@@ -14,7 +14,7 @@ import hou
 
 # Internal
 from fxhoudinimcp_server.config import layout_if_enabled
-from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.dispatcher import Capability, register_handler
 
 
 ###### Helpers
@@ -358,10 +358,10 @@ def get_context_info(context: str) -> dict:
 
 ###### Registration
 
-register_handler("scene.get_scene_info", get_scene_info)
+register_handler("scene.get_scene_info", get_scene_info, Capability.READONLY)
 register_handler("scene.new_scene", new_scene)
 register_handler("scene.save_scene", save_scene)
 register_handler("scene.load_scene", load_scene)
 register_handler("scene.import_file", import_file)
 register_handler("scene.export_file", export_file)
-register_handler("scene.get_context_info", get_context_info)
+register_handler("scene.get_context_info", get_context_info, Capability.READONLY)

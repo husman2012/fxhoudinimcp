@@ -11,7 +11,7 @@ import hou
 
 # Internal
 from fxhoudinimcp_server.config import auto_layout_enabled, layout_if_enabled
-from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.dispatcher import Capability, register_handler
 
 
 ###### Helpers
@@ -766,10 +766,10 @@ register_handler("nodes.delete_node", delete_node)
 register_handler("nodes.rename_node", rename_node)
 register_handler("nodes.copy_node", copy_node)
 register_handler("nodes.move_node", move_node)
-register_handler("nodes.get_node_info", get_node_info)
-register_handler("nodes.list_children", list_children)
-register_handler("nodes.find_nodes", find_nodes)
-register_handler("nodes.list_node_types", list_node_types)
+register_handler("nodes.get_node_info", get_node_info, Capability.READONLY)
+register_handler("nodes.list_children", list_children, Capability.READONLY)
+register_handler("nodes.find_nodes", find_nodes, Capability.READONLY)
+register_handler("nodes.list_node_types", list_node_types, Capability.READONLY)
 register_handler("nodes.connect_nodes", connect_nodes)
 register_handler("nodes.connect_nodes_batch", connect_nodes_batch)
 register_handler("nodes.disconnect_node", disconnect_node)

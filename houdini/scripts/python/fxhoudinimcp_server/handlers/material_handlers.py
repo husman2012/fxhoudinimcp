@@ -14,7 +14,7 @@ import hou
 
 # Internal
 from fxhoudinimcp_server.config import layout_if_enabled
-from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.dispatcher import Capability, register_handler
 
 
 ###### Helpers
@@ -93,7 +93,7 @@ def _list_materials(*, root_path: str = "/mat", **_: Any) -> dict[str, Any]:
         "materials": materials,
     }
 
-register_handler("materials.list_materials", _list_materials)
+register_handler("materials.list_materials", _list_materials, Capability.READONLY)
 
 
 ###### materials.get_material_info
@@ -162,7 +162,7 @@ def _get_material_info(*, node_path: str, **_: Any) -> dict[str, Any]:
         "assignments": assignments,
     }
 
-register_handler("materials.get_material_info", _get_material_info)
+register_handler("materials.get_material_info", _get_material_info, Capability.READONLY)
 
 
 ###### materials.create_material_network
@@ -340,4 +340,4 @@ def _list_material_types(
         "types": results,
     }
 
-register_handler("materials.list_material_types", _list_material_types)
+register_handler("materials.list_material_types", _list_material_types, Capability.READONLY)

@@ -85,6 +85,11 @@ def start(port: int | None = None) -> None:
     # Import hwebserver_app to register the API functions
     from fxhoudinimcp_server import hwebserver_app  # noqa: F401
 
+    # Install the security gate (must run after handlers are registered).
+    # Fail-hard on import: if homedini.dcc.mcp_gate is missing, we never start.
+    from fxhoudinimcp_server.gate import install_gate
+    install_gate()
+
     # Start hwebserver if not already running. In Houdini 20.5+ it may already
     # be running for built-in features; in that case registering the functions
     # above is enough. Either way, prove the HTTP endpoint is reachable before

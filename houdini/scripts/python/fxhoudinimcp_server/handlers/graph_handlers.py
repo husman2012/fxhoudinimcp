@@ -23,7 +23,7 @@ import hou
 
 # Internal
 from fxhoudinimcp_server.config import layout_if_enabled
-from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.dispatcher import Capability, register_handler
 
 ###### Helpers
 
@@ -614,6 +614,6 @@ def find_expensive_nodes(
 ###### Registration
 
 register_handler("graph.build_network", build_network)
-register_handler("graph.verify_network", verify_network)
-register_handler("graph.get_node_card", get_node_card)
-register_handler("graph.find_expensive_nodes", find_expensive_nodes)
+register_handler("graph.verify_network", verify_network, Capability.READONLY)
+register_handler("graph.get_node_card", get_node_card, Capability.READONLY)
+register_handler("graph.find_expensive_nodes", find_expensive_nodes, Capability.CODE_EXEC)  # cook(force=True) loop over all nodes under root

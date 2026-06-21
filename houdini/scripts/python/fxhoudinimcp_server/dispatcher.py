@@ -13,6 +13,7 @@ import logging
 import threading
 import time
 import traceback
+from enum import Enum
 from typing import Any, Callable
 
 # Third-party (hdefereval is only available in graphical Houdini sessions)
@@ -32,14 +33,47 @@ _COMMAND_TIMEOUT = 120  # seconds
 _handler_registry: dict[str, Callable] = {}
 
 
-def register_handler(command: str, handler: Callable) -> None:
+class Capability(str, Enum):
+    """Security capability tier for each registered MCP handler.
+
+    READONLY   — pure introspection/query; no scene mutation, no code execution.
+    MUTATING   — scene-mutating but does NOT compile/run operator-supplied code.
+                 Default (fail-closed) when register_handler is called without
+                 an explicit capability arg.
+    CODE_EXEC  — compiles or runs operator-supplied code (exec/eval/setExpression/
+                 cook-of-injected-content). Always queued below TRUSTED.
+    """
+    READONLY = "readonly"
+    MUTATING = "mutating"
+    CODE_EXEC = "code_exec"
+
+
+# Registry of command name -> declared capability (populated by register_handler)
+_capability_registry: dict[str, Capability] = {}
+
+
+def register_handler(
+    command: str,
+    handler: Callable,
+    capability: Capability = Capability.MUTATING,
+) -> None:
     """Register a handler function for a command name.
 
     Args:
-        command: Dotted command name (e.g. "scene.get_scene_info")
-        handler: Function to call with **params
+        command:    Dotted command name (e.g. "scene.get_scene_info")
+        handler:    Function to call with **params
+        capability: Security tier for the gate. Defaults to MUTATING (fail-closed) —
+                    a handler that omits the argument is treated as mutating, never
+                    silently allowed as readonly.  Only CODE_EXEC and READONLY need
+                    explicit declarations; MUTATING is the safe default.
     """
     _handler_registry[command] = handler
+    _capability_registry[command] = capability
+
+
+def capability_of(command: str) -> Capability | None:
+    """Return the declared capability tier for *command*, or None if undeclared."""
+    return _capability_registry.get(command)
 
 
 def list_commands() -> list[str]:

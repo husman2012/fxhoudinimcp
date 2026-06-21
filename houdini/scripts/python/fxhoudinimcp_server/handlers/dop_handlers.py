@@ -14,7 +14,7 @@ import logging
 import hou
 
 # Internal
-from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.dispatcher import Capability, register_handler
 
 logger = logging.getLogger(__name__)
 
@@ -412,11 +412,11 @@ def _get_sim_memory_usage(node_path: str) -> dict:
 
 ###### Registration
 
-register_handler("dops.get_simulation_info", _get_simulation_info)
-register_handler("dops.list_dop_objects", _list_dop_objects)
-register_handler("dops.get_dop_object", _get_dop_object)
-register_handler("dops.get_dop_field", _get_dop_field)
-register_handler("dops.get_dop_relationships", _get_dop_relationships)
+register_handler("dops.get_simulation_info", _get_simulation_info, Capability.READONLY)
+register_handler("dops.list_dop_objects", _list_dop_objects, Capability.READONLY)
+register_handler("dops.get_dop_object", _get_dop_object, Capability.READONLY)
+register_handler("dops.get_dop_field", _get_dop_field, Capability.READONLY)
+register_handler("dops.get_dop_relationships", _get_dop_relationships, Capability.READONLY)
 register_handler("dops.step_simulation", _step_simulation)
 register_handler("dops.reset_simulation", _reset_simulation)
-register_handler("dops.get_sim_memory_usage", _get_sim_memory_usage)
+register_handler("dops.get_sim_memory_usage", _get_sim_memory_usage, Capability.READONLY)

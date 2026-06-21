@@ -15,7 +15,7 @@ from typing import Any
 import hou
 
 # Internal
-from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.dispatcher import Capability, register_handler
 
 
 ###### Helpers
@@ -129,7 +129,7 @@ def _get_geometry_info(*, node_path: str) -> dict[str, Any]:
         result["prim_type_breakdown_note"] = prim_sample_note
     return result
 
-register_handler("geometry.get_geometry_info", _get_geometry_info)
+register_handler("geometry.get_geometry_info", _get_geometry_info, Capability.READONLY)
 
 
 ###### geometry.get_points
@@ -187,7 +187,7 @@ def _get_points(
         "points": rows,
     }
 
-register_handler("geometry.get_points", _get_points)
+register_handler("geometry.get_points", _get_points, Capability.READONLY)
 
 
 ###### geometry.get_prims
@@ -246,7 +246,7 @@ def _get_prims(
         "prims": rows,
     }
 
-register_handler("geometry.get_prims", _get_prims)
+register_handler("geometry.get_prims", _get_prims, Capability.READONLY)
 
 
 ###### geometry.get_attrib_values
@@ -329,7 +329,7 @@ def _get_attrib_values(
         "values": page,
     }
 
-register_handler("geometry.get_attrib_values", _get_attrib_values)
+register_handler("geometry.get_attrib_values", _get_attrib_values, Capability.READONLY)
 
 
 ###### geometry.set_detail_attrib
@@ -432,7 +432,7 @@ def _get_groups(*, node_path: str) -> dict[str, Any]:
         **groups,
     }
 
-register_handler("geometry.get_groups", _get_groups)
+register_handler("geometry.get_groups", _get_groups, Capability.READONLY)
 
 
 ###### geometry.get_group_members
@@ -487,7 +487,7 @@ def _get_group_members(
         "members": page,
     }
 
-register_handler("geometry.get_group_members", _get_group_members)
+register_handler("geometry.get_group_members", _get_group_members, Capability.READONLY)
 
 
 ###### geometry.get_bounding_box
@@ -505,7 +505,7 @@ def _get_bounding_box(*, node_path: str) -> dict[str, Any]:
         "center": list(bbox.center()),
     }
 
-register_handler("geometry.get_bounding_box", _get_bounding_box)
+register_handler("geometry.get_bounding_box", _get_bounding_box, Capability.READONLY)
 
 
 ###### geometry.get_attribute_info
@@ -551,7 +551,7 @@ def _get_attribute_info(
         "type_name": attrib.dataType().name(),
     }
 
-register_handler("geometry.get_attribute_info", _get_attribute_info)
+register_handler("geometry.get_attribute_info", _get_attribute_info, Capability.READONLY)
 
 
 ###### geometry.sample_geometry
@@ -612,7 +612,7 @@ def _sample_geometry(
         "points": rows,
     }
 
-register_handler("geometry.sample_geometry", _sample_geometry)
+register_handler("geometry.sample_geometry", _sample_geometry, Capability.READONLY)
 
 
 ###### geometry.get_prim_intrinsics
@@ -716,7 +716,7 @@ def _get_prim_intrinsics(
         result["summary_note"] = sample_note
     return result
 
-register_handler("geometry.get_prim_intrinsics", _get_prim_intrinsics)
+register_handler("geometry.get_prim_intrinsics", _get_prim_intrinsics, Capability.READONLY)
 
 
 ###### geometry.find_nearest_point
@@ -781,4 +781,4 @@ def _find_nearest_point(
         "results": results,
     }
 
-register_handler("geometry.find_nearest_point", _find_nearest_point)
+register_handler("geometry.find_nearest_point", _find_nearest_point, Capability.READONLY)

@@ -14,7 +14,7 @@ import hou
 
 # Internal
 from fxhoudinimcp_server.config import layout_if_enabled
-from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.dispatcher import Capability, register_handler
 
 
 ###### Helpers
@@ -380,8 +380,8 @@ def validate_vex(node_path: str) -> dict:
 
 ###### Registration
 
-register_handler("vex.create_wrangle", create_wrangle)
-register_handler("vex.set_wrangle_code", set_wrangle_code)
-register_handler("vex.get_wrangle_code", get_wrangle_code)
-register_handler("vex.create_vex_expression", create_vex_expression)
-register_handler("vex.validate_vex", validate_vex)
+register_handler("vex.create_wrangle", create_wrangle, Capability.CODE_EXEC)          # injects VEX snippet that executes on cook
+register_handler("vex.set_wrangle_code", set_wrangle_code, Capability.CODE_EXEC)      # injects VEX snippet that executes on cook
+register_handler("vex.get_wrangle_code", get_wrangle_code, Capability.READONLY)       # reads snippet parm; no execution
+register_handler("vex.create_vex_expression", create_vex_expression, Capability.CODE_EXEC)  # setExpression → executes on every parm eval
+register_handler("vex.validate_vex", validate_vex, Capability.CODE_EXEC)              # cook(force=True) executes injected VEX (ADR §3.3.2)

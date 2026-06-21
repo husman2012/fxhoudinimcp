@@ -13,7 +13,7 @@ from typing import Any
 import hou
 
 # Internal
-from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.dispatcher import Capability, register_handler
 
 
 ###### takes.list_takes
@@ -46,7 +46,7 @@ def _list_takes(**_: Any) -> dict[str, Any]:
         "current_take": current_name,
     }
 
-register_handler("takes.list_takes", _list_takes)
+register_handler("takes.list_takes", _list_takes, Capability.READONLY)
 
 
 ###### takes.get_current_take
@@ -86,7 +86,7 @@ def _get_current_take(**_: Any) -> dict[str, Any]:
         "overridden_parms": overridden_parms,
     }
 
-register_handler("takes.get_current_take", _get_current_take)
+register_handler("takes.get_current_take", _get_current_take, Capability.READONLY)
 
 
 ###### takes.set_current_take

@@ -10,7 +10,7 @@ from __future__ import annotations
 import hou
 
 # Internal
-from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.dispatcher import Capability, register_handler
 
 
 ###### Helpers
@@ -284,9 +284,9 @@ def _playbar_control(
 register_handler("animation.set_keyframe", _set_keyframe)
 register_handler("animation.set_keyframes", _set_keyframes)
 register_handler("animation.delete_keyframe", _delete_keyframe)
-register_handler("animation.get_keyframes", _get_keyframes)
+register_handler("animation.get_keyframes", _get_keyframes, Capability.READONLY)
 register_handler("animation.set_frame", _set_frame)
-register_handler("animation.get_frame", _get_frame)
+register_handler("animation.get_frame", _get_frame, Capability.READONLY)
 register_handler("animation.set_frame_range", _set_frame_range)
 register_handler("animation.set_playback_range", _set_playback_range)
 register_handler("animation.playbar_control", _playbar_control)

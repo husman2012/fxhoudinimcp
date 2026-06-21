@@ -14,7 +14,7 @@ from typing import Any
 import hou
 
 # Internal
-from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.dispatcher import Capability, register_handler
 
 
 ###### Module-level state
@@ -770,11 +770,11 @@ def _get_node_errors_detailed(
 
 ###### Registration
 
-register_handler("context.get_network_overview", _get_network_overview)
-register_handler("context.get_cook_chain", _get_cook_chain)
-register_handler("context.explain_node", _explain_node)
-register_handler("context.get_selection", _get_selection)
+register_handler("context.get_network_overview", _get_network_overview, Capability.READONLY)
+register_handler("context.get_cook_chain", _get_cook_chain, Capability.READONLY)
+register_handler("context.explain_node", _explain_node, Capability.READONLY)
+register_handler("context.get_selection", _get_selection, Capability.READONLY)
 register_handler("context.set_selection", _set_selection)
-register_handler("context.get_scene_summary", _get_scene_summary)
-register_handler("context.compare_snapshots", _compare_snapshots)
-register_handler("context.get_node_errors_detailed", _get_node_errors_detailed)
+register_handler("context.get_scene_summary", _get_scene_summary, Capability.READONLY)
+register_handler("context.compare_snapshots", _compare_snapshots, Capability.READONLY)
+register_handler("context.get_node_errors_detailed", _get_node_errors_detailed, Capability.READONLY)

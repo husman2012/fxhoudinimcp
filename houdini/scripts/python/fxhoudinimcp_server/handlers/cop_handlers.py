@@ -14,7 +14,7 @@ import hou
 
 # Internal
 from fxhoudinimcp_server.config import layout_if_enabled
-from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.dispatcher import Capability, register_handler
 
 logger = logging.getLogger(__name__)
 
@@ -480,10 +480,10 @@ def get_cop_vdb(node_path: str, output_index: int = 0) -> dict:
 
 ###### Registration
 
-register_handler("cops.get_cop_info", get_cop_info)
-register_handler("cops.get_cop_geometry", get_cop_geometry)
-register_handler("cops.get_cop_layer", get_cop_layer)
+register_handler("cops.get_cop_info", get_cop_info, Capability.READONLY)
+register_handler("cops.get_cop_geometry", get_cop_geometry, Capability.READONLY)
+register_handler("cops.get_cop_layer", get_cop_layer, Capability.READONLY)
 register_handler("cops.create_cop_node", create_cop_node)
 register_handler("cops.set_cop_flags", set_cop_flags)
-register_handler("cops.list_cop_node_types", list_cop_node_types)
-register_handler("cops.get_cop_vdb", get_cop_vdb)
+register_handler("cops.list_cop_node_types", list_cop_node_types, Capability.READONLY)
+register_handler("cops.get_cop_vdb", get_cop_vdb, Capability.READONLY)

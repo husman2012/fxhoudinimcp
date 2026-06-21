@@ -16,7 +16,7 @@ import os
 import hou
 
 # Internal
-from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.dispatcher import Capability, register_handler
 
 logger = logging.getLogger(__name__)
 
@@ -806,16 +806,16 @@ def log_status(message: str, severity: str = "message") -> dict:
 
 ###### Registration
 
-register_handler("viewport.list_panes", list_panes)
-register_handler("viewport.get_viewport_info", get_viewport_info)
+register_handler("viewport.list_panes", list_panes, Capability.READONLY)
+register_handler("viewport.get_viewport_info", get_viewport_info, Capability.READONLY)
 register_handler("viewport.set_viewport_camera", set_viewport_camera)
 register_handler("viewport.set_viewport_display", set_viewport_display)
 register_handler("viewport.set_viewport_direction", set_viewport_direction)
 register_handler("viewport.set_viewport_renderer", set_viewport_renderer)
 register_handler("viewport.frame_selection", frame_selection)
 register_handler("viewport.frame_all", frame_all)
-register_handler("viewport.capture_screenshot", capture_screenshot)
-register_handler("viewport.capture_network_editor", capture_network_editor)
+register_handler("viewport.capture_screenshot", capture_screenshot, Capability.READONLY)
+register_handler("viewport.capture_network_editor", capture_network_editor, Capability.READONLY)
 register_handler("viewport.set_current_network", set_current_network)
-register_handler("viewport.find_error_nodes", find_error_nodes)
+register_handler("viewport.find_error_nodes", find_error_nodes, Capability.READONLY)
 register_handler("viewport.log_status", log_status)

@@ -58,3 +58,4 @@ from fxhoudinimcp.tools import materials  # noqa: F401
 from fxhoudinimcp.tools import chops  # noqa: F401
 from fxhoudinimcp.tools import cache  # noqa: F401
 from fxhoudinimcp.tools import takes  # noqa: F401
+from fxhoudinimcp.tools import gate  # noqa: F401
