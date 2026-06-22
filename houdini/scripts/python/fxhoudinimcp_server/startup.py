@@ -48,7 +48,7 @@ def _query_health(port: int, timeout: float = 0.5) -> dict | None:
 
 def _wait_for_current_process_health(
     port: int,
-    timeout_seconds: float = 3.0,
+    timeout_seconds: float = 15.0,
 ) -> dict | None:
     deadline = time.time() + max(0.0, timeout_seconds)
     current_pid = os.getpid()
