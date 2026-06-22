@@ -24,6 +24,7 @@ _HANDLER_MODULES = [
     "code_handlers",
     "dop_handlers",
     "animation_handlers",
+    "character_handlers",
     "rendering_handlers",
     "viewport_handlers",
     "geometry_handlers",
