@@ -117,10 +117,22 @@ class HoudiniBridge:
 
         if isinstance(result, dict) and result.get("status") == "error":
             err = result.get("error", {})
+            # Some handlers (e.g. the gate) return `error` as a plain string
+            # rather than a dict.  Normalise to dict so .get() doesn't raise
+            # AttributeError and the real server message surfaces in the exception.
+            if isinstance(err, str):
+                err = {"message": err}
             raise HoudiniCommandError(
                 message=err.get("message", "Unknown Houdini error"),
                 code=err.get("code", "UNKNOWN"),
                 details=err,
+            )
+
+        if isinstance(result, dict) and result.get("status") == "denied":
+            raise HoudiniCommandError(
+                message=result.get("reason", "Command denied by security gate"),
+                code="DENIED",
+                details=result,
             )
 
         if isinstance(result, dict) and result.get("status") == "success":

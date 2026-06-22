@@ -85,4 +85,5 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
     "integration: requires a live Houdini instance",
+    "hython_smoke: requires a live Houdini session with the gate installed (hython-smoke tier)",
 ]

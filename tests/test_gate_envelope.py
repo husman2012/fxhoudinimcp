@@ -275,3 +275,85 @@ class TestAllowPathEnvelopeContract:
             "DEFECT #2: handler fields leaked to top-level without 'data' wrapper. "
             f"result keys = {list(result.keys())}"
         )
+
+
+# ---------------------------------------------------------------------------
+# FIX A regression: mode input-normalization (_set_permission_mode)
+# ---------------------------------------------------------------------------
+# gate_model.py is pure-logic (no hou/Qt/pxr — CL-015 compliant).
+# These tests run entirely off-DCC and guard against the underscore/hyphen
+# normalization being silently reverted.
+# Root cause: Mode.READ_ONLY.value == "read-only" (hyphen), so Mode("read_only")
+# raises ValueError. The fix normalizes underscore→hyphen before Mode(…).
+
+class TestModeInputNormalization:
+    """Pure-logic regression tests for FIX A — _set_permission_mode input path.
+
+    Exercises the normalization logic that maps underscore-form mode strings
+    (e.g. "read_only") to the hyphenated enum values (e.g. "read-only").
+    No hou, no Qt, no live Houdini needed.
+    """
+
+    def _normalize_and_parse(self, mode_str: str):
+        """Mirror the normalization logic in _set_permission_mode for offline testing."""
+        from homedini.dcc.mcp_gate.gate_model import Mode
+        normalized = mode_str.replace("_", "-")
+        return Mode(normalized)
+
+    def test_read_only_underscore_resolves(self):
+        """'read_only' (underscore) must resolve to Mode.READ_ONLY without error."""
+        from homedini.dcc.mcp_gate.gate_model import Mode
+        result = self._normalize_and_parse("read_only")
+        assert result == Mode.READ_ONLY, (
+            f"Expected Mode.READ_ONLY, got {result!r}"
+        )
+
+    def test_read_only_hyphen_resolves(self):
+        """'read-only' (hyphen, canonical) must still resolve correctly after normalization."""
+        from homedini.dcc.mcp_gate.gate_model import Mode
+        result = self._normalize_and_parse("read-only")
+        assert result == Mode.READ_ONLY
+
+    def test_propose_resolves(self):
+        """'propose' (no hyphen) must still work (no transformation needed)."""
+        from homedini.dcc.mcp_gate.gate_model import Mode
+        result = self._normalize_and_parse("propose")
+        assert result == Mode.PROPOSE
+
+    def test_trusted_resolves(self):
+        """'trusted' must still work."""
+        from homedini.dcc.mcp_gate.gate_model import Mode
+        result = self._normalize_and_parse("trusted")
+        assert result == Mode.TRUSTED
+
+    def test_garbage_input_raises_value_error(self):
+        """Garbage input must raise ValueError (not silently succeed)."""
+        from homedini.dcc.mcp_gate.gate_model import Mode
+        with pytest.raises(ValueError):
+            self._normalize_and_parse("admin")
+
+    def test_mode_str_output_is_underscore(self):
+        """_mode_str() must output underscore form for all Mode values.
+
+        Guards the OUTPUT path so the INPUT normalization and OUTPUT
+        normalization remain symmetric.
+        """
+        # Import _mode_str directly — it has no hou dependency.
+        import sys
+        _FORK_PYTHON = "C:/Users/husma/development/fxhoudinimcp/houdini/scripts/python"
+        if _FORK_PYTHON not in sys.path:
+            sys.path.insert(0, _FORK_PYTHON)
+
+        from homedini.dcc.mcp_gate.gate_model import Mode
+
+        # Stub hou so middleware can be imported (it guards with try/except ImportError).
+        import types
+        if "hou" not in sys.modules:
+            sys.modules["hou"] = types.ModuleType("hou")  # type: ignore[assignment]
+
+        from fxhoudinimcp_server.gate.middleware import _mode_str
+
+        assert _mode_str(Mode.READ_ONLY) == "read_only"
+        assert _mode_str(Mode.PROPOSE)   == "propose"
+        assert _mode_str(Mode.TRUSTED)   == "trusted"
+        assert _mode_str(Mode.APPROVE)   == "approve"

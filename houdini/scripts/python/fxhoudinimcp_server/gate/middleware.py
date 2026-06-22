@@ -454,9 +454,14 @@ def _register_gate_handlers(_d, gate_ref) -> None:
         g = _get_gate()
         if g is None:
             return {"status": "error", "error": "Gate not installed"}
+        # Normalize underscore → hyphen so both "read_only" and "read-only" are
+        # accepted.  The pure-core Mode enum stores values with hyphens
+        # (Mode.READ_ONLY.value == "read-only").  _mode_str() converts hyphens
+        # back to underscores on OUTPUT; this is the symmetric INPUT path.
+        _normalized = mode.replace("_", "-")
         try:
-            new_mode = Mode(mode)
-        except ValueError:
+            new_mode = Mode(_normalized)
+        except (ValueError, AttributeError):
             return {
                 "gate": "allowed",
                 "status": "error",
