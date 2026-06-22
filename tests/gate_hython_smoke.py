@@ -183,7 +183,7 @@ def _item3():
 
     info = _dispatch("scene.get_scene_info", {})
     _assert(info.get("gate") == "allowed", f"expected gate=allowed on read, got {info!r}")
-    _assert("houdini_version" in info, f"expected houdini_version in scene info: {info!r}")
+    _assert("houdini_version" in info.get("data", {}), f"expected houdini_version in scene info data: {info!r}")
 
 
 # ---- §3.7 item 4 ---------------------------------------------------------
@@ -195,8 +195,8 @@ def _item4():
     info = _dispatch("scene.get_scene_info", {})
     _assert(info.get("gate") == "allowed", f"expected gate=allowed in trusted, got {info!r}")
     # Original response keys must survive unchanged (they come from get_scene_info).
-    _assert("houdini_version" in info, f"missing houdini_version in trusted response: {info!r}")
-    _assert("fps" in info, f"missing fps in trusted response: {info!r}")
+    _assert("houdini_version" in info.get("data", {}), f"missing houdini_version in trusted response: {info!r}")
+    _assert("fps" in info.get("data", {}), f"missing fps in trusted response: {info!r}")
 
 
 # ---- §3.7 item 5 ---------------------------------------------------------

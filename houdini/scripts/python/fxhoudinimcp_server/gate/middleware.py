@@ -227,11 +227,13 @@ def _gated_dispatch(command: str, params: dict[str, Any]) -> dict[str, Any]:
         if isinstance(outer, dict) and outer.get("status") == "success" and "data" in outer:
             inner = outer["data"]
             if isinstance(inner, dict):
-                result = dict(inner)
+                # ADR-0002 Option A: preserve the {status, gate, data} envelope so
+                # bridge.execute()'s result.get("data", {}) resolves to the handler
+                # payload rather than {}.  The old dict(inner) flattening dropped
+                # the "data" key, breaking every non-gate tool over the live bridge.
+                result = {"status": "success", "gate": "allowed", "data": inner}
                 if "timing_ms" in outer:
-                    result.setdefault("timing_ms", outer["timing_ms"])
-                result["gate"] = "allowed"
-                result["status"] = "success"
+                    result["timing_ms"] = outer["timing_ms"]
                 return result
         # Non-standard response (e.g. error or timeout) — surface as-is + gate.
         outer["gate"] = "allowed"
@@ -548,12 +550,14 @@ def _register_gate_handlers(_d, gate_ref) -> None:
         return {
             "gate": "allowed",
             "status": "success",
-            "classification": {
-                "danger": cl.danger,
-                "classes": cl.classes,
-                "severity": cl.severity.name,
-                "reasons": cl.reasons,
-                "capability": "code_exec",
+            "data": {
+                "classification": {
+                    "danger": cl.danger,
+                    "classes": cl.classes,
+                    "severity": cl.severity.name,
+                    "reasons": cl.reasons,
+                    "capability": "code_exec",
+                },
             },
         }
 
