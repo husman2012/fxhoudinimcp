@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass  # F7: removed unused 'field' import
 from typing import Any
 
 
@@ -203,11 +203,35 @@ def derive_parents(
     Returns:
         A dict keyed by every name in ``names``; value is the parent name
         string, or None for root joints (those that never appear as a child).
+
+    Raises:
+        ValueError: if a joint appears as the child in more than one edge
+                    (double-parent — invalid KineFX skeleton).
+        ValueError: if a cycle is detected in the parent chain (e.g. A->B->A).
     """
     # Build a child-to-parent lookup from the edge list.
+    # F1 + F2: detect double-parent and cycle, raise ValueError on both.
     child_to_parent: dict[str, str] = {}
     for parent_name, child_name in edges:
+        # F2: double-parent detection — a joint can have at most one parent.
+        if child_name in child_to_parent:
+            raise ValueError(
+                f"derive_parents: joint '{child_name}' has multiple parents"
+            )
         child_to_parent[child_name] = parent_name
+
+    # F1: cycle detection — walk each child's ancestor chain; a joint that
+    # appears more than once in the chain means a cycle exists.
+    for start in child_to_parent:
+        visited: set[str] = set()
+        current = start
+        while current in child_to_parent:
+            if current in visited:
+                raise ValueError(
+                    f"derive_parents: cycle detected at '{current}'"
+                )
+            visited.add(current)
+            current = child_to_parent[current]
 
     # For each joint, look up its parent; roots are absent from the lookup.
     return {n: child_to_parent.get(n) for n in names}
@@ -222,14 +246,30 @@ def pack_trs(
     are converted to plain Python before reaching the pure layer.  Translation
     occupies the last row (row index 3, columns 0-2).
 
+    **Input convention (F3 / F4 / Opus-F1):**
+    - Row-major layout: ``matrix4[row][col]``.
+    - Translation is in row 3 (``matrix4[3][0..2]``), NOT in column 3.
+      This matches the ``hou.Matrix4`` storage convention used throughout
+      the fxhoudinimcp bridge.  The caller (character_handlers.py and any
+      PR-2 code) MUST honor this row-major / row-3-translation layout.
+    - The upper-left 3x3 sub-matrix is assumed to encode scale * rotation
+      for an **orthonormal** (right-angle axes) matrix — i.e. the three
+      column vectors of the upper-left 3x3 must be mutually perpendicular
+      after normalisation.  Sheared or degenerate matrices (where any column
+      has near-zero length, ``< 1e-12``) will produce non-unit quaternions
+      or a zero scale component; the caller is responsible for ensuring the
+      input is a valid rigid-body transform.
+
     Args:
-        matrix4: 4x4 nested list of floats.
+        matrix4: 4x4 nested list of floats in row-major order.
 
     Returns:
         A 3-tuple ``(translate, rotate, scale)`` where:
         - translate: (tx, ty, tz) floats
-        - rotate:    (rx, ry, rz, rw) quaternion floats
-        - scale:     (sx, sy, sz) floats
+        - rotate:    (rx, ry, rz, rw) quaternion floats -- may not be unit
+                     if the input contains shear or a degenerate column.
+        - scale:     (sx, sy, sz) floats -- a degenerate column (length
+                     near-zero) results in sx/sy/sz == 0.0 for that axis.
     """
     # Translation is in the last row, first three columns.
     tx, ty, tz = matrix4[3][0], matrix4[3][1], matrix4[3][2]
@@ -253,7 +293,7 @@ def pack_trs(
     r02 = _safe_div(col2[0], sz); r12 = _safe_div(col2[1], sz); r22 = _safe_div(col2[2], sz)
 
     # Convert the 3x3 rotation matrix to a unit quaternion (x, y, z, w).
-    # Shepperd's method — numerically stable across all rotation matrices.
+    # Shepperd's method -- numerically stable across all rotation matrices.
     trace = r00 + r11 + r22
     if trace > 0.0:
         s = 0.5 / math.sqrt(trace + 1.0)
@@ -302,18 +342,37 @@ def validate_mapping(
 ) -> list:  # list[str] — empty on success
     """Validate that all joint names in a RetargetMap exist in their respective skeletons.
 
+    Also detects duplicate source->target pairs and one-to-many target mappings
+    (the same target joint claimed by more than one source joint).
+
     Args:
-        retarget_map:     the source→target joint pair mapping to validate.
+        retarget_map:     the source->target joint pair mapping to validate.
         source_skeleton:  the skeleton providing source joint names.
         target_skeleton:  the skeleton providing target joint names.
 
     Returns:
-        A list of error strings — one per invalid pair.  Empty list means valid.
+        A list of error strings -- one per invalid pair or structural problem.
+        Empty list means valid.
     """
     src_names = {j.name for j in source_skeleton.joints}
     tgt_names = {j.name for j in target_skeleton.joints}
     errors: list[str] = []
+
+    # F5: tracking sets for duplicate-pair and one-to-many detection.
+    seen_pairs: set[tuple[str, str]] = set()
+    target_claimed_by: dict[str, str] = {}  # target_joint -> first source that claimed it
+
     for src_joint, tgt_joint in retarget_map.pairs:
+        pair = (src_joint, tgt_joint)
+
+        # F5: duplicate pair detection -- same (src, tgt) listed more than once.
+        if pair in seen_pairs:
+            errors.append(
+                f"Duplicate mapping pair: '{src_joint}' -> '{tgt_joint}'."
+            )
+            continue
+        seen_pairs.add(pair)
+
         if src_joint not in src_names:
             errors.append(
                 f"Source joint '{src_joint}' not found in source skeleton."
@@ -322,4 +381,14 @@ def validate_mapping(
             errors.append(
                 f"Target joint '{tgt_joint}' not found in target skeleton."
             )
+
+        # F5: one-to-many target detection -- same target claimed by two sources.
+        if tgt_joint in target_claimed_by and target_claimed_by[tgt_joint] != src_joint:
+            errors.append(
+                f"Target joint '{tgt_joint}' is mapped from multiple sources: "
+                f"'{target_claimed_by[tgt_joint]}' and '{src_joint}'."
+            )
+        else:
+            target_claimed_by[tgt_joint] = src_joint
+
     return errors

@@ -739,3 +739,70 @@ class TestHouFreeImport:
         assert "import hou" not in source_no_comments, (
             "kinefx_model.py must not import hou (CL-015 / FR-11)"
         )
+
+
+# ===========================================================================
+# Section 9 — Edge-case hardening (F1/F2/F5 fix-pass additions)
+#
+# These tests were added in the diff-scoped hardening pass (pp12-110a fix-pass)
+# to close tier-3 review flags:
+#   F1  — derive_parents cycle detection (raises ValueError)
+#   F2  — derive_parents double-parent detection (raises ValueError)
+#   F5  — validate_mapping duplicate-pair + one-to-many detection
+#
+# Each test exercises one flag's contract exactly.
+# The existing 63 tests above are not modified.
+# ===========================================================================
+
+class TestDeriveParentsEdgeCases:
+    """Edge-case hardening for derive_parents — F1 (cycle) and F2 (double-parent)."""
+
+    def test_cycle_raises_value_error(self):
+        """A->B->A cycle must raise ValueError mentioning 'cycle'."""
+        # A is parent of B, B is parent of A — a two-node cycle.
+        edges = [("A", "B"), ("B", "A")]
+        names = ["A", "B"]
+        with pytest.raises(ValueError, match="cycle"):
+            derive_parents(edges, names)
+
+    def test_double_parent_raises_value_error(self):
+        """A joint listed as a child in two edges must raise ValueError."""
+        # Both ("Root", "Child") and ("Other", "Child") claim Child as a child.
+        edges = [("Root", "Child"), ("Other", "Child")]
+        names = ["Root", "Other", "Child"]
+        with pytest.raises(ValueError, match="multiple parents"):
+            derive_parents(edges, names)
+
+
+class TestValidateMappingEdgeCases:
+    """Edge-case hardening for validate_mapping — F5 (duplicates + one-to-many)."""
+
+    def _make_skeleton_names(self, *names: str) -> Skeleton:
+        joints = [Joint(name=n, parent=None, rest=_trs_dict()) for n in names]
+        return Skeleton(joints=joints)
+
+    def test_duplicate_pair_is_flagged(self):
+        """The same (src, tgt) pair appearing twice must produce an error entry."""
+        src = self._make_skeleton_names("Hips", "Spine")
+        tgt = self._make_skeleton_names("root", "spine_01")
+        rm = RetargetMap(pairs=[
+            ("Hips", "root"),
+            ("Hips", "root"),  # exact duplicate
+        ])
+        errors = validate_mapping(rm, src, tgt)
+        assert len(errors) >= 1
+        combined = " ".join(errors).lower()
+        assert "duplicate" in combined or "hips" in combined
+
+    def test_one_to_many_target_is_flagged(self):
+        """Two distinct sources mapping to the same target must produce an error."""
+        src = self._make_skeleton_names("Hips", "Spine")
+        tgt = self._make_skeleton_names("root")
+        rm = RetargetMap(pairs=[
+            ("Hips",  "root"),  # first claimant
+            ("Spine", "root"),  # second claimant — same target
+        ])
+        errors = validate_mapping(rm, src, tgt)
+        assert len(errors) >= 1
+        combined = " ".join(errors).lower()
+        assert "root" in combined or "multiple" in combined or "source" in combined
