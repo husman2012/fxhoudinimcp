@@ -55,6 +55,17 @@ A comprehensive [MCP](https://modelcontextprotocol.io/) (Model Context Protocol)
 
 **179 tools**, **8 resources**, and **6 workflow prompts** out of the box.
 
+<!-- FORK POSITIONING -->
+## This Fork: Full-Surface + Operator-Gated
+
+> **Note (2026-06-23, PROVISIONAL — pending official H22 release notes ~mid-July 2026):** SideFX shipped their first official MCP server with Houdini 22 — the **APEX Script Comfort Package**, scoped to APEX rig-script authoring only and shipped **without a security/permission gate**. This fork extends the original `healkeiser/fxhoudinimcp` bridge in two directions the official MCP does not cover:
+>
+> **1. Full-surface coverage.** The official APEX Script MCP handles rig-script authoring in one context. This fork covers every Houdini context — SOP/LOP/TOP/COP/OBJ — including KineFX character import and retarget, engine-export hooks (VAT/Alembic/UE), USD/MaterialX disk export, Copernicus ONNX-inference + pixel readback, and Karma AOV/EXR readback.
+>
+> **2. Operator-gated security model (member #109).** The official APEX Script MCP ships an *integrated validator* that checks code shape. This fork adds a **four-tier capability model** (`trusted` / `approve` / `propose` / `read-only`) + a **danger-class AST classifier** (os/subprocess/file-write/file-delete/network/`hou.hipFile`/dynamic-exec) + a **tamper-evident append-only audit log** + **operator-in-the-loop approval** at every state-mutating call. A validator tells you what code does; a gate decides whether an agent is allowed to run it on a live production scene. Every `execute_code` or `execute_hscript` call passes through the gate before touching the scene — the agent proposes, the human approves.
+>
+> Both extensions layer cleanly on top of the upstream fork's `@hwebserver.apiFunction` + `hdefereval.executeInMainThreadWithResult()` bridge pattern — no upstream handler edits beyond registration.
+
 <!-- FEATURES -->
 ## Features
 
