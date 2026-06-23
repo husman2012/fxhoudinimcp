@@ -566,7 +566,138 @@ def import_fbx_animation(path: str, dest: str = None, cascadeur: bool = False) -
 
 
 # ---------------------------------------------------------------------------
-# Registration — ALL three read-only + TWO new mutating
+# setup_bonedeform
+# ---------------------------------------------------------------------------
+
+def setup_bonedeform(rest: str, anim: str, geo: str, dest: str = None) -> dict:
+    """Wire a bonedeform SOP from rest skeleton, animated skeleton, and captured skin geo.
+
+    Authoritative bonedeform input order (probed 2026-06-23 — plan riskNotes):
+      * input 0 — geo  (Geometry to Deform)
+      * input 1 — rest (Rest Point Transforms)
+      * input 2 — anim (Deform Point Transforms)
+
+    FR-2 (fail-loud): the ENTIRE mutating body is wrapped in an outer
+    try/except Exception so that NO code path raises past the handler boundary.
+    All failures return {"ok": False, "error": "<msg>"}.
+
+    FR-5 (missing capture guard): ``has_capture_weight`` is read from the INPUT
+    ``geo_node.geometry()``, NOT from ``bd.geometry()``.  bonedeform's
+    ``deletecaptureattrib`` parm may strip capture attributes from the output,
+    making an output-side check unreliable.
+
+    FR-12 (verify-after-mutate): a validator sub-dict is embedded in the return
+    envelope so the caller can inspect what was wired without a second query.
+
+    Args:
+        rest: Houdini scene path to the rest skeleton SOP node.
+        anim: Houdini scene path to the animated skeleton SOP node.
+        geo:  Houdini scene path to the captured skin geometry SOP node.
+        dest: Optional Houdini scene path for the SOP parent. Defaults to None
+              (auto-creates / reuses a geo container under /obj).
+
+    Returns::
+
+        {
+            "ok": True,
+            "node": "<created node path>",
+            "skeleton": {
+                "joints": <int>,        # @name point count from anim node
+                "frame_range": [s, e]   # from hou.playbar, or null if unreadable
+            },
+            "validator": {
+                "cook_errors": [],
+                "deformed_points": <int>,
+                "has_capture_weight": <bool>,
+                "note": "verify-after-mutate"
+            }
+        }
+
+    or on error::
+
+        {"ok": False, "error": "<message>"}
+    """
+    if not all([rest, anim, geo]):
+        return {"ok": False, "error": "setup_bonedeform requires 'rest', 'anim', and 'geo' params"}
+
+    # ── FR-2 outer envelope — wraps ALL Houdini mutation + geometry reads ─────
+    try:
+        geo_node = _get_node(geo)
+        rest_node = _get_node(rest)
+        anim_node = _get_node(anim)
+
+        parent = _resolve_sop_parent(dest, "mcp_bonedeform")
+
+        bd = parent.createNode("bonedeform", "mcp_bonedeform")
+        # Authoritative input wiring order from bonedeform SOP probe:
+        #   input 0 = "Geometry to Deform"  → geo
+        #   input 1 = "Rest Point Transforms" → rest
+        #   input 2 = "Deform Point Transforms" → anim
+        bd.setInput(0, geo_node)
+        bd.setInput(1, rest_node)
+        bd.setInput(2, anim_node)
+
+        try:
+            bd.cook(force=True)
+        except Exception as exc:
+            errs = bd.errors()
+            return {"ok": False, "error": "\n".join(errs) if errs else str(exc)}
+
+        errs = bd.errors()
+        if errs:
+            return {"ok": False, "error": "\n".join(errs)}
+
+        # ── skeleton summary: joint count from anim node @name attr ──────────
+        anim_geom = anim_node.geometry()
+        joint_count = 0
+        if anim_geom is not None:
+            name_attrib = anim_geom.findPointAttrib("name")
+            if name_attrib is not None:
+                joint_count = anim_geom.intrinsicValue("pointcount")
+
+        # ── frame range from playbar (best-effort) ────────────────────────────
+        frame_range = None
+        try:
+            s = int(hou.playbar.playbackRange()[0])
+            e = int(hou.playbar.playbackRange()[1])
+            frame_range = [s, e]
+        except (AttributeError, hou.Error, RuntimeError) as exc:
+            _log.warning("setup_bonedeform: could not read playbar range: %s", exc)
+
+        # ── deformed output point count ───────────────────────────────────────
+        bd_geom = bd.geometry()
+        deformed_points = (
+            bd_geom.intrinsicValue("pointcount") if bd_geom is not None else 0
+        )
+
+        return {
+            "ok": True,
+            "node": bd.path(),
+            "skeleton": {
+                "joints": joint_count,
+                "frame_range": frame_range,
+            },
+            "validator": {
+                "cook_errors": [],
+                "deformed_points": deformed_points,
+                # FR-5: read from INPUT geo_node (not bd.geometry() which deletecaptureattrib
+                # may strip). KineFX stores capture as a single "boneCapture" point attrib;
+                # the prefix check catches that AND the _weight / _index suffix variants.
+                "has_capture_weight": any(
+                    a.name().startswith("boneCapture")
+                    for a in geo_node.geometry().pointAttribs()
+                ),
+                "note": "verify-after-mutate",
+            },
+        }
+
+    except Exception as exc:
+        # FR-2: catch everything from _get_node / createNode / setInput / geometry reads.
+        return {"ok": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Registration — ALL three read-only + TWO mutating (PR-3) + ONE mutating (PR-4)
 # ---------------------------------------------------------------------------
 
 register_handler("kinefx_probe", kinefx_probe, Capability.READONLY)
@@ -574,3 +705,4 @@ register_handler("query_skeleton", query_skeleton, Capability.READONLY)
 register_handler("inspect_apex", inspect_apex, Capability.READONLY)
 register_handler("import_fbx_character", import_fbx_character, Capability.MUTATING)
 register_handler("import_fbx_animation", import_fbx_animation, Capability.MUTATING)
+register_handler("setup_bonedeform", setup_bonedeform, Capability.MUTATING)

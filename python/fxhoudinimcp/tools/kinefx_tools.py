@@ -167,3 +167,64 @@ async def houdini_import_fbx_animation(
     return await bridge.execute(
         "import_fbx_animation", {"path": path, "dest": dest, "cascadeur": cascadeur}
     )
+
+
+# ---------------------------------------------------------------------------
+# PR-4 -- GATED bonedeform wiring tool (require_approval=True)
+# ---------------------------------------------------------------------------
+
+@mcp.tool(meta={"require_approval": True})
+async def houdini_setup_bonedeform(
+    ctx: Context,
+    rest: str,
+    anim: str,
+    geo: str,
+    dest: str = "/obj",
+) -> dict[str, Any]:
+    """Wire a bonedeform SOP from rest skeleton, animated skeleton, and captured skin geo (GATED).
+
+    Creates a ``bonedeform`` SOP under *dest*, wires the three inputs in the
+    authoritative probe order, cooks, and returns a verify-after-mutate envelope
+    (FR-12).
+
+    Input wiring (authoritative probed order — plan riskNotes):
+      * input 0 -- ``geo``  (Geometry to Deform)
+      * input 1 -- ``rest`` (Rest Point Transforms)
+      * input 2 -- ``anim`` (Deform Point Transforms)
+
+    Capability: MUTATING -- routed through the PP12-109 security gate.
+
+    Returns::
+
+        {
+            "ok": True,
+            "node": "<created node path>",
+            "skeleton": {
+                "joints": <int>,          # point count from anim node @name attrib
+                "frame_range": [s, e]     # playbar range, or null if unreadable
+            },
+            "validator": {
+                "cook_errors": [],
+                "deformed_points": <int>, # point count from bd.geometry()
+                "has_capture_weight": <bool>,  # read from INPUT geo, not bd output
+                "note": "verify-after-mutate"
+            }
+        }
+
+    On cook error::
+
+        {"ok": False, "error": "<node error messages>"}
+
+    Args:
+        ctx: MCP request context (injected by FastMCP).
+        rest: Houdini scene path to the rest skeleton SOP node.
+        anim: Houdini scene path to the animated skeleton SOP node.
+        geo:  Houdini scene path to the captured skin geometry SOP node.
+        dest: Houdini scene path under which to create the bonedeform node
+              (default ``/obj``).
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute(
+        "setup_bonedeform",
+        {"rest": rest, "anim": anim, "geo": geo, "dest": dest},
+    )
