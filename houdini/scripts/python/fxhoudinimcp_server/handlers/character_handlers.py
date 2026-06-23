@@ -1,17 +1,33 @@
-"""KineFX / APEX read-only handlers for fxhoudinimcp (PP12-110 PR-2).
+"""KineFX / APEX handlers for fxhoudinimcp (PP12-110 PR-2 + PR-3).
 
-All three handlers are READONLY — they inspect existing cooked geometry and
-APEX graph state without creating nodes, cooking, or writing anything.
+PR-2 (read-only): kinefx_probe, query_skeleton, inspect_apex — inspect
+existing cooked geometry / APEX graph state without creating nodes or writing.
 
-Registered via register_handler(..., Capability.READONLY).
-hdefereval.executeInMainThreadWithResult is called inside the dispatcher,
-not here — these are plain Python functions.
+PR-3 (mutating / gated): import_fbx_character, import_fbx_animation —
+create + cook kinefx::fbxcharacter/animimport nodes, then return a
+skeleton summary.  Registered with Capability.MUTATING.
+
+FR-2 (fail-loud) contract for MUTATING handlers:
+    NO code path may raise past the handler boundary.  Every failure MUST
+    return {"ok": False, "error": "<msg>"}.  An outer try/except Exception
+    wraps the entire mutating body after param validation.
+
+FR-4 (dest contract) for MUTATING handlers:
+    - If dest is explicitly provided and hou.node(dest) returns None → fail loud.
+    - If dest is omitted (defaults to "/obj") OR resolves to an OBJ-context
+      network manager (hou.objNodeTypeCategory), create/reuse a geo container
+      and place the SOP import node inside it.  This is required because
+      kinefx::fbxcharacterimport and kinefx::fbxanimimport are SOP types and
+      cannot be placed directly under an OBJ-context network.
 """
 
 from __future__ import annotations
 
+import logging
 import hou
 from fxhoudinimcp_server.dispatcher import Capability, register_handler
+
+_log = logging.getLogger(__name__)
 
 # ── kinefx_model reuse (PR-1) — sys.path bootstrap for Houdini load ─────────
 # fxhoudinimcp (MCP-client) lives in <fork>/python/, which is NOT on Houdini's
@@ -50,6 +66,64 @@ def _get_node(node_path: str) -> hou.Node:
     if node is None:
         raise ValueError(f"Node not found: {node_path!r}")
     return node
+
+
+def _resolve_sop_parent(dest: str | None, geo_name: str) -> hou.Node:
+    """Return a SOP-context parent node suitable for FBX import nodes.
+
+    Rules (FR-4 dest contract):
+      * If *dest* was explicitly provided by the caller (not the sentinel "/obj"
+        default) and hou.node(dest) is None → raise ValueError so the outer
+        FR-2 envelope can return {ok: False, error: ...}.
+      * If *dest* is None or "/obj" (the default sentinel) → the caller did not
+        specify a destination.  Create or reuse a geo container under /obj so
+        the SOP import node has a valid SOP-context parent.
+      * If *dest* resolves to an OBJ-category network (hou.objNodeTypeCategory)
+        → same treatment: create/reuse a geo container inside it.  Placing a
+        SOP type directly under an OBJ manager raises hou.OperationFailed.
+      * Otherwise *dest* is assumed to be a valid SOP-context parent (e.g.
+        /obj/geo1) — return it directly.
+
+    The sentinel value "/obj" is the module-level default for both handlers
+    and signals "caller did not supply a dest" rather than "caller explicitly
+    wants /obj as the parent".
+
+    Args:
+        dest: the raw dest string from params (None → not supplied).
+        geo_name: name for the geo node created as a SOP container
+                  (e.g. "mcp_fbx_char" or "mcp_fbx_anim").
+
+    Returns:
+        A hou.Node whose category is SOP-context (suitable for createNode of
+        kinefx::fbxcharacterimport / kinefx::fbxanimimport).
+
+    Raises:
+        ValueError: when dest was explicitly provided but does not exist in the
+                    current scene.
+    """
+    _DEFAULT_DEST = "/obj"
+
+    if dest is None or dest == _DEFAULT_DEST:
+        # Caller did not supply a destination — use /obj and wrap in a geo node.
+        obj_net = hou.node("/obj")
+        if obj_net is None:
+            raise ValueError("Scene /obj network not found — is a Houdini session active?")
+        # Reuse an existing geo node of the same name, or create a fresh one.
+        existing = obj_net.node(geo_name)
+        return existing if existing is not None else obj_net.createNode("geo", geo_name)
+
+    # Caller supplied an explicit dest — it MUST exist.
+    parent = hou.node(dest)
+    if parent is None:
+        raise ValueError(f"dest node not found: {dest!r}")
+
+    # If dest is an OBJ-category network, wrap in a geo container.
+    if parent.childTypeCategory() == hou.objNodeTypeCategory():
+        existing = parent.node(geo_name)
+        return existing if existing is not None else parent.createNode("geo", geo_name)
+
+    # dest is a valid SOP-context parent (e.g. /obj/my_geo).
+    return parent
 
 
 # ---------------------------------------------------------------------------
@@ -275,9 +349,220 @@ def inspect_apex(params: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Registration — ALL three are READONLY
+# import_fbx_character
+# ---------------------------------------------------------------------------
+
+def import_fbx_character(params: dict) -> dict:
+    """Import an FBX character rig via kinefx::fbxcharacterimport.
+
+    Creates the import node under *dest*, sets the FBX file path, cooks,
+    and returns a skeleton summary built from the node's outputs:
+
+    * OUT 0 — skin mesh  (has_skin_geo = True when it has points)
+    * OUT 1 — deformation skeleton, 84 joints with @name attr  (the one we count)
+
+    FR-2 (fail-loud): the ENTIRE mutating body is wrapped in an outer
+    try/except Exception so that NO code path raises past the handler boundary.
+    createNode, parm().set(), cook(), geometry() reads, and all other Houdini
+    calls return {"ok": False, "error": "<msg>"} on any exception.
+
+    FR-4 (dest contract): if dest is explicitly provided but does not exist in
+    the scene, returns {"ok": False, "error": "dest node not found: '<dest>'"}.
+    If dest is omitted (default) or is the OBJ network manager, the SOP import
+    node is placed inside a geo container.
+
+    FR-12 (verify-after-mutate): skeleton summary is embedded in the return
+    envelope so the caller can inspect what was imported without a second query.
+
+    Returns::
+
+        {
+            "ok": True,
+            "node": "<node path>",
+            "skeleton": {
+                "joints": <int>,       # point count at OUT 1 (@name attr)
+                "has_skin_geo": <bool> # OUT 0 has at least one point
+            }
+        }
+
+    or on error::
+
+        {"ok": False, "error": "<message>"}
+    """
+    path = params.get("path")
+    # dest=None means "caller did not supply"; "/obj" is the legacy default —
+    # both are handled by _resolve_sop_parent which wraps them in a geo node.
+    dest = params.get("dest", None)
+
+    if not path:
+        # param validation failures are the ONE category allowed to raise (they
+        # are programming errors, not Houdini operation failures).
+        raise ValueError("import_fbx_character requires 'path'")
+
+    # ── FR-2 outer envelope — wraps ALL Houdini mutation + geometry reads ─────
+    try:
+        parent = _resolve_sop_parent(dest, "mcp_fbx_char")
+
+        # Guard parm() result: returns None on SDK drift (FR-2 Major-2).
+        imp = parent.createNode("kinefx::fbxcharacterimport", "mcp_fbxcharacterimport")
+        fbxfile_parm = imp.parm("fbxfile")
+        if fbxfile_parm is None:
+            return {"ok": False, "error": "parm 'fbxfile' not found on kinefx::fbxcharacterimport — SDK version mismatch?"}
+        fbxfile_parm.set(path)
+
+        try:
+            imp.cook(force=True)
+        except Exception as exc:
+            errs = imp.errors()
+            err_msg = "\n".join(errs) if errs else str(exc)
+            return {"ok": False, "error": err_msg}
+
+        errs = imp.errors()
+        if errs:
+            return {"ok": False, "error": "\n".join(errs)}
+
+        # OUT 1 — deformation skeleton with @name point attribute (84 joints for WorkersWelders)
+        # hou.SopNode.geometry(output_index) is the correct API; geometryAtOutput() does not exist.
+        # These reads are INSIDE the outer try/except (FR-2 Major-1): a malformed FBX with
+        # fewer than 2 outputs raises hou.OperationFailed, which is caught below.
+        skel_geo = imp.geometry(1)
+        joint_count = 0
+        if skel_geo is not None:
+            name_attr = skel_geo.findPointAttrib("name")
+            if name_attr is not None:
+                joint_count = skel_geo.intrinsicValue("pointcount")
+
+        # OUT 0 — skin mesh; has_skin_geo is True when it has at least one point
+        skin_geo = imp.geometry(0)
+        has_skin_geo = bool(
+            skin_geo is not None and skin_geo.intrinsicValue("pointcount") > 0
+        )
+
+        return {
+            "ok": True,
+            "node": imp.path(),
+            "skeleton": {"joints": joint_count, "has_skin_geo": has_skin_geo},
+        }
+
+    except Exception as exc:
+        # FR-2: catch everything from createNode / parm.set / geometry reads.
+        return {"ok": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# import_fbx_animation
+# ---------------------------------------------------------------------------
+
+def import_fbx_animation(params: dict) -> dict:
+    """Import FBX animation via kinefx::fbxanimimport (Cascadeur first-class).
+
+    Creates the import node under *dest*, sets the FBX file path, optionally
+    sets ``convertunits`` for Cascadeur FBX files, and cooks.
+
+    * OUT 0 (single output) — skeleton with @name attr + baked animation
+
+    FR-2 (fail-loud): the ENTIRE mutating body is wrapped in an outer
+    try/except Exception so that NO code path raises past the handler boundary.
+    createNode, parm().set(), cook(), geometry() reads, and frame-range parm
+    reads all return {"ok": False, "error": "<msg>"} on any exception.
+
+    FR-3 (Cascadeur): when ``cascadeur=True``, sets the ``convertunits`` parm
+    (confirmed present on kinefx::fbxanimimport via hython probe, 2026-06-22).
+
+    FR-4 (dest contract): if dest is explicitly provided but does not exist,
+    returns {"ok": False, "error": "dest node not found: '<dest>'"}.
+    When dest is omitted/default, wraps in a geo container (SOP-context parent).
+
+    FR-12 (verify-after-mutate): skeleton summary embedded in return envelope.
+
+    Returns::
+
+        {
+            "ok": True,
+            "node": "<node path>",
+            "skeleton": {
+                "joints": <int>,
+                "frame_range": [<start>, <end>]  # when parms are readable
+            }
+        }
+
+    or on error::
+
+        {"ok": False, "error": "<message>"}
+    """
+    path = params.get("path")
+    # dest=None means "caller did not supply"; "/obj" is the legacy default —
+    # both are handled by _resolve_sop_parent which wraps them in a geo node.
+    dest = params.get("dest", None)
+    cascadeur = params.get("cascadeur", False)
+
+    if not path:
+        # param validation failures are the ONE category allowed to raise.
+        raise ValueError("import_fbx_animation requires 'path'")
+
+    # ── FR-2 outer envelope — wraps ALL Houdini mutation + geometry reads ─────
+    try:
+        parent = _resolve_sop_parent(dest, "mcp_fbx_anim")
+
+        # Guard parm() result: returns None on SDK drift (FR-2 Major-2).
+        imp = parent.createNode("kinefx::fbxanimimport", "mcp_fbxanimimport")
+        fbxfile_parm = imp.parm("fbxfile")
+        if fbxfile_parm is None:
+            return {"ok": False, "error": "parm 'fbxfile' not found on kinefx::fbxanimimport — SDK version mismatch?"}
+        fbxfile_parm.set(path)
+
+        # FR-3: Cascadeur convertunits flag (parm may be absent on older builds).
+        if cascadeur:
+            cu_parm = imp.parm("convertunits")
+            if cu_parm is not None:
+                cu_parm.set(1)
+
+        try:
+            imp.cook(force=True)
+        except Exception as exc:
+            errs = imp.errors()
+            err_msg = "\n".join(errs) if errs else str(exc)
+            return {"ok": False, "error": err_msg}
+
+        errs = imp.errors()
+        if errs:
+            return {"ok": False, "error": "\n".join(errs)}
+
+        # OUT 0 — single output: skeleton with @name + baked animation data.
+        # INSIDE the outer try/except (FR-2 Major-1).
+        geo = imp.geometry()
+        joint_count = 0
+        if geo is not None:
+            name_attr = geo.findPointAttrib("name")
+            if name_attr is not None:
+                joint_count = geo.intrinsicValue("pointcount")
+
+        skeleton: dict = {"joints": joint_count}
+
+        # Attempt to read frame range from FBX import parms (optional — absent = skip).
+        # FR-2 Major-3 fix: narrow the bare except to specific Houdini exception types
+        # and log a warning so the omission is observable rather than silent.
+        try:
+            start_parm = imp.parm("animationstartframe")
+            end_parm = imp.parm("animationendframe")
+            if start_parm is not None and end_parm is not None:
+                skeleton["frame_range"] = [int(start_parm.eval()), int(end_parm.eval())]
+        except (hou.OperationFailed, hou.Error, RuntimeError) as exc:
+            _log.warning("import_fbx_animation: could not read frame range parms: %s", exc)
+
+        return {"ok": True, "node": imp.path(), "skeleton": skeleton}
+
+    except Exception as exc:
+        # FR-2: catch everything from createNode / parm.set / cook / geometry reads.
+        return {"ok": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Registration — ALL three read-only + TWO new mutating
 # ---------------------------------------------------------------------------
 
 register_handler("kinefx_probe", kinefx_probe, Capability.READONLY)
 register_handler("query_skeleton", query_skeleton, Capability.READONLY)
 register_handler("inspect_apex", inspect_apex, Capability.READONLY)
+register_handler("import_fbx_character", import_fbx_character, Capability.MUTATING)
+register_handler("import_fbx_animation", import_fbx_animation, Capability.MUTATING)
