@@ -1,10 +1,18 @@
-"""MCP tool wrappers for the 3 read-only KineFX/APEX handlers (PP12-110 PR-2).
+"""MCP tool wrappers for the KineFX/APEX handlers (PP12-110 PR-2 + PR-3).
 
-All three tools are:
-- require_approval=False  (read-only — they never prompt/gate)
-- Capability.READONLY on the handler side
+PR-2 (read-only): kinefx_probe, query_skeleton, inspect_apex — inspect
+existing cooked geometry / APEX graph state without creating nodes or writing.
 
-The wrappers call bridge.call(command, **kwargs) — NOT bridge.execute.
+PR-3 (mutating / gated): houdini_import_fbx_character, houdini_import_fbx_animation --
+create + cook kinefx::fbxcharacterimport / fbxanimimport nodes, then return a
+skeleton summary.
+
+All five tools call the bridge using the canonical convention:
+    bridge = _get_bridge(ctx)
+    return await bridge.execute("<command>", {<params dict>})
+
+This matches every other tool in this codebase (e.g. tools/nodes.py).
+bridge.call() does NOT exist on HoudiniBridge -- never use it.
 """
 
 from __future__ import annotations
@@ -27,8 +35,8 @@ async def kinefx_probe(ctx: Context, node_path: str = "/obj") -> dict[str, Any]:
         ctx: MCP request context (injected by FastMCP).
         node_path: Scene path to inspect (default ``/obj``).
     """
-    bridge = _get_bridge()
-    return await bridge.call("kinefx_probe", node_path=node_path)
+    bridge = _get_bridge(ctx)
+    return await bridge.execute("kinefx_probe", {"node_path": node_path})
 
 
 @mcp.tool(meta={"require_approval": False})
@@ -39,7 +47,7 @@ async def query_skeleton(
 ) -> dict[str, Any]:
     """Read joint hierarchy and transforms from a cooked skeleton SOP.
 
-    Serialises the skeleton using the §7.3 JSON shape::
+    Serialises the skeleton using the section 7.3 JSON shape::
 
         {"count": N, "joints": [{"name": ..., "parent": ..., "rest": {...}}, ...]}
 
@@ -48,13 +56,13 @@ async def query_skeleton(
         node_path: Path to the skeleton SOP node.
         frame: Optional frame number to sample; uses current frame if None.
     """
-    bridge = _get_bridge()
-    return await bridge.call("query_skeleton", node_path=node_path, frame=frame)
+    bridge = _get_bridge(ctx)
+    return await bridge.execute("query_skeleton", {"node_path": node_path, "frame": frame})
 
 
 @mcp.tool(meta={"require_approval": False})
 async def inspect_apex(ctx: Context, node_path: str) -> dict[str, Any]:
-    """Summarise an APEX graph node — nodes, wires, control count.
+    """Summarise an APEX graph node -- nodes, wires, control count.
 
     Returns::
 
@@ -68,12 +76,12 @@ async def inspect_apex(ctx: Context, node_path: str) -> dict[str, Any]:
         ctx: MCP request context (injected by FastMCP).
         node_path: Path to the APEX graph node.
     """
-    bridge = _get_bridge()
-    return await bridge.call("inspect_apex", node_path=node_path)
+    bridge = _get_bridge(ctx)
+    return await bridge.execute("inspect_apex", {"node_path": node_path})
 
 
 # ---------------------------------------------------------------------------
-# PR-3 — GATED mutating import tools (require_approval=True)
+# PR-3 -- GATED mutating import tools (require_approval=True)
 # ---------------------------------------------------------------------------
 
 @mcp.tool(meta={"require_approval": True})
@@ -82,12 +90,12 @@ async def houdini_import_fbx_character(
     path: str,
     dest: str = "/obj",
 ) -> dict[str, Any]:
-    """Import an FBX character rig via kinefx::fbxcharacterimport (GATED — mutating).
+    """Import an FBX character rig via kinefx::fbxcharacterimport (GATED -- mutating).
 
     Creates a ``kinefx::fbxcharacterimport`` node under *dest*, cooks it, and
     returns a skeleton summary for verify-after-mutate (FR-12).
 
-    Capability: MUTATING — routed through the PP12-109 security gate.
+    Capability: MUTATING -- routed through the PP12-109 security gate.
 
     Returns::
 
@@ -110,8 +118,8 @@ async def houdini_import_fbx_character(
         dest: Houdini scene path under which to create the import node
               (default ``/obj``).
     """
-    bridge = _get_bridge()
-    return await bridge.call("import_fbx_character", path=path, dest=dest)
+    bridge = _get_bridge(ctx)
+    return await bridge.execute("import_fbx_character", {"path": path, "dest": dest})
 
 
 @mcp.tool(meta={"require_approval": True})
@@ -130,7 +138,7 @@ async def houdini_import_fbx_animation(
     import node to handle Cascadeur's non-standard unit conventions (FR-3,
     confirmed present via hython probe 2026-06-22).
 
-    Capability: MUTATING — routed through the PP12-109 security gate.
+    Capability: MUTATING -- routed through the PP12-109 security gate.
 
     Returns::
 
@@ -155,7 +163,7 @@ async def houdini_import_fbx_animation(
         cascadeur: When ``True``, sets ``convertunits`` parm for Cascadeur FBX
                    files.  Default ``False``.
     """
-    bridge = _get_bridge()
-    return await bridge.call(
-        "import_fbx_animation", path=path, dest=dest, cascadeur=cascadeur
+    bridge = _get_bridge(ctx)
+    return await bridge.execute(
+        "import_fbx_animation", {"path": path, "dest": dest, "cascadeur": cascadeur}
     )

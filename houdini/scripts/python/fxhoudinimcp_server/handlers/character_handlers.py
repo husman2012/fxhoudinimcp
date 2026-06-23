@@ -130,12 +130,16 @@ def _resolve_sop_parent(dest: str | None, geo_name: str) -> hou.Node:
 # kinefx_probe
 # ---------------------------------------------------------------------------
 
-def kinefx_probe(params: dict) -> dict:
+def kinefx_probe(node_path: str = "/obj") -> dict:
     """Report which KineFX/APEX node types resolve in the installed Houdini build.
 
     This is a build-level type-availability check — it tests whether each of
     the 7 FR-1 node types is installed and resolvable via the SOP node-type
     registry, NOT whether any instances exist under a given scene path.
+
+    Args:
+        node_path: Scene path hint (unused for type-probe; reserved for future
+                   scoped probes). Defaults to "/obj".
 
     Returns::
         {
@@ -165,7 +169,7 @@ def kinefx_probe(params: dict) -> dict:
 # query_skeleton
 # ---------------------------------------------------------------------------
 
-def query_skeleton(params: dict) -> dict:
+def query_skeleton(node_path: str, frame: float | None = None) -> dict:
     """Read joint hierarchy + transforms from a cooked skeleton SOP node.
 
     Reads the geometry at the given node path (optionally at *frame*) and
@@ -173,6 +177,10 @@ def query_skeleton(params: dict) -> dict:
     kinefx_model.pack_trs, kinefx_model.skeleton_to_json).
 
     Does NOT cook the node; reads existing cooked geometry only.
+
+    Args:
+        node_path: Absolute path to the cooked skeleton SOP node.
+        frame: Optional frame number to sample at; uses current cooked geo if None.
 
     Returns the §7.3 JSON shape::
         {
@@ -191,11 +199,6 @@ def query_skeleton(params: dict) -> dict:
             ]
         }
     """
-    node_path: str = params.get("node_path")
-    if not node_path:
-        raise ValueError("query_skeleton requires 'node_path'")
-
-    frame = params.get("frame")
     node = _get_node(node_path)
 
     # Optionally sample at a specific frame
@@ -268,7 +271,7 @@ def query_skeleton(params: dict) -> dict:
 # inspect_apex
 # ---------------------------------------------------------------------------
 
-def inspect_apex(params: dict) -> dict:
+def inspect_apex(node_path: str) -> dict:
     """Return a summary of an APEX graph node.
 
     Walks the APEX graph stored at node_path and returns an ApexGraphSummary
@@ -281,11 +284,10 @@ def inspect_apex(params: dict) -> dict:
         }
 
     Does NOT cook or modify the APEX graph.
-    """
-    node_path: str = params.get("node_path")
-    if not node_path:
-        raise ValueError("inspect_apex requires 'node_path'")
 
+    Args:
+        node_path: Absolute path to the APEX SOP node.
+    """
     node = _get_node(node_path)
 
     # APEX graphs are stored in the geometry as a special attribute.
@@ -352,7 +354,7 @@ def inspect_apex(params: dict) -> dict:
 # import_fbx_character
 # ---------------------------------------------------------------------------
 
-def import_fbx_character(params: dict) -> dict:
+def import_fbx_character(path: str, dest: str = None) -> dict:
     """Import an FBX character rig via kinefx::fbxcharacterimport.
 
     Creates the import node under *dest*, sets the FBX file path, cooks,
@@ -374,6 +376,11 @@ def import_fbx_character(params: dict) -> dict:
     FR-12 (verify-after-mutate): skeleton summary is embedded in the return
     envelope so the caller can inspect what was imported without a second query.
 
+    Args:
+        path: Absolute file-system path to the FBX file.
+        dest: Optional scene node path for the SOP parent. Defaults to None
+              (auto-creates a geo container under /obj).
+
     Returns::
 
         {
@@ -389,10 +396,8 @@ def import_fbx_character(params: dict) -> dict:
 
         {"ok": False, "error": "<message>"}
     """
-    path = params.get("path")
     # dest=None means "caller did not supply"; "/obj" is the legacy default —
     # both are handled by _resolve_sop_parent which wraps them in a geo node.
-    dest = params.get("dest", None)
 
     if not path:
         # param validation failures are the ONE category allowed to raise (they
@@ -453,7 +458,7 @@ def import_fbx_character(params: dict) -> dict:
 # import_fbx_animation
 # ---------------------------------------------------------------------------
 
-def import_fbx_animation(params: dict) -> dict:
+def import_fbx_animation(path: str, dest: str = None, cascadeur: bool = False) -> dict:
     """Import FBX animation via kinefx::fbxanimimport (Cascadeur first-class).
 
     Creates the import node under *dest*, sets the FBX file path, optionally
@@ -475,6 +480,12 @@ def import_fbx_animation(params: dict) -> dict:
 
     FR-12 (verify-after-mutate): skeleton summary embedded in return envelope.
 
+    Args:
+        path: Absolute file-system path to the FBX file.
+        dest: Optional scene node path for the SOP parent. Defaults to None
+              (auto-creates a geo container under /obj).
+        cascadeur: When True, sets the ``convertunits`` parm for Cascadeur FBX.
+
     Returns::
 
         {
@@ -490,11 +501,8 @@ def import_fbx_animation(params: dict) -> dict:
 
         {"ok": False, "error": "<message>"}
     """
-    path = params.get("path")
     # dest=None means "caller did not supply"; "/obj" is the legacy default —
     # both are handled by _resolve_sop_parent which wraps them in a geo node.
-    dest = params.get("dest", None)
-    cascadeur = params.get("cascadeur", False)
 
     if not path:
         # param validation failures are the ONE category allowed to raise.
