@@ -358,6 +358,29 @@ def unmapped_target_joints(
     return [name for name in target_joint_names if name not in mapped]
 
 
+def affected_target_joints(
+    requested_joints: list,  # list[str] -- joints caller wants secondarymotion applied to
+    actual_joint_names: list,  # list[str] -- all joint names present in the skeleton
+) -> list:  # list[str] -- requested joints that exist in the skeleton
+    """Return the subset of requested_joints that exist in actual_joint_names.
+
+    Preserves the order of requested_joints (NOT the order of actual_joint_names).
+    Joints absent from the skeleton are silently dropped.
+
+    Args:
+        requested_joints: joints the caller asked to apply secondarymotion to.
+                          May be None or empty -- both mean "no specific joints".
+        actual_joint_names: ordered list of all joint names in the target skeleton.
+
+    Returns:
+        An ordered list (by requested_joints order) of joint names that exist
+        in actual_joint_names.  Empty list means no requested joint exists in
+        the skeleton.
+    """
+    actual_set = set(actual_joint_names)
+    return [name for name in (requested_joints or []) if name in actual_set]
+
+
 def validate_mapping(
     retarget_map: "RetargetMap",
     source_skeleton: "Skeleton",

@@ -309,3 +309,61 @@ async def houdini_setup_retarget(
             "dest": dest,
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# PR-6 -- GATED secondary motion tool (require_approval=True)
+# ---------------------------------------------------------------------------
+
+@mcp.tool(meta={"require_approval": True})
+async def houdini_apply_secondarymotion(
+    ctx: Context,
+    node: str,
+    joints: list | None = None,
+    params: dict | None = None,
+    dest: str = "/obj",
+) -> dict[str, Any]:
+    """Apply kinefx::secondarymotion to a skeleton SOP (GATED -- mutating).
+
+    Wires a single ``kinefx::secondarymotion`` SOP onto a skeleton node,
+    sets ``jointgroup`` from the joints list and effect parameters from the
+    pass-through params dict (real probe-confirmed parm names), cooks it so
+    the chosen effect (lagovershoot / jiggle / spring) is applied WITHOUT
+    a simulation, and returns ``{ok, node, affected_joints, frame_range}``.
+
+    Capability: MUTATING -- routed through the PP12-109 security gate.
+
+    Returns::
+
+        {
+            "ok": True,
+            "node": "<created node path>",
+            "affected_joints": <int>,       # count of joints affected
+            "frame_range": [s, e],          # playbar range
+            "ignored_params": [...]         # only present when non-empty
+        }
+
+    On error::
+
+        {"ok": False, "error": "<message>"}
+
+    Args:
+        ctx: MCP request context (injected by FastMCP).
+        node: Houdini scene path to the skeleton SOP node to attach to.
+        joints: Optional list of joint names to apply secondarymotion to.
+                When None or empty, applies to ALL joints.
+        params: Optional dict of parm-name → value for the secondarymotion
+                node.  Keys are real Houdini parm names (probe-confirmed):
+                ``effect``, ``effectmult``, ``lag``, ``overshoot``,
+                ``stiffness``, ``jiggledamping``, ``limit``, ``flex``,
+                ``multiplier``, ``springconstant``, ``mass``, ``damping``.
+                Scalar values are broadcast to multi-component parmTuples.
+                Unknown keys are silently collected into ``ignored_params``.
+        dest: Houdini scene path under which to create the secondarymotion
+              node (default ``/obj``).
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute(
+        "apply_secondarymotion",
+        {"node": node, "joints": joints, "params": params, "dest": dest},
+    )

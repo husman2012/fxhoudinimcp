@@ -54,6 +54,7 @@ from fxhoudinimcp.kinefx_model import (
     skeleton_to_json,
     validate_mapping,
     unmapped_target_joints,  # pp12-110e — RED: does not exist yet
+    affected_target_joints,  # pp12-110f — RED: does not exist yet
 )
 
 
@@ -869,4 +870,83 @@ class TestUnmappedTargetJoints:
         result = unmapped_target_joints(mapping_pairs, target_joint_names)
         assert result == ["c", "a"], (
             f"Expected ['c', 'a'] (target_joint_names order), got {result!r}"
+        )
+
+
+# ===========================================================================
+# Section 11 — affected_target_joints (pp12-110f RED phase)
+#
+# Public contract (plan pp12-110f decomposition):
+#   affected_target_joints(
+#       requested_joints: list[str],    # joints the caller asked to apply secondarymotion to
+#       actual_joint_names: list[str],  # ordered list of all joint names in the skeleton
+#   ) -> list[str]
+#
+#   Returns the subset of requested_joints that actually exist in
+#   actual_joint_names, preserving the order of requested_joints (NOT the
+#   order of actual_joint_names).
+#
+#   Rationale: used by apply_secondarymotion handler to resolve the user's
+#   requested joint list against the real skeleton before wiring the
+#   kinefx::secondarymotion node.  Joints absent from the skeleton are
+#   silently dropped (caller is responsible for surfacing warnings).
+#
+# Mirrors the shape of unmapped_target_joints — same module, same pure-logic
+# layer, same off-DCC test rung (pytest-model).
+#
+# These tests are RED — affected_target_joints does not exist yet in
+# kinefx_model.py.  They will fail with ImportError on the first run
+# (the import block at line 43 now includes affected_target_joints, which
+# is absent from the module).
+# ===========================================================================
+
+class TestAffectedTargetJoints:
+    """affected_target_joints — requested joints filtered to those present in the skeleton."""
+
+    def test_subset_present_order_follows_requested(self):
+        """Only hip and spine exist in the skeleton; ear_L is absent.
+        Result order follows requested_joints, not actual_joint_names."""
+        requested = ["hip", "spine", "ear_L"]
+        actual = ["hip", "spine", "tail_05"]
+        result = affected_target_joints(requested, actual)
+        assert result == ["hip", "spine"], (
+            f"Expected ['hip', 'spine'], got {result!r}"
+        )
+
+    def test_all_present_returns_all(self):
+        """When every requested joint exists in the skeleton, all are returned."""
+        requested = ["a", "b", "c"]
+        actual = ["a", "b", "c"]
+        result = affected_target_joints(requested, actual)
+        assert result == ["a", "b", "c"], (
+            f"Expected ['a', 'b', 'c'], got {result!r}"
+        )
+
+    def test_empty_requested_returns_empty(self):
+        """An empty requested list always returns an empty list."""
+        requested = []
+        actual = ["a", "b"]
+        result = affected_target_joints(requested, actual)
+        assert result == [], (
+            f"Expected [], got {result!r}"
+        )
+
+    def test_none_present_returns_empty(self):
+        """When none of the requested joints exist in the skeleton, return []."""
+        requested = ["x", "y"]
+        actual = ["a", "b"]
+        result = affected_target_joints(requested, actual)
+        assert result == [], (
+            f"Expected [], got {result!r}"
+        )
+
+    def test_order_follows_requested_not_actual(self):
+        """Result order must follow requested_joints, not actual_joint_names.
+        requested=['c','a'], actual=['a','b','c'] → result=['c','a'] (requested order)."""
+        requested = ["c", "a"]
+        actual = ["a", "b", "c"]
+        result = affected_target_joints(requested, actual)
+        assert result == ["c", "a"], (
+            f"Expected ['c', 'a'] (requested order), got {result!r} — "
+            "result must preserve requested_joints order, not actual_joint_names order"
         )

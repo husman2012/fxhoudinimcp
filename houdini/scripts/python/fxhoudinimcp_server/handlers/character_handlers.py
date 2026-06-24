@@ -888,8 +888,138 @@ def setup_retarget(
 
 
 # ---------------------------------------------------------------------------
+# PR-6 -- apply_secondarymotion (MUTATING / gated)
+# ---------------------------------------------------------------------------
+
+def apply_secondarymotion(node, joints=None, params=None, dest=None) -> dict:
+    """Wire kinefx::secondarymotion onto a skeleton SOP and cook it.
+
+    Applies a secondary-motion effect (lagovershoot / jiggle / spring) to
+    the skeleton WITHOUT a simulation.  Returns a flat verify-after-mutate
+    envelope (FR-12).
+
+    FR-2 (fail-loud): returns {"ok": False, "error": ...} on any failure;
+    never raises past the handler boundary.
+
+    Args:
+        node:   Houdini scene path to the skeleton SOP node (required).
+        joints: Optional list of joint name strings.  When provided, sets the
+                ``jointgroup`` parm so only those joints are affected.  When
+                None / empty, leaves jointgroup empty → ALL joints affected.
+        params: Optional dict mapping real Houdini parm names to values.
+                Probe-confirmed names: effect, effectmult, lag (len-2),
+                overshoot (len-2), stiffness, jiggledamping, limit, flex,
+                multiplier (len-3), springconstant, mass, damping.
+                Scalar values are broadcast to multi-component parmTuples.
+                Unknown parm keys are non-fatal and collected in ignored_params.
+        dest:   Houdini path under which to create the secondarymotion node.
+                Defaults to sentinel "/obj" → FR-4 creates/reuses a geo container.
+
+    Returns:
+        Success: {"ok": True, "node": <path>, "affected_joints": <int>,
+                  "frame_range": [s, e], "ignored_params": [...]}
+                 "ignored_params" key is absent when empty.
+        Failure: {"ok": False, "error": "<message>"}
+    """
+    # FR-2: validate required param BEFORE outer try so empty-string fails loud.
+    if not node:
+        return {"ok": False, "error": "node path is required"}
+
+    try:
+        # ── resolve skeleton input node ───────────────────────────────────────
+        node_node = _get_node(node)
+
+        # ── resolve SOP-context parent (FR-4) ────────────────────────────────
+        parent = _resolve_sop_parent(dest, "mcp_secondarymotion")
+
+        # ── create secondarymotion node ───────────────────────────────────────
+        sm = parent.createNode("kinefx::secondarymotion", "mcp_secondarymotion")
+
+        # Input 0 = Skeleton.  Input 1 (MotionClip) is intentionally left
+        # unconnected — secondarymotion works NO-SIM when only input 0 is wired.
+        sm.setInput(0, node_node)
+
+        # ── joint group ───────────────────────────────────────────────────────
+        if joints:
+            jg_parm = sm.parm("jointgroup")
+            if jg_parm is None:
+                return {"ok": False, "error": "jointgroup parm not found on kinefx::secondarymotion"}
+            jg_parm.set(" ".join(joints))
+        # else: leave jointgroup empty → applies to ALL joints
+
+        # ── params pass-through (parmTuple scalar-broadcast) ─────────────────
+        ignored_params = []
+        for k, v in (params or {}).items():
+            pt = sm.parmTuple(k)
+            if pt is None:
+                ignored_params.append(k)  # unknown parm key — non-fatal
+            elif isinstance(v, (list, tuple)):
+                pt.set(tuple(v))
+            else:
+                # Scalar broadcast: fills every component with the same value.
+                # Handles lag (len-2), overshoot (len-2), multiplier (len-3).
+                pt.set(tuple([v] * len(pt)))
+
+        # ── cook (inner try keeps cook errors in the ok:false envelope) ──────
+        try:
+            sm.cook(force=True)
+        except Exception as cook_exc:
+            return {"ok": False, "error": str(cook_exc)}
+
+        errs = sm.errors()
+        if errs:
+            return {"ok": False, "error": "\n".join(errs)}
+
+        # ── affected_joints count ─────────────────────────────────────────────
+        # Read @name attrib from the INPUT skeleton (the same surface the parm
+        # dialog's "Joint Group" field resolves against).
+        name_values = []
+        try:
+            in_geo = node_node.geometry()
+            if in_geo is not None:
+                name_attrib = in_geo.findPointAttrib("name")
+                if name_attrib is not None:
+                    name_values = list(in_geo.pointStringAttribValues("name"))
+        except Exception as exc:
+            _log.debug("apply_secondarymotion: could not read @name for affected_joints: %s", exc)
+
+        if joints:
+            affected = len(kinefx_model.affected_target_joints(joints, name_values))
+        elif name_values:
+            affected = len(name_values)
+        else:
+            try:
+                affected = node_node.geometry().intrinsicValue("pointcount")
+            except Exception:
+                affected = 0
+
+        # ── frame range (best-effort) ─────────────────────────────────────────
+        frame_range = None
+        try:
+            s = int(hou.playbar.playbackRange()[0])
+            e = int(hou.playbar.playbackRange()[1])
+            frame_range = [s, e]
+        except (AttributeError, hou.Error, RuntimeError) as exc:
+            _log.warning("apply_secondarymotion: could not read playbar range: %s", exc)
+
+        result = {
+            "ok": True,
+            "node": sm.path(),
+            "affected_joints": affected,
+            "frame_range": frame_range,
+        }
+        if ignored_params:
+            result["ignored_params"] = ignored_params
+        return result
+
+    except Exception as exc:
+        # FR-2: outer catch for _get_node / _resolve_sop_parent / createNode / setInput.
+        return {"ok": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
 # Registration — ALL three read-only + TWO mutating (PR-3) + ONE mutating (PR-4)
-#                + ONE mutating (PR-5)
+#                + ONE mutating (PR-5) + ONE mutating (PR-6)
 # ---------------------------------------------------------------------------
 
 register_handler("kinefx_probe", kinefx_probe, Capability.READONLY)
@@ -899,3 +1029,4 @@ register_handler("import_fbx_character", import_fbx_character, Capability.MUTATI
 register_handler("import_fbx_animation", import_fbx_animation, Capability.MUTATING)
 register_handler("setup_bonedeform", setup_bonedeform, Capability.MUTATING)
 register_handler("setup_retarget", setup_retarget, Capability.MUTATING)
+register_handler("apply_secondarymotion", apply_secondarymotion, Capability.MUTATING)
