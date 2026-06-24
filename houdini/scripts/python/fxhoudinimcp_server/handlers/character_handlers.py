@@ -697,7 +697,199 @@ def setup_bonedeform(rest: str, anim: str, geo: str, dest: str = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# PR-5 — setup_retarget
+# ---------------------------------------------------------------------------
+
+def setup_retarget(
+    source: str,
+    target: str,
+    method: str = "rigmatchpose+fullbodyik",
+    match_size: bool = True,
+    mapping: list | None = None,
+    dest: str = None,
+) -> dict:
+    """Wire a KineFX retarget chain from source skeleton to target skeleton.
+
+    Authoritative KineFX retarget chain (probed 2026-06-23):
+      * By-name path (mapping=None):
+          kinefx::rigmatchpose → kinefx::fullbodyik
+          fullbodyik.mapusing = 1 (matchattrib), attribtomatch = "name"
+      * Explicit-mapping path (mapping provided):
+          kinefx::rigmatchpose → kinefx::mappoints → kinefx::fullbodyik
+          mappoints.reftype = "attribvalue", referenceattrib = "name"
+          fullbodyik.mapusing = 0 (mappingattrib)
+
+    Authoritative connector order (probed 2026-06-23):
+      setInput(0) = Target Skeleton (target)
+      setInput(1) = Source Skeleton (source)
+      Chain: next.setInput(0, prev, 0); next.setInput(1, prev, 1)
+
+    FR-2 (fail-loud): the ENTIRE mutating body is wrapped in an outer
+    try/except Exception so that NO code path raises past the handler boundary.
+
+    FR-12 (verify-after-mutate): validator sub-dict embedded in return envelope.
+
+    Args:
+        source: Houdini scene path to the source skeleton SOP node.
+        target: Houdini scene path to the target skeleton SOP node.
+        method: Retarget method string (default "rigmatchpose+fullbodyik").
+        match_size: When True, sets the match_size folder parm on rigmatchpose
+                    to activate scale matching (default True).
+        mapping: Optional list of [source_joint, target_joint] pairs.
+                 When provided, inserts a kinefx::mappoints node with explicit
+                 joint pairs.  When None, uses the by-name automatic path.
+        dest: Optional SOP parent path.  Defaults to None (auto-creates geo
+              container under /obj via _resolve_sop_parent).
+
+    Returns::
+
+        {
+            "ok": True,
+            "retarget_node": "<fullbodyik node path>",
+            "target_skeleton": {
+                "joints": <int>,           # joint count from @name attrib on target
+                "frame_range": [s, e]      # playbar range, or null if unreadable
+            },
+            "validator": {
+                "unmapped_target_joints": [...],
+                "cook_errors": [],
+                "note": "verify-after-mutate"
+            }
+        }
+
+    or on error::
+
+        {"ok": False, "error": "<message>"}
+    """
+    # FR-2 early-return guard BEFORE the outer try block
+    if not all([source, target]):
+        return {"ok": False, "error": "setup_retarget requires 'source' and 'target' params"}
+
+    # ── FR-2 outer envelope — wraps ALL Houdini mutation + geometry reads ─────
+    try:
+        source_node = _get_node(source)
+        target_node = _get_node(target)
+
+        parent = _resolve_sop_parent(dest, "mcp_setup_retarget")
+
+        # ── Build the retarget chain ──────────────────────────────────────────
+        rmp = parent.createNode("kinefx::rigmatchpose", "mcp_rigmatchpose")
+
+        # Authoritative connector order: setInput(0)=Target, setInput(1)=Source
+        rmp.setInput(0, target_node)
+        rmp.setInput(1, source_node)
+
+        # bboxmatch is the documented "Enable Match Bounds" toggle; match_size is its
+        # fold-out folder controller.  Set both to honour match_size True AND False.
+        # Probe (orchestrator, 2026-06-23): both parms confirmed present on rigmatchpose.
+        _bb = 1 if match_size else 0
+        for _pn in ("bboxmatch", "match_size"):
+            _p = rmp.parm(_pn)
+            if _p is None:
+                return {"ok": False, "error": f"rigmatchpose parm {_pn!r} not found — KineFX/Houdini version mismatch"}
+            _p.set(_bb)
+
+        explicit_mapping = mapping and len(mapping) > 0
+
+        if explicit_mapping:
+            # Explicit-mapping path: rigmatchpose → mappoints → fullbodyik
+            mp = parent.createNode("kinefx::mappoints", "mcp_mappoints")
+            # Wire mappoints from rigmatchpose (both outputs carry skeleton streams)
+            mp.setInput(0, rmp, 0)
+            mp.setInput(1, rmp, 1)
+
+            # Set reference type to attrib-value matching by "name" attribute
+            mp.parm("reftype").set("attribvalue")
+            mp.parm("referenceattrib").set("name")
+
+            # Populate the mappings multiparm: from#/to# pairs.
+            # kinefx::mappoints uses 0-based multiparm instance naming:
+            #   from0/to0 … from(N-1)/to(N-1)  (probe confirmed 2026-06-23).
+            # enumerate(mapping, start=1) → from1..fromN was the off-by-one bug:
+            #   from0 never set, fromN (out of range) raised AttributeError.
+            mp.parm("mappings").set(len(mapping))
+            for i, pair in enumerate(mapping):
+                src_joint = pair[0] if len(pair) > 0 else ""
+                tgt_joint = pair[1] if len(pair) > 1 else ""
+                mp.parm(f"from{i}").set(src_joint)
+                mp.parm(f"to{i}").set(tgt_joint)
+
+            fbik = parent.createNode("kinefx::fullbodyik", "mcp_fullbodyik")
+            fbik.setInput(0, mp, 0)
+            fbik.setInput(1, mp, 1)
+            # mapusing=0 → "mappingattrib" (use the mappoints output attribute)
+            fbik.parm("mapusing").set(0)
+
+        else:
+            # By-name path: rigmatchpose → fullbodyik directly
+            fbik = parent.createNode("kinefx::fullbodyik", "mcp_fullbodyik")
+            fbik.setInput(0, rmp, 0)
+            fbik.setInput(1, rmp, 1)
+            # mapusing=1 → "matchattrib" (match by @name attribute automatically)
+            fbik.parm("mapusing").set(1)
+            fbik.parm("attribtomatch").set("name")
+
+        # ── Cook the final fullbodyik node ────────────────────────────────────
+        try:
+            fbik.cook(force=True)
+        except Exception as exc:
+            errs = fbik.errors()
+            return {"ok": False, "error": "\n".join(errs) if errs else str(exc)}
+
+        errs = fbik.errors()
+        if errs:
+            return {"ok": False, "error": "\n".join(errs)}
+
+        # ── skeleton summary: joint count from target node @name attrib ───────
+        tgt_geom = target_node.geometry()
+        joint_count = 0
+        target_joint_names: list = []
+        if tgt_geom is not None:
+            name_attrib = tgt_geom.findPointAttrib("name")
+            if name_attrib is not None:
+                joint_count = tgt_geom.intrinsicValue("pointcount")
+                target_joint_names = list(tgt_geom.pointStringAttribValues("name"))
+
+        # ── frame range from playbar (best-effort) ────────────────────────────
+        frame_range = None
+        try:
+            s = int(hou.playbar.playbackRange()[0])
+            e = int(hou.playbar.playbackRange()[1])
+            frame_range = [s, e]
+        except (AttributeError, hou.Error, RuntimeError) as exc:
+            _log.warning("setup_retarget: could not read playbar range: %s", exc)
+
+        # ── unmapped target joints (validator, FR-12) ─────────────────────────
+        # By-name mode: FBIK matches all joints by @name — nothing is "unmapped".
+        # Explicit mapping: report target joints absent from the pairs.
+        unmapped = (
+            kinefx_model.unmapped_target_joints(
+                mapping_pairs=mapping, target_joint_names=target_joint_names)
+            if explicit_mapping else []
+        )
+
+        return {
+            "ok": True,
+            "retarget_node": fbik.path(),
+            "target_skeleton": {
+                "joints": joint_count,
+                "frame_range": frame_range,
+            },
+            "validator": {
+                "unmapped_target_joints": unmapped,
+                "cook_errors": [],
+                "note": "verify-after-mutate",
+            },
+        }
+
+    except Exception as exc:
+        # FR-2: catch everything from _get_node / createNode / setInput / geometry reads.
+        return {"ok": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
 # Registration — ALL three read-only + TWO mutating (PR-3) + ONE mutating (PR-4)
+#                + ONE mutating (PR-5)
 # ---------------------------------------------------------------------------
 
 register_handler("kinefx_probe", kinefx_probe, Capability.READONLY)
@@ -706,3 +898,4 @@ register_handler("inspect_apex", inspect_apex, Capability.READONLY)
 register_handler("import_fbx_character", import_fbx_character, Capability.MUTATING)
 register_handler("import_fbx_animation", import_fbx_animation, Capability.MUTATING)
 register_handler("setup_bonedeform", setup_bonedeform, Capability.MUTATING)
+register_handler("setup_retarget", setup_retarget, Capability.MUTATING)

@@ -228,3 +228,84 @@ async def houdini_setup_bonedeform(
         "setup_bonedeform",
         {"rest": rest, "anim": anim, "geo": geo, "dest": dest},
     )
+
+
+# ---------------------------------------------------------------------------
+# PR-5 -- GATED retarget wiring tool (require_approval=True)
+# ---------------------------------------------------------------------------
+
+@mcp.tool(meta={"require_approval": True})
+async def houdini_setup_retarget(
+    ctx: Context,
+    source: str,
+    target: str,
+    method: str = "rigmatchpose+fullbodyik",
+    match_size: bool = True,
+    mapping: list | None = None,
+    dest: str = "/obj",
+) -> dict[str, Any]:
+    """Wire a KineFX retarget chain from source skeleton to target skeleton (GATED).
+
+    Creates a ``kinefx::rigmatchpose`` → ``kinefx::fullbodyik`` network under
+    *dest* (or with an intermediate ``kinefx::mappoints`` when an explicit
+    *mapping* is provided), cooks the chain, and returns a verify-after-mutate
+    envelope (FR-12).
+
+    KineFX retarget chain (H21 authoritative — live probed 2026-06-23):
+      * By-name path (no mapping): ``rigmatchpose → fullbodyik``
+        (fullbodyik.mapusing = "matchattrib", attribtomatch = "name")
+      * Explicit-mapping path: ``rigmatchpose → mappoints → fullbodyik``
+        (fullbodyik.mapusing = "mappingattrib")
+
+    Connector order (authoritative):
+      * setInput(0) = Target Skeleton
+      * setInput(1) = Source Skeleton
+
+    Capability: MUTATING -- routed through the PP12-109 security gate.
+
+    Returns::
+
+        {
+            "ok": True,
+            "retarget_node": "<fullbodyik node path>",
+            "target_skeleton": {
+                "joints": <int>,           # joint count from @name attrib
+                "frame_range": [s, e]      # playbar range, or null if unreadable
+            },
+            "validator": {
+                "unmapped_target_joints": [...],  # target joints with no mapping
+                "cook_errors": [],
+                "note": "verify-after-mutate"
+            }
+        }
+
+    On cook error::
+
+        {"ok": False, "error": "<node error messages>"}
+
+    Args:
+        ctx: MCP request context (injected by FastMCP).
+        source: Houdini scene path to the source skeleton SOP node.
+        target: Houdini scene path to the target skeleton SOP node.
+        method: Retarget method string (default ``"rigmatchpose+fullbodyik"``).
+        match_size: When ``True``, the rigmatchpose node will attempt to match
+                    skeleton scale (default ``True``).
+        mapping: Optional list of ``[source_joint, target_joint]`` pairs.
+                 When provided, inserts a ``kinefx::mappoints`` node and sets
+                 ``fullbodyik.mapusing`` to ``"mappingattrib"``.
+                 When ``None``, uses the by-name automatic path.
+        dest: Houdini scene path under which to create the retarget network
+              (default ``/obj``).
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute(
+        "setup_retarget",
+        {
+            "source": source,
+            "target": target,
+            "method": method,
+            "match_size": match_size,
+            "mapping": mapping,
+            "dest": dest,
+        },
+    )

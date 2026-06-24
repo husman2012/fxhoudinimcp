@@ -335,6 +335,29 @@ def skeleton_to_json(skeleton: "Skeleton") -> dict:
     return skeleton.to_dict()
 
 
+def unmapped_target_joints(
+    mapping_pairs: list,  # list[list[str]] -- [[src, tgt], ...] raw from MCP param
+    target_joint_names: list,  # list[str] -- ordered list of all target joint names
+) -> list:  # list[str] -- target joints NOT appearing as 2nd element of any pair
+    """Return target joint names not covered by any mapping pair.
+
+    Preserves the order of target_joint_names.  Only the 2nd element of each
+    pair (the target joint) is checked; the source joint (1st element) is ignored.
+
+    Args:
+        mapping_pairs: list of [source_joint, target_joint] pairs as forwarded
+                       from the MCP wrapper params dict (raw JSON lists).
+                       May be None or empty -- both mean "no mapping provided".
+        target_joint_names: ordered list of all joint names in the target skeleton.
+
+    Returns:
+        An ordered list of target joint names that have no corresponding
+        mapping entry.  Empty list means all targets are covered.
+    """
+    mapped = {pair[1] for pair in (mapping_pairs or [])}
+    return [name for name in target_joint_names if name not in mapped]
+
+
 def validate_mapping(
     retarget_map: "RetargetMap",
     source_skeleton: "Skeleton",

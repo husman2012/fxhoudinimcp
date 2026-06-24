@@ -53,6 +53,7 @@ from fxhoudinimcp.kinefx_model import (
     pack_trs,
     skeleton_to_json,
     validate_mapping,
+    unmapped_target_joints,  # pp12-110e — RED: does not exist yet
 )
 
 
@@ -806,3 +807,66 @@ class TestValidateMappingEdgeCases:
         assert len(errors) >= 1
         combined = " ".join(errors).lower()
         assert "root" in combined or "multiple" in combined or "source" in combined
+
+
+# ===========================================================================
+# Section 10 — unmapped_target_joints (pp12-110e RED phase)
+#
+# Public contract (plan pp12-110e decomposition):
+#   unmapped_target_joints(
+#       mapping_pairs: list[list[str]],   # [[src, tgt], ...] — the tool's raw JSON param
+#       target_joint_names: list[str],    # ordered list of all target skeleton joint names
+#   ) -> list[str]
+#
+#   Returns the subset of target_joint_names NOT appearing as the 2nd element
+#   of any pair in mapping_pairs, preserving the order of target_joint_names.
+#
+#   Rationale: used by setup_retarget handler to identify target joints that
+#   have no explicit mapping so they can be passed to kinefx::mappoints
+#   (the unmapped joints are left for the full-body-IK solver to handle).
+#
+# These tests are RED — unmapped_target_joints does not exist yet in kinefx_model.py.
+# They will fail with ImportError on the first run (the import at line 57 of this
+# file already includes unmapped_target_joints, which is absent from the module).
+# ===========================================================================
+
+class TestUnmappedTargetJoints:
+    """unmapped_target_joints — returns target joints not covered by any mapping pair."""
+
+    def test_partial_mapping_returns_uncovered_targets(self):
+        """Only the first two targets are mapped; tail_05 must be returned."""
+        mapping_pairs = [["Hips", "root"], ["Spine", "spine_01"]]
+        target_joint_names = ["root", "spine_01", "tail_05"]
+        result = unmapped_target_joints(mapping_pairs, target_joint_names)
+        assert result == ["tail_05"], (
+            f"Expected ['tail_05'], got {result!r}"
+        )
+
+    def test_full_mapping_returns_empty_list(self):
+        """Every target joint is covered by exactly one pair — result is empty."""
+        mapping_pairs = [["A", "root"], ["B", "spine_01"], ["C", "tail_05"]]
+        target_joint_names = ["root", "spine_01", "tail_05"]
+        result = unmapped_target_joints(mapping_pairs, target_joint_names)
+        assert result == [], (
+            f"Expected [], got {result!r}"
+        )
+
+    def test_empty_mapping_returns_all_targets(self):
+        """No pairs means every target joint is unmapped."""
+        mapping_pairs = []
+        target_joint_names = ["root", "spine_01"]
+        result = unmapped_target_joints(mapping_pairs, target_joint_names)
+        assert result == ["root", "spine_01"], (
+            f"Expected ['root', 'spine_01'], got {result!r}"
+        )
+
+    def test_order_preserved_from_target_joint_names(self):
+        """Unmapped joints must be returned in the order they appear in target_joint_names,
+        not in mapping-pair order or sorted order."""
+        # Mapping covers the middle element only; result must preserve original order.
+        mapping_pairs = [["X", "b"]]
+        target_joint_names = ["c", "b", "a"]   # unmapped: c and a, in that order
+        result = unmapped_target_joints(mapping_pairs, target_joint_names)
+        assert result == ["c", "a"], (
+            f"Expected ['c', 'a'] (target_joint_names order), got {result!r}"
+        )
