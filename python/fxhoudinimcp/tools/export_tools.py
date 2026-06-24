@@ -1,10 +1,14 @@
 """
-export_tools.py — MCP wrapper tools for the engine-export member (PP12-111 PR-3).
+export_tools.py — MCP wrapper tools for the engine-export member (PP12-111 PR-3/PR-4).
 
-Both tools are read-only and UNGATED (FR-10):
+PR-3 (read-only / ungated, FR-10):
   - houdini_export_probe_versions: reports Houdini build, Labs VAT ROP version,
     ROP-Alembic/FBX availability, and optional skew_table verdict when target_ue given.
   - houdini_export_validate_budget: DRY-RUN budget check (reads geometry, writes nothing).
+
+PR-4 (GATED / mutating):
+  - houdini_export_vat: bake labs::vertex_animation_textures ROP → mesh + textures
+    + ExportManifest sidecar. Registered with require_approval=True (PP12-109 gate).
 
 Convention notes (grounded against kinefx_tools.py):
   - ctx: Context  (NOT ctx: Any — 4-bug convention class, bug #1)
@@ -40,6 +44,45 @@ async def houdini_export_probe_versions(
     """
     bridge = _get_bridge(ctx)
     return await bridge.execute("probe_versions", {"target_ue": target_ue})
+
+
+@mcp.tool(meta={"require_approval": True})
+async def houdini_export_vat(
+    ctx: Context,
+    node: str,
+    out_dir: str,
+    export_type: str = "soft",
+    asset_name: str | None = None,
+    frame_range: list | None = None,
+    target_ue: str | None = None,
+) -> dict[str, Any]:
+    """Bake a labs::vertex_animation_textures ROP (mesh + textures + manifest sidecar). GATED — mutating.
+
+    Creates and cooks a VAT ROP, writes textures and mesh to out_dir, and
+    emits an ExportManifest sidecar (.export.json) for downstream validation.
+
+    Args:
+        ctx:         MCP context (injected by FastMCP).
+        node:        Houdini SOP node path (e.g. "/obj/geo1/box1").
+        out_dir:     Output directory for textures, mesh, and sidecar.
+        export_type: VAT mode — "soft" (default), "rigid", "fluid", or "sprite".
+        asset_name:  Asset base name.  Derived from 'node' leaf when None.
+        frame_range: [start, end] frame list.  Uses scene playbar range when None.
+        target_ue:   Optional UE version string (e.g. "5.4") for skew annotation.
+
+    Returns:
+        dict with keys: ok, node, mesh, textures, sidecar, vat_version,
+        version_triple.  On failure: ok=False, error=..., wrote_files=False.
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute("export_vat", {
+        "node": node,
+        "out_dir": out_dir,
+        "export_type": export_type,
+        "asset_name": asset_name,
+        "frame_range": frame_range,
+        "target_ue": target_ue,
+    })
 
 
 @mcp.tool(meta={"require_approval": False})

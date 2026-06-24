@@ -941,3 +941,162 @@ class TestHouFreeImport:
         assert "import hou" not in source_no_comments, (
             "export_model.py must not import hou (CL-015 — pure-logic boundary)"
         )
+
+
+# ===========================================================================
+# Section 8 — vat_mode_from_export_type(export_type: str) -> int
+#
+# PP12-111d (PR-4) — new pure helper in export_model.py.
+#
+# Locked contract:
+#   vat_mode_from_export_type("soft")   == 0   (VAT ROP mode int, parm 'mode')
+#   vat_mode_from_export_type("rigid")  == 1
+#   vat_mode_from_export_type("fluid")  == 2
+#   vat_mode_from_export_type("sprite") == 3
+#
+#   Case-normalised: "Soft" -> 0, " SOFT " -> 0 (strip + casefold)
+#   Unknown string raises ValueError.
+#
+#   Optional: export_model exposes VAT_EXPORT_MODES mapping with 4 keys.
+#
+# TDD phase: RED — vat_mode_from_export_type does NOT exist yet in export_model.
+# Expected failure: ImportError on import of the symbol.
+#
+# Cross-references:
+#   - Plan pp12-111d §7.1: GROUNDED FIELD TABLE, parm 'mode' (int 0/1/2/3)
+#   - CL-015: pure-logic module, no hou/Qt/pxr
+#   - tdd-with-agents.md §4: hou-test writes red; hou-dev turns green
+# ===========================================================================
+
+class TestVatModeFromExportType:
+    """vat_mode_from_export_type — string -> ROP mode int mapping, case/space normalised."""
+
+    @pytest.fixture(autouse=True)
+    def _import_subject(self):
+        """Import vat_mode_from_export_type from export_model (must fail at RED phase)."""
+        from fxhoudinimcp.export_model import vat_mode_from_export_type
+        self._fn = vat_mode_from_export_type
+
+    # -----------------------------------------------------------------------
+    # Four canonical mappings (the locked enum: mode parm 0..3)
+    # -----------------------------------------------------------------------
+
+    def test_soft_returns_0(self):
+        """vat_mode_from_export_type('soft') == 0 (Soft Body, ROP mode=0)."""
+        assert self._fn("soft") == 0, (
+            "vat_mode_from_export_type('soft') must return 0 (Labs VAT ROP mode=0 Soft Body)"
+        )
+
+    def test_rigid_returns_1(self):
+        """vat_mode_from_export_type('rigid') == 1 (Rigid Body, ROP mode=1)."""
+        assert self._fn("rigid") == 1, (
+            "vat_mode_from_export_type('rigid') must return 1 (Labs VAT ROP mode=1 Rigid Body)"
+        )
+
+    def test_fluid_returns_2(self):
+        """vat_mode_from_export_type('fluid') == 2 (Fluid, ROP mode=2)."""
+        assert self._fn("fluid") == 2, (
+            "vat_mode_from_export_type('fluid') must return 2 (Labs VAT ROP mode=2 Fluid)"
+        )
+
+    def test_sprite_returns_3(self):
+        """vat_mode_from_export_type('sprite') == 3 (Sprite, ROP mode=3)."""
+        assert self._fn("sprite") == 3, (
+            "vat_mode_from_export_type('sprite') must return 3 (Labs VAT ROP mode=3 Sprite)"
+        )
+
+    # -----------------------------------------------------------------------
+    # Return-type contract
+    # -----------------------------------------------------------------------
+
+    def test_returns_int(self):
+        """Return value must be a plain Python int, not a str or float."""
+        result = self._fn("soft")
+        assert isinstance(result, int), (
+            f"vat_mode_from_export_type must return int, got {type(result).__name__!r}"
+        )
+
+    # -----------------------------------------------------------------------
+    # Case / whitespace normalisation
+    # -----------------------------------------------------------------------
+
+    def test_title_case_soft_returns_0(self):
+        """Case-normalised: 'Soft' -> 0 (title-case input accepted)."""
+        assert self._fn("Soft") == 0, (
+            "vat_mode_from_export_type must case-normalise: 'Soft' must return 0"
+        )
+
+    def test_upper_case_with_spaces_returns_0(self):
+        """Case+whitespace normalised: ' SOFT ' -> 0 (stripped + casefolded)."""
+        assert self._fn(" SOFT ") == 0, (
+            "vat_mode_from_export_type must strip + casefold: ' SOFT ' must return 0"
+        )
+
+    def test_mixed_case_rigid(self):
+        """'RIGID' -> 1 (upper-case variant accepted)."""
+        assert self._fn("RIGID") == 1, (
+            "vat_mode_from_export_type must case-normalise: 'RIGID' must return 1"
+        )
+
+    def test_mixed_case_fluid(self):
+        """'Fluid' -> 2 (title-case variant accepted)."""
+        assert self._fn("Fluid") == 2
+
+    def test_mixed_case_sprite(self):
+        """'SPRITE' -> 3 (upper-case variant accepted)."""
+        assert self._fn("SPRITE") == 3
+
+    def test_leading_trailing_whitespace_rigid(self):
+        """'  rigid  ' -> 1 (whitespace stripped)."""
+        assert self._fn("  rigid  ") == 1
+
+    # -----------------------------------------------------------------------
+    # Unknown input raises ValueError
+    # -----------------------------------------------------------------------
+
+    def test_unknown_string_raises_value_error(self):
+        """Unknown export_type raises ValueError (not a silent default)."""
+        with pytest.raises(ValueError):
+            self._fn("bogus")
+
+    def test_empty_string_raises_value_error(self):
+        """Empty string raises ValueError."""
+        with pytest.raises(ValueError):
+            self._fn("")
+
+    def test_partial_match_raises(self):
+        """'sof' (partial of 'soft') raises ValueError -- no prefix matching."""
+        with pytest.raises(ValueError):
+            self._fn("sof")
+
+    def test_numeric_string_raises(self):
+        """'0' raises ValueError -- numeric strings are not accepted."""
+        with pytest.raises(ValueError):
+            self._fn("0")
+
+    def test_none_like_string_raises(self):
+        """'none' raises ValueError -- unsupported mode name."""
+        with pytest.raises(ValueError):
+            self._fn("none")
+
+    # -----------------------------------------------------------------------
+    # Optional: VAT_EXPORT_MODES mapping exposed at module level
+    # -----------------------------------------------------------------------
+
+    def test_vat_export_modes_exposed_with_4_keys(self):
+        """export_model exposes VAT_EXPORT_MODES dict-like with 4 canonical keys.
+
+        Optional -- but if present it must have exactly the 4 mode names as keys.
+        """
+        import fxhoudinimcp.export_model as em
+        if not hasattr(em, "VAT_EXPORT_MODES"):
+            pytest.skip("VAT_EXPORT_MODES not present (optional attribute)")
+        modes = em.VAT_EXPORT_MODES
+        assert len(modes) == 4, (
+            f"VAT_EXPORT_MODES must have 4 keys (soft/rigid/fluid/sprite), "
+            f"got {len(modes)}: {list(modes.keys())}"
+        )
+        for name in ("soft", "rigid", "fluid", "sprite"):
+            assert name in modes, (
+                f"VAT_EXPORT_MODES missing key {name!r}; present: {list(modes.keys())}"
+            )

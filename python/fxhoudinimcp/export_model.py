@@ -282,6 +282,28 @@ class ExportManifest:
 
 
 # ---------------------------------------------------------------------------
+# VAT export mode helpers
+# ---------------------------------------------------------------------------
+
+VAT_EXPORT_MODES: dict = {"soft": 0, "rigid": 1, "fluid": 2, "sprite": 3}
+
+
+def vat_mode_from_export_type(export_type: str) -> int:
+    """Convert a VAT export type name to the ROP mode integer (parm 'mode').
+
+    Accepts any case and leading/trailing whitespace.
+    Valid values: 'soft'->0, 'rigid'->1, 'fluid'->2, 'sprite'->3.
+
+    Raises:
+        ValueError: if export_type is not a recognized VAT mode name.
+    """
+    key = export_type.strip().lower()
+    if key not in VAT_EXPORT_MODES:
+        raise ValueError(f"unknown VAT export_type: {export_type!r}")
+    return VAT_EXPORT_MODES[key]
+
+
+# ---------------------------------------------------------------------------
 # ExportRequest
 # ---------------------------------------------------------------------------
 
