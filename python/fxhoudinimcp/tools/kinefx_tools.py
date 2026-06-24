@@ -241,7 +241,7 @@ async def houdini_setup_retarget(
     target: str,
     method: str = "rigmatchpose+fullbodyik",
     match_size: bool = True,
-    mapping: list | None = None,
+    mapping: list[list[str]] | None = None,
     dest: str = "/obj",
 ) -> dict[str, Any]:
     """Wire a KineFX retarget chain from source skeleton to target skeleton (GATED).
@@ -319,7 +319,7 @@ async def houdini_setup_retarget(
 async def houdini_apply_secondarymotion(
     ctx: Context,
     node: str,
-    joints: list | None = None,
+    joints: list[str] | None = None,
     params: dict | None = None,
     dest: str = "/obj",
 ) -> dict[str, Any]:
