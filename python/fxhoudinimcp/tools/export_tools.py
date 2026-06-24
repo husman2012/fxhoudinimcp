@@ -1,0 +1,72 @@
+"""
+export_tools.py — MCP wrapper tools for the engine-export member (PP12-111 PR-3).
+
+Both tools are read-only and UNGATED (FR-10):
+  - houdini_export_probe_versions: reports Houdini build, Labs VAT ROP version,
+    ROP-Alembic/FBX availability, and optional skew_table verdict when target_ue given.
+  - houdini_export_validate_budget: DRY-RUN budget check (reads geometry, writes nothing).
+
+Convention notes (grounded against kinefx_tools.py):
+  - ctx: Context  (NOT ctx: Any — 4-bug convention class, bug #1)
+  - _get_bridge(ctx)  (NOT _get_bridge() — bug #2)
+  - bridge.execute(...)  (NOT bridge.call(...) — bug #3)
+  - handler(**params) dispatching convention satisfied by bridge.execute (bug #4)
+  - bridge.call() does NOT exist on HoudiniBridge -- never use it.
+"""
+from __future__ import annotations
+
+from typing import Any
+
+from mcp.server.fastmcp import Context
+
+from fxhoudinimcp.server import mcp, _get_bridge
+
+
+@mcp.tool(meta={"require_approval": False})
+async def houdini_export_probe_versions(
+    ctx: Context,
+    target_ue: str | None = None,
+) -> dict[str, Any]:
+    """Report Houdini build, Labs VAT ROP version, ROP availability, and optional skew verdict.
+
+    Args:
+        ctx:       MCP context (injected by FastMCP).
+        target_ue: Optional Unreal Engine version string (e.g. "5.4").
+                   When supplied, the result includes a 'skew' compatibility block.
+
+    Returns:
+        dict with keys: houdini, labs_vat_rop, rop_alembic, rop_fbx,
+        and optionally 'skew' when target_ue is provided.
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute("probe_versions", {"target_ue": target_ue})
+
+
+@mcp.tool(meta={"require_approval": False})
+async def houdini_export_validate_budget(
+    ctx: Context,
+    node: str,
+    target: str,
+    budget_preset: str | None = None,
+) -> dict[str, Any]:
+    """DRY-RUN budget check against a SOP node's geometry.
+
+    Reads geometry statistics via read-only introspection. Writes nothing.
+    The result always has wrote_files=False.
+
+    Args:
+        ctx:           MCP context (injected by FastMCP).
+        node:          Houdini SOP node path (e.g. "/obj/geo1/box1").
+        target:        Export target; one of "vat", "alembic_ue", "fbx",
+                       "niagara", "chaos_gc".
+        budget_preset: Optional named budget preset (e.g. "ue_realtime").
+                       Defaults to the UE_REALTIME preset when None.
+
+    Returns:
+        dict with keys: verdict, checks, wrote_files (always False).
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute(
+        "validate_budget",
+        {"node": node, "target": target, "budget_preset": budget_preset},
+    )
