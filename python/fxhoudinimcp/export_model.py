@@ -471,3 +471,49 @@ def niagara_normalize_output(out_path: str) -> str:
         return out_path
     root, _ = os.path.splitext(out_path)
     return root + ".hbjson"
+
+
+# ---------------------------------------------------------------------------
+# pp12-111g helper — preview ROP plan (ADV-008)
+# ---------------------------------------------------------------------------
+
+
+def rop_plan(
+    tool: str,
+    params: dict,
+    out_paths: list,
+    version_triple: VersionTriple,
+) -> dict:
+    """Assemble a human-readable ROP bake plan for operator preview.
+
+    This is a pure-logic helper (no hou/Qt/pxr — CL-015) that serialises
+    everything an operator needs to review before approving a gated export:
+    which exporter fires, what parameters were supplied, where files land, and
+    the compatibility verdict for the current Houdini/Labs/UE stack.
+
+    The returned dict has a pinned schema (``rop_plan_schema_version == 1``)
+    so downstream consumers (middleware preview, list_pending_calls output)
+    can detect schema drift across PR upgrades.
+
+    Args:
+        tool:           Exporter identifier, e.g. ``"export_vat"``.
+        params:         Raw handler params dict forwarded from the MCP call.
+        out_paths:      List of output file paths the bake will write.
+        version_triple: VersionTriple instance representing Houdini/Labs/UE
+                        version compatibility for this session.
+
+    Returns:
+        dict with keys:
+          ``tool``                 — exporter name
+          ``params``               — shallow copy of input params
+          ``out_paths``            — list of output paths
+          ``version_triple``       — serialised VersionTriple (from to_dict())
+          ``rop_plan_schema_version`` — always 1 (sentinel for schema compat)
+    """
+    return {
+        "tool": tool,
+        "params": dict(params),
+        "out_paths": list(out_paths),
+        "version_triple": version_triple.to_dict(),
+        "rop_plan_schema_version": 1,
+    }

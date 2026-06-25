@@ -55,6 +55,7 @@ from fxhoudinimcp.export_model import (  # noqa: E402
     gc_export_refusal,
     niagara_normalize_output,
     resolve_frame_range,
+    rop_plan,
     vat_mode_from_export_type,
 )
 
@@ -438,7 +439,7 @@ def export_vat(
             },
             out_paths=out_paths,
             version_triple=version_triple,
-            validator={},  # FIX 2: honest deferral — PR-7 wires the real validator
+            validator=validate_budget(node, "vat"),
         )
         sidecar_path = _os.path.join(_out_dir, f"{_asset_name}.export.json")
         with open(sidecar_path, "w", encoding="utf-8") as _f:
@@ -624,7 +625,7 @@ def export_alembic_ue(
             },
             out_paths=[_out_path],
             version_triple=version_triple,
-            validator={},
+            validator=validate_budget(node, "alembic_ue"),
         )
         _stem = _os.path.splitext(_os.path.basename(_out_path))[0]
         sidecar_path = _os.path.join(_out_dir or ".", f"{_stem}.export.json")
@@ -796,7 +797,7 @@ def export_fbx(
             },
             out_paths=[_out_path],
             version_triple=version_triple,
-            validator={},
+            validator=validate_budget(node, "fbx"),
         )
         _stem = _os.path.splitext(_os.path.basename(_out_path))[0]
         sidecar_path = _os.path.join(_out_dir or ".", f"{_stem}.export.json")
@@ -1029,7 +1030,7 @@ def export_chaos_gc(
             },
             out_paths=[_out_abc],
             version_triple=version_triple,
-            validator={},
+            validator=validate_budget(node_path, "chaos_gc"),
         )
         _stem = _os.path.splitext(_os.path.basename(_out_abc))[0]
         sidecar_path = _os.path.join(_out_dir or ".", f"{_stem}.export.json")
@@ -1222,7 +1223,7 @@ def export_niagara(
             },
             out_paths=[_out_path],
             version_triple=version_triple,
-            validator={},
+            validator=validate_budget(node_path, "niagara"),
         )
         _stem = _os.path.splitext(_os.path.basename(_out_path))[0]
         sidecar_path = _os.path.join(_out_dir or ".", f"{_stem}.export.json")
@@ -1249,14 +1250,165 @@ def export_niagara(
 
 
 # ---------------------------------------------------------------------------
+# 109-gate preview functions (pp12-111g / ADR 0005 rev2)
+# Each function runs on the main thread via _run_preview / hdefereval;
+# hou.* access is safe here (CL-016).  They are pure read-only — no scene
+# mutation — so preview_required=True causes DENY on raise/timeout only.
+# ---------------------------------------------------------------------------
+
+
+def _preview_vat(params: dict) -> dict:
+    """Return a rop_plan preview dict for export_vat without mutating the scene."""
+    houdini_version = hou.applicationVersionString()
+    labs_vat = _get_labs_vat_version()
+    _labs_for_skew = labs_vat if labs_vat is not None else "0.0"
+    _verdict, _notes = skew_table.skew_verdict(
+        houdini=houdini_version,
+        labs_vat=_labs_for_skew,
+        ue=params.get("target_ue"),
+    )
+    vt = VersionTriple(
+        houdini=houdini_version,
+        labs_vat=labs_vat,
+        ue=params.get("target_ue"),
+        verdict=_verdict,
+        notes=_notes,
+    )
+    plan = rop_plan("export_vat", params, [params.get("out_dir", "")], vt)
+    # B2: embed budget verdict (validate_budget handles absent nodes gracefully,
+    # returning {"ok": False, "error": ...} rather than raising).
+    plan["budget_verdict"] = validate_budget(params.get("node", ""), "vat")
+    return plan
+
+
+def _preview_alembic_ue(params: dict) -> dict:
+    """Return a rop_plan preview dict for export_alembic_ue without mutating the scene."""
+    houdini_version = hou.applicationVersionString()
+    labs_vat = _get_labs_vat_version()
+    _labs_for_skew = labs_vat if labs_vat is not None else "0.0"
+    _verdict, _notes = skew_table.skew_verdict(
+        houdini=houdini_version,
+        labs_vat=_labs_for_skew,
+        ue=None,
+    )
+    vt = VersionTriple(
+        houdini=houdini_version,
+        labs_vat=labs_vat,
+        verdict=_verdict,
+        notes=_notes,
+    )
+    plan = rop_plan("export_alembic_ue", params, [params.get("out_path", "")], vt)
+    # B2: embed budget verdict.
+    plan["budget_verdict"] = validate_budget(params.get("node", ""), "alembic_ue")
+    return plan
+
+
+def _preview_fbx(params: dict) -> dict:
+    """Return a rop_plan preview dict for export_fbx without mutating the scene."""
+    houdini_version = hou.applicationVersionString()
+    labs_vat = _get_labs_vat_version()
+    _labs_for_skew = labs_vat if labs_vat is not None else "0.0"
+    _verdict, _notes = skew_table.skew_verdict(
+        houdini=houdini_version,
+        labs_vat=_labs_for_skew,
+        ue=None,
+    )
+    vt = VersionTriple(
+        houdini=houdini_version,
+        labs_vat=labs_vat,
+        verdict=_verdict,
+        notes=_notes,
+    )
+    plan = rop_plan("export_fbx", params, [params.get("out_path", "")], vt)
+    # B2: embed budget verdict.
+    plan["budget_verdict"] = validate_budget(params.get("node", ""), "fbx")
+    return plan
+
+
+def _preview_chaos_gc(params: dict) -> dict:
+    """Return a rop_plan preview dict for export_chaos_gc without mutating the scene."""
+    houdini_version = hou.applicationVersionString()
+    labs_vat = _get_labs_vat_version()
+    _labs_for_skew = labs_vat if labs_vat is not None else "0.0"
+    _verdict, _notes = skew_table.skew_verdict(
+        houdini=houdini_version,
+        labs_vat=_labs_for_skew,
+        ue=None,
+    )
+    vt = VersionTriple(
+        houdini=houdini_version,
+        labs_vat=labs_vat,
+        verdict=_verdict,
+        notes=_notes,
+    )
+    plan = rop_plan("export_chaos_gc", params, [params.get("out_abc", "")], vt)
+    # B2: embed budget verdict.
+    plan["budget_verdict"] = validate_budget(params.get("node", ""), "chaos_gc")
+    return plan
+
+
+def _preview_niagara(params: dict) -> dict:
+    """Return a rop_plan preview dict for export_niagara without mutating the scene."""
+    houdini_version = hou.applicationVersionString()
+    labs_vat = _get_labs_vat_version()
+    _labs_for_skew = labs_vat if labs_vat is not None else "0.0"
+    _verdict, _notes = skew_table.skew_verdict(
+        houdini=houdini_version,
+        labs_vat=_labs_for_skew,
+        ue=None,
+    )
+    vt = VersionTriple(
+        houdini=houdini_version,
+        labs_vat=labs_vat,
+        verdict=_verdict,
+        notes=_notes,
+    )
+    _out = niagara_normalize_output(params.get("out_path", ""))
+    plan = rop_plan("export_niagara", params, [_out], vt)
+    # B2: embed budget verdict.
+    plan["budget_verdict"] = validate_budget(params.get("node", ""), "niagara")
+    return plan
+
+
+# ---------------------------------------------------------------------------
 # Handler registration — MUST be at the BOTTOM of the file
 # (grounded against character_handlers.py registration pattern)
 # ---------------------------------------------------------------------------
 
+# M-04 reload-stable registry stale-key eviction (CL-005):
+# hou.session._fxhoudinimcp_preview_registry persists across importlib.reload()
+# so renamed or removed commands from THIS module would leave stale preview_fn
+# entries forever.  Drop only OUR OWN command keys before re-registering so the
+# session registry stays in sync with the current module surface.  We do NOT
+# clear the entire registry — that would evict other modules' registrations.
+_OWN_COMMANDS = (
+    "probe_versions",
+    "validate_budget",
+    "export_vat",
+    "export_alembic_ue",
+    "export_fbx",
+    "export_chaos_gc",
+    "export_niagara",
+)
+try:
+    import hou as _hou_m04  # type: ignore[import-untyped]
+    _reg = getattr(_hou_m04.session, "_fxhoudinimcp_preview_registry", None)
+    if _reg is not None:
+        for _cmd in _OWN_COMMANDS:
+            _reg.pop(_cmd, None)
+    del _reg, _hou_m04, _cmd
+except ImportError:
+    pass  # off-DCC: fallback dict is cleared by module reload; nothing to evict
+
 register_handler("probe_versions", probe_versions, Capability.READONLY)
 register_handler("validate_budget", validate_budget, Capability.READONLY)
-register_handler("export_vat", export_vat, Capability.MUTATING)
-register_handler("export_alembic_ue", export_alembic_ue, Capability.MUTATING)
-register_handler("export_fbx", export_fbx, Capability.MUTATING)
-register_handler("export_chaos_gc", export_chaos_gc, Capability.MUTATING)
-register_handler("export_niagara", export_niagara, Capability.MUTATING)
+register_handler("export_vat", export_vat, Capability.MUTATING,
+                 preview_fn=_preview_vat, preview_required=True)
+register_handler("export_alembic_ue", export_alembic_ue, Capability.MUTATING,
+                 preview_fn=_preview_alembic_ue, preview_required=True)
+register_handler("export_fbx", export_fbx, Capability.MUTATING,
+                 preview_fn=_preview_fbx, preview_required=True)
+register_handler("export_chaos_gc", export_chaos_gc, Capability.MUTATING,
+                 preview_fn=_preview_chaos_gc, preview_required=True)
+register_handler("export_niagara", export_niagara, Capability.MUTATING,
+                 preview_fn=_preview_niagara, preview_required=True)

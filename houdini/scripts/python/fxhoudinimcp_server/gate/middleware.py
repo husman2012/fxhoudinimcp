@@ -22,6 +22,7 @@ import datetime
 import logging
 import os
 import sys
+import threading
 from typing import Any, Callable
 
 log = logging.getLogger("fxhoudinimcp_server.gate.middleware")
@@ -77,6 +78,119 @@ def _extract_code(params: dict[str, Any]) -> str | None:
         if val and isinstance(val, str):
             return val
     return None
+
+
+# Preview timeout — shorter than the full command timeout so a stuck preview_fn
+# does not block the operator's queue indefinitely. (ADV-002 worker+join pattern)
+_PREVIEW_TIMEOUT = 30  # seconds
+
+
+def _readonly_dispatch(command: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Local capability check for READONLY sub-operations within preview.
+
+    This is NOT re-entry into the hdefereval gate dispatcher.  It performs a
+    pure capability assertion: if the command is not READONLY, it raises
+    ValueError.  Callers use this to guard sub-operations that preview_fn may
+    internally invoke (ADV-004).
+
+    Args:
+        command: the sub-command name to check.
+        params: ignored by this check; passed through to the real dispatcher if
+            capability passes.
+
+    Raises:
+        ValueError: when the command's declared capability is not READONLY.
+    """
+    import fxhoudinimcp_server.dispatcher as _d
+    cap = _d.capability_of(command)
+    if cap is None or cap.value != "readonly":
+        raise ValueError(
+            f"_readonly_dispatch: command {command!r} is not READONLY "
+            f"(capability={cap!r}); only READONLY sub-ops allowed in preview."
+        )
+    # For the verified-READONLY path, delegate to the original (unwrapped) dispatch.
+    return _ORIGINAL_DISPATCH(command, params)
+
+
+def _run_preview(command: str, params: dict[str, Any]) -> tuple[dict | None, str | None]:
+    """Run the registered preview_fn for *command* on the main thread.
+
+    Returns (preview_dict, error_str):
+        - (payload, None)  -- preview succeeded; payload is the fn's return value.
+        - (None, error_str) -- preview_fn raised or timed out.
+        - (None, None)     -- no preview_fn registered; caller queues normally.
+
+    The preview_fn runs via hdefereval.executeInMainThreadWithResult so it can
+    safely call hou.* on the main thread (CL-016 / ADV-002).
+    Uses a worker+join with _PREVIEW_TIMEOUT so a stuck fn does not block forever.
+    The preview_fn body is wrapped in hou.undos.disabler() so no undo history is
+    recorded (ADV-004 / B1).  The result is json.dumps-validated to ensure it is
+    serializable before being stored in the queue (ADV-011).
+    """
+    import fxhoudinimcp_server.dispatcher as _d
+
+    reg = _d.preview_of(command)
+    preview_fn = reg.get("preview_fn")
+    if preview_fn is None:
+        return None, None
+
+    container: dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            import hdefereval  # type: ignore[import-untyped]
+            def _on_main():
+                # Wrap preview_fn in undos.disabler so preview reads leave no
+                # undo history in the scene (ADV-004 / B1).
+                try:
+                    import hou  # type: ignore[import-untyped]
+                    with hou.undos.disabler():
+                        return preview_fn(params)
+                except ImportError:
+                    # hou not available (unlikely in hdefereval path) — run bare.
+                    return preview_fn(params)
+            container["result"] = hdefereval.executeInMainThreadWithResult(_on_main)
+        except ImportError:
+            # Off-DCC (plain hython without hdefereval) — call directly.
+            # This covers the hython-smoke test environment.
+            try:
+                try:
+                    import hou  # type: ignore[import-untyped]
+                    with hou.undos.disabler():
+                        container["result"] = preview_fn(params)
+                except ImportError:
+                    # hython path without hou.undos — run bare (B1 / ADV-004).
+                    container["result"] = preview_fn(params)
+            except Exception as exc:  # noqa: BLE001
+                container["error"] = str(exc)
+        except Exception as exc:  # noqa: BLE001
+            container["error"] = str(exc)
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(timeout=_PREVIEW_TIMEOUT)
+
+    if worker.is_alive():
+        # Preview timed out — treat as a preview failure.
+        return None, f"preview_fn timed out after {_PREVIEW_TIMEOUT}s"
+
+    if "error" in container:
+        return None, container["error"]
+
+    result = container.get("result")
+    if not isinstance(result, dict):
+        return None, f"preview_fn returned non-dict: {type(result).__name__!r}"
+
+    # ADV-011: validate JSON-serializability before storing in queue.
+    # A preview_fn that returns non-serializable objects would cause list_pending
+    # to crash later when the result is serialized for the MCP client.
+    try:
+        import json
+        json.dumps(result)
+    except (TypeError, ValueError) as exc:
+        return None, f"preview_fn result is not JSON-serializable: {exc}"
+
+    return result, None
 
 
 def _get_gate():
@@ -266,15 +380,54 @@ def _gated_dispatch(command: str, params: dict[str, Any]) -> dict[str, Any]:
         # This is the rev-1 deadlock fix — no worker/join nesting.
         thunk: Callable = lambda h=handler, p=captured: h(**p)  # noqa: E731
 
+        # --- ADR 0005 preview hook ---
+        # Run preview_fn on the main thread (via _run_preview / hdefereval).
+        # result shape: (payload|None, error_str|None)
+        preview_payload: dict | None
+        preview_error: str | None
+        preview_payload, preview_error = _run_preview(command, params)
+
+        reg = _d.preview_of(command)
+        preview_required: bool = reg.get("preview_required", False)
+
+        if preview_error is not None and preview_required:
+            # ADV-007: preview_fn raised/timed-out AND preview_required=True -> DENY.
+            _emit_audit(gate, command, params, "denied", classification)
+            return {
+                "gate": "denied",
+                "status": "denied",
+                "reason": (
+                    f"Command '{command}' denied: preview validation failed and "
+                    f"preview_required=True. Error: {preview_error}"
+                ),
+                "preview_error": preview_error,
+            }
+
+        # Degrade case: preview_fn raised but preview_required=False — store
+        # {"preview_error": <str>} as the opaque preview blob so list() can
+        # surface preview_error as a top-level field in the PRESENTATION SPLIT.
+        stored_preview: dict | None
+        if preview_error is not None:
+            # Degrade: queue with error marker; no valid preview payload.
+            stored_preview = {"preview_error": preview_error}
+        else:
+            # Success or no preview_fn (preview_payload may be None).
+            stored_preview = preview_payload
+
         pending_id = gate.queue.add(
             tool=command,
             capability=capability,
             classification=classification,
             code=code or "",
             run_thunk=thunk,
+            preview=stored_preview,
+            # B3 fix: store params for approve-time re-validate (ADR 0005 rev2 §3.4f).
+            params=params,
         )
         _emit_audit(gate, command, params, "queued", classification, pending_id=pending_id)
-        return {
+
+        # Build the queue response, surfacing the preview payload for check-1.
+        queue_resp: dict[str, Any] = {
             "gate": "queued",
             "status": "pending_approval",
             "pending_id": pending_id,
@@ -293,6 +446,13 @@ def _gated_dispatch(command: str, params: dict[str, Any]) -> dict[str, Any]:
                 f"gate.reject_pending_call with pending_id={pending_id!r}."
             ),
         }
+        if preview_payload is not None:
+            # Successful preview: surface the payload directly in the queue response.
+            queue_resp["preview"] = preview_payload
+        if preview_error is not None:
+            # Degrade: surface the error string in the queue response.
+            queue_resp["preview_error"] = preview_error
+        return queue_resp
 
     else:
         # Unknown decision variant — fail closed.
@@ -477,14 +637,53 @@ def _register_gate_handlers(_d, gate_ref) -> None:
         g = _get_gate()
         if g is None:
             return {"status": "error", "error": "Gate not installed"}
-        pending = g.queue.list()
-        return {"gate": "allowed", "status": "success", "data": {"pending": pending}}
+        raw_pending = g.queue.list()
+        # PRESENTATION SPLIT (ADR 0005 rev2 §3.4e):
+        # The pending_queue stores the preview blob as an opaque dict.
+        # For the degrade case, the stored blob is {"preview_error": <str>},
+        # which must be split into top-level preview_error and preview=None.
+        # For the success case, the stored blob IS the payload -> keep as preview.
+        presented: list[dict] = []
+        for entry in raw_pending:
+            e = dict(entry)  # shallow copy — don't mutate the queue
+            stored = e.get("preview")
+            # M-03: use structural envelope check instead of fragile len()==1.
+            # A degrade marker is identified by having a "preview_error" key with
+            # a string value.  This is robust to extra fields being present and
+            # does not confuse a success payload that happens to contain
+            # "preview_error" as a field name in its own schema (the string-value
+            # check distinguishes: a real error is always a str from str(exc)).
+            if (
+                isinstance(stored, dict)
+                and isinstance(stored.get("preview_error"), str)
+            ):
+                # Degrade marker: lift preview_error to top level; preview is None.
+                e["preview_error"] = stored["preview_error"]
+                e["preview"] = None
+            # else: preview stays as-is (success payload or None)
+            presented.append(e)
+        return {"gate": "allowed", "status": "success", "data": {"pending": presented}}
 
     # --- gate.approve_pending_call ---
     def _approve_pending_call(pending_id: str) -> dict:
         g = _get_gate()
         if g is None:
             return {"status": "error", "error": "Gate not installed"}
+
+        # Peek at the pending entry BEFORE approving to capture the stored
+        # preview payload (needed for re-validate divergence check).
+        # peek_entry may be None if expired/not-found — we'll catch that below.
+        pending_entries = g.queue.list()
+        peek_entry = next(
+            (e for e in pending_entries if e.get("id") == pending_id), None
+        )
+
+        # B3 / ADR 0005 rev2 §3.4f: retrieve original call params BEFORE the
+        # approve() call removes the entry from the queue.  params_of() returns
+        # None once the entry is gone (approve purges it), so we must capture
+        # here while the entry is still present.
+        stored_params_pre: dict = g.queue.params_of(pending_id) or {}  # type: ignore[attr-defined]
+
         # First check: is the pending_id known (raises KeyError if not)?
         try:
             raw_handler_result = g.queue.approve(pending_id)
@@ -512,6 +711,54 @@ def _register_gate_handlers(_d, gate_ref) -> None:
             wrapped = dict(raw_handler_result)
         else:
             wrapped = {"status": "success", "data": raw_handler_result}
+
+        # ADR 0005 rev2 §3.4f — Re-validate preview at approve time.
+        # Run the preview_fn DIRECTLY (no _run_preview / no hdefereval) since
+        # approve_pending_call is already running on the main thread — nesting
+        # hdefereval here would deadlock (M-02 / B3).
+        # Use stored params from the queue so the re-validate result matches the
+        # original queue-time call (B3 fix: empty {} produced spurious divergence).
+        if peek_entry is not None:
+            command = peek_entry.get("tool", "")
+            # Use params captured PRE-approve (stored_params_pre); the entry has
+            # already been removed from the queue by g.queue.approve() above so
+            # calling params_of() again would return None (B3 bug root cause).
+            stored_params: dict = stored_params_pre
+            if command:
+                import fxhoudinimcp_server.dispatcher as _d2
+                reg2 = _d2.preview_of(command)
+                preview_fn2 = reg2.get("preview_fn")
+                if preview_fn2 is not None:
+                    stored_preview = peek_entry.get("preview")
+                    # Stored preview may be the degrade marker; treat it as None
+                    # for divergence purposes (we compare real payloads only).
+                    stored_real = (
+                        stored_preview
+                        if isinstance(stored_preview, dict) and "preview_error" not in stored_preview
+                        else None
+                    )
+                    # Call preview_fn directly — already on main thread (§3.4f ADR).
+                    # Wrap in undos.disabler for consistency with _run_preview (ADV-004).
+                    try:
+                        try:
+                            import hou  # type: ignore[import-untyped]
+                            with hou.undos.disabler():
+                                revalidate_payload = preview_fn2(stored_params)
+                        except ImportError:
+                            revalidate_payload = preview_fn2(stored_params)
+                        revalidate_error = None
+                    except Exception as exc:  # noqa: BLE001
+                        revalidate_payload = None
+                        revalidate_error = str(exc)
+                    if revalidate_error is None and revalidate_payload is not None:
+                        # Compare the re-validate result with the stored queue-time result.
+                        if revalidate_payload != stored_real:
+                            wrapped["divergence_warning"] = (
+                                f"Preview verdict changed between queue time and approve time "
+                                f"for command '{command}'. Queue-time: {stored_real!r}. "
+                                f"Approve-time: {revalidate_payload!r}. "
+                                "The operator should verify the current state before proceeding."
+                            )
 
         # Emit approved audit event.
         g2 = _get_gate()
