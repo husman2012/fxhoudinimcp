@@ -52,6 +52,8 @@ from fxhoudinimcp.export_model import (  # noqa: E402
     ExportManifest,
     VersionTriple,
     alembic_packed_transform_value,
+    gc_export_refusal,
+    niagara_normalize_output,
     resolve_frame_range,
     vat_mode_from_export_type,
 )
@@ -820,6 +822,432 @@ def export_fbx(
         return {"ok": False, "error": str(exc), "wrote_files": False}
 
 
+def export_chaos_gc(
+    node_path: str,
+    out_abc: str,
+    deforming: bool = True,
+    frame_range: list | None = None,
+) -> dict:
+    """Bake a Chaos Geometry Cache (.abc) for Unreal Engine import. FR-7 contiguity-gated.
+
+    FR-7: Reads the unreal_gc_piece prim attribute BEFORE creating any ROP.
+    If the piece IDs are non-contiguous or absent, returns a refusal dict
+    immediately (ok=False, wrote_files=False) with NO ROP created and NO .abc
+    written.
+
+    Creates a SOP-context rop_alembic under the source SOP's parent geo node
+    (grounded: rop_alembic is SOP-category, NOT /out — mirrors export_alembic_ue).
+
+    FR-2 (fail-loud): param validation BEFORE the outer try; the entire
+    mutating body is wrapped in a single try/except Exception.
+
+    Args:
+        node_path:   Houdini SOP node path (e.g. "/obj/geo1/attribwrangle1").
+        out_abc:     Output .abc file path.
+        deforming:   True -> packed_transform=0 (Deform Geometry — default);
+                     False -> packed_transform=1 (Transform Geometry).
+        frame_range: [start, end] or [start, end, inc]. Uses playbar range when None.
+
+    Returns:
+        {ok, node, out_abc, sidecar, tool_version, manifest}  on success.
+        {ok: False, error, wrote_files: False}                 on failure or FR-7 refusal.
+    """
+    import json as _json
+    import os as _os
+
+    # ── param validation (FR-2 early-return — before outer try) ──────────────
+    if not node_path:
+        return {"ok": False, "error": "export_chaos_gc requires 'node_path'", "wrote_files": False}
+    if not out_abc:
+        return {"ok": False, "error": "export_chaos_gc requires 'out_abc'", "wrote_files": False}
+
+    # Resolve frame range early (pure-logic — raises ValueError on bad input).
+    try:
+        playbar_fr = hou.playbar.frameRange()
+        f1, f2, _finc = resolve_frame_range(
+            frame_range,
+            default_start=int(playbar_fr[0]),
+            default_end=int(playbar_fr[1]),
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc), "wrote_files": False}
+
+    packed_transform = alembic_packed_transform_value(deforming)
+
+    # ── FR-2 outer envelope — wraps ALL Houdini mutation + file I/O ──────────
+    try:
+        # rop is bound FIRST so the outer except's `if rop is not None` is always
+        # safe even if a statement before createNode raises (FR-2: no UnboundLocalError).
+        rop = None
+
+        _node = hou.node(node_path)
+        if _node is None:
+            return {"ok": False, "error": f"Node not found: {node_path!r}", "wrote_files": False}
+
+        # Accept both ObjNode (geo container) and SOP node paths.
+        # If given an ObjNode, drill into its display SOP for geometry + ROP parent.
+        if hasattr(_node, "displayNode") and callable(_node.displayNode):
+            # ObjNode path: display SOP is the source; container is the ROP parent.
+            sop_node = _node.displayNode()
+            if sop_node is None:
+                return {"ok": False, "error": f"ObjNode {node_path!r} has no display SOP", "wrote_files": False}
+            parent_geo = _node  # rop_alembic goes into the ObjNode container
+        else:
+            # SOP node path: parent is the ObjNode container.
+            sop_node = _node
+            parent_geo = _node.parent()
+            if parent_geo is None:
+                return {"ok": False, "error": f"SOP {node_path!r} has no parent geo node", "wrote_files": False}
+
+        # ── FR-7: Contiguity check BEFORE any createNode ─────────────────────
+        # Read unreal_gc_piece prim attribute from the live geometry.
+        geo = sop_node.geometry()
+        if geo is not None:
+            piece_attrib = geo.findPrimAttrib("unreal_gc_piece")
+            if piece_attrib is not None:
+                piece_ids = list(geo.primIntAttribValues("unreal_gc_piece"))
+            else:
+                piece_ids = []
+        else:
+            piece_ids = []
+
+        check = budget_rules.check_gc_sequential(piece_ids)
+        refusal = gc_export_refusal(check)
+        if refusal is not None:
+            # FR-7: non-contiguous or absent piece IDs — abort BEFORE creating ROP.
+            return refusal
+
+        # Expand path and ensure the output directory exists.
+        _out_abc = hou.text.expandString(out_abc).replace("\\", "/")
+        _out_dir = _os.path.dirname(_out_abc)
+        if _out_dir:
+            _os.makedirs(_out_dir, exist_ok=True)
+
+        # Get Labs version for VersionTriple.
+        labs_vat = _get_labs_vat_version()
+        houdini_version = hou.applicationVersionString()
+
+        # Create rop_alembic node inside the parent geo container.
+        rop = parent_geo.createNode("rop_alembic", "mcp_gc_export")
+
+        def _fail_destroy(msg):
+            try:
+                rop.destroy()
+            except Exception:
+                pass
+            return {"ok": False, "error": msg, "wrote_files": False}
+
+        # ── Set ROP parms (grounded from plan riskNotes + export_alembic_ue exemplar) ─
+
+        # SOP export wiring: use_sop_path + sop_path (prim-path wiring).
+        use_sop_parm = rop.parm("use_sop_path")
+        sop_path_parm = rop.parm("sop_path")
+        if use_sop_parm is None or sop_path_parm is None:
+            # Fallback: wire SOP directly as first input.
+            try:
+                rop.setInput(0, sop_node)
+            except Exception as exc:
+                return _fail_destroy(f"Cannot wire SOP to rop_alembic: {exc}")
+        else:
+            use_sop_parm.set(1)
+            sop_path_parm.set(node_path)
+
+        # filename — output .abc path.
+        filename_parm = rop.parm("filename")
+        if filename_parm is None:
+            return _fail_destroy("parm 'filename' not found on rop_alembic — SDK version mismatch?")
+        filename_parm.set(_out_abc)
+
+        # Frame range: trange=1 (use range), f tuple = (f1, f2, _finc).
+        trange_parm = rop.parm("trange")
+        if trange_parm is not None:
+            trange_parm.set(1)  # 0=current, 1=range, 2=full
+        f_tuple = rop.parmTuple("f")
+        if f_tuple is not None:
+            f_tuple.set((f1, f2, _finc))
+
+        # packed_transform: 0=Deform, 1=Transform.
+        pt_parm = rop.parm("packed_transform")
+        if pt_parm is not None:
+            pt_parm.set(packed_transform)
+
+        # save_attributes: ensure custom attribs (unreal_gc_*) are written.
+        # Enable both point and prim attribute saving (non-fatal — skip if absent).
+        save_attribs_parm = rop.parm("save_attributes")
+        if save_attribs_parm is not None:
+            save_attribs_parm.set(1)
+
+        prim_attribs_parm = rop.parm("primitiveAttributes")
+        if prim_attribs_parm is not None:
+            prim_attribs_parm.set("unreal_gc_*")
+
+        point_attribs_parm = rop.parm("pointAttributes")
+        if point_attribs_parm is not None:
+            point_attribs_parm.set("*")
+
+        # ── Trigger the bake ──────────────────────────────────────────────────
+        try:
+            exec_parm = rop.parm("execute")
+            if exec_parm is not None:
+                exec_parm.pressButton()
+            else:
+                rop.render()
+        except Exception as cook_exc:
+            errs = rop.errors()
+            err_msg = "\n".join(errs) if errs else str(cook_exc)
+            return _fail_destroy(err_msg)
+
+        errs = rop.errors()
+        if errs:
+            return _fail_destroy("\n".join(errs))
+
+        # Destroy rop_alembic now that bake succeeded.
+        rop.destroy()
+        rop = None
+
+        # ── Build VersionTriple + ExportManifest sidecar ──────────────────────
+        _labs_for_skew = labs_vat if labs_vat is not None else "0.0"
+        _skew_verdict, _skew_notes = skew_table.skew_verdict(
+            houdini=houdini_version,
+            labs_vat=_labs_for_skew,
+            ue=None,
+        )
+        version_triple = VersionTriple(
+            houdini=houdini_version,
+            labs_vat=labs_vat,
+            verdict=_skew_verdict,
+            notes=_skew_notes,
+        )
+
+        manifest = ExportManifest(
+            tool="houdini_export_chaos_gc",
+            args={
+                "node_path": node_path,
+                "out_abc": out_abc,
+                "deforming": deforming,
+                "frame_range": [f1, f2],
+            },
+            out_paths=[_out_abc],
+            version_triple=version_triple,
+            validator={},
+        )
+        _stem = _os.path.splitext(_os.path.basename(_out_abc))[0]
+        sidecar_path = _os.path.join(_out_dir or ".", f"{_stem}.export.json")
+        with open(sidecar_path, "w", encoding="utf-8") as _fh:
+            _json.dump(manifest.to_dict(), _fh, indent=2)
+
+        manifest_dict = manifest.to_dict()
+        return {
+            "ok": True,
+            "node": node_path,
+            "out_abc": _out_abc,
+            "sidecar": sidecar_path,
+            "tool_version": houdini_version,
+            "manifest": manifest_dict,
+        }
+
+    except Exception as exc:
+        if rop is not None:
+            try:
+                rop.destroy()
+            except Exception:
+                pass
+        return {"ok": False, "error": str(exc), "wrote_files": False}
+
+
+def export_niagara(
+    node_path: str,
+    out_path: str,
+    frame_range: list | None = None,
+) -> dict:
+    """Bake a labs::niagara_rop: write .hbjson + ExportManifest sidecar.
+
+    Creates a labs::niagara_rop ROP under /out (Driver/ROP context — grounded
+    from plan riskNotes: labs::niagara_rop is ROP-category, NOT SOP-context),
+    wires the supplied SOP node via the 'soppath' string parm, normalises the
+    output path to .hbjson (via niagara_normalize_output), triggers the bake,
+    and writes an ExportManifest sidecar (.export.json).
+
+    FR-2 (fail-loud): param validation BEFORE the outer try; the entire
+    mutating body is wrapped in a single try/except Exception.
+
+    Args:
+        node_path:   Houdini SOP node path (e.g. "/obj/geo1/attribwrangle1").
+        out_path:    Output file path. Extension is normalised to .hbjson
+                     by niagara_normalize_output (idempotent).
+        frame_range: [start, end] or [start, end, inc]. Uses playbar range when None.
+
+    Returns:
+        {ok, node, out_path, sidecar, tool_version, manifest}  on success.
+        {ok: False, error, wrote_files: False}                  on failure.
+    """
+    import json as _json
+    import os as _os
+
+    # ── param validation (FR-2 early-return — before outer try) ──────────────
+    if not node_path:
+        return {"ok": False, "error": "export_niagara requires 'node_path'", "wrote_files": False}
+    if not out_path:
+        return {"ok": False, "error": "export_niagara requires 'out_path'", "wrote_files": False}
+
+    # Normalise output path to .hbjson BEFORE the outer try (pure-logic).
+    _out_path_normalised = niagara_normalize_output(out_path)
+
+    # Resolve frame range early (pure-logic — raises ValueError on bad input).
+    try:
+        playbar_fr = hou.playbar.frameRange()
+        f1, f2, _finc = resolve_frame_range(
+            frame_range,
+            default_start=int(playbar_fr[0]),
+            default_end=int(playbar_fr[1]),
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc), "wrote_files": False}
+
+    # ── FR-2 outer envelope — wraps ALL Houdini mutation + file I/O ──────────
+    try:
+        # rop is bound FIRST so the outer except's `if rop is not None` is always
+        # safe even if a statement before createNode raises (FR-2: no UnboundLocalError).
+        rop = None
+
+        _node_n = hou.node(node_path)
+        if _node_n is None:
+            return {"ok": False, "error": f"Node not found: {node_path!r}", "wrote_files": False}
+
+        # Accept both ObjNode (geo container) and SOP node paths.
+        # labs::niagara_rop uses a string 'soppath' parm — resolve to the display
+        # SOP path so the ROP correctly targets SOP-context geometry in both cases.
+        if hasattr(_node_n, "displayNode") and callable(_node_n.displayNode):
+            sop_node = _node_n.displayNode()
+            if sop_node is None:
+                return {"ok": False, "error": f"ObjNode {node_path!r} has no display SOP", "wrote_files": False}
+            _sop_path_for_rop = sop_node.path()
+        else:
+            sop_node = _node_n
+            _sop_path_for_rop = node_path
+
+        # Expand path and ensure the output directory exists.
+        _out_path = hou.text.expandString(_out_path_normalised).replace("\\", "/")
+        _out_dir = _os.path.dirname(_out_path)
+        if _out_dir:
+            _os.makedirs(_out_dir, exist_ok=True)
+
+        # Get Labs version for VersionTriple.
+        labs_vat = _get_labs_vat_version()
+        houdini_version = hou.applicationVersionString()
+
+        # Create the Niagara ROP under /out (Driver context — grounded from plan riskNotes).
+        out_net = hou.node("/out")
+        if out_net is None:
+            return {"ok": False, "error": "Scene /out network not found — is a Houdini session active?", "wrote_files": False}
+
+        rop = out_net.createNode("labs::niagara_rop", "mcp_niagara_export")
+
+        def _fail_destroy(msg):
+            try:
+                rop.destroy()
+            except Exception:
+                pass
+            return {"ok": False, "error": msg, "wrote_files": False}
+
+        # ── Set ROP parms (grounded from plan riskNotes) ──────────────────────
+
+        # soppath — string parm for SOP input path (ROP-category node).
+        soppath_parm = rop.parm("soppath")
+        if soppath_parm is None:
+            return _fail_destroy("parm 'soppath' not found on labs::niagara_rop — SDK version mismatch?")
+        soppath_parm.set(_sop_path_for_rop)
+
+        # outputpath — the .hbjson output file path.
+        outputpath_parm = rop.parm("outputpath")
+        if outputpath_parm is None:
+            return _fail_destroy("parm 'outputpath' not found on labs::niagara_rop — SDK version mismatch?")
+        outputpath_parm.set(_out_path)
+
+        # mkpath: auto-create output directory (non-fatal — silently skip if absent).
+        mkpath_parm = rop.parm("mkpath")
+        if mkpath_parm is not None:
+            mkpath_parm.set(1)
+
+        # Frame range: trange=1 (use range), f tuple = (f1, f2, finc).
+        # labs::niagara_rop has a 3-component f ParmTuple (f1/f2/f3 — start/end/inc).
+        # Passing a 2-tuple raises "Invalid size." — must always pass 3-tuple.
+        trange_parm = rop.parm("trange")
+        if trange_parm is not None:
+            trange_parm.set(1)  # 0=current, 1=range, 2=full
+        f_tuple = rop.parmTuple("f")
+        if f_tuple is not None:
+            f_tuple.set((f1, f2, _finc))
+
+        # ── Trigger the bake ──────────────────────────────────────────────────
+        try:
+            exec_parm = rop.parm("execute")
+            if exec_parm is not None:
+                exec_parm.pressButton()
+            else:
+                rop.render()
+        except Exception as cook_exc:
+            errs = rop.errors()
+            err_msg = "\n".join(errs) if errs else str(cook_exc)
+            return _fail_destroy(err_msg)
+
+        errs = rop.errors()
+        if errs:
+            return _fail_destroy("\n".join(errs))
+
+        # Destroy niagara ROP now that bake succeeded.
+        rop.destroy()
+        rop = None
+
+        # ── Build VersionTriple + ExportManifest sidecar ──────────────────────
+        _labs_for_skew = labs_vat if labs_vat is not None else "0.0"
+        _skew_verdict, _skew_notes = skew_table.skew_verdict(
+            houdini=houdini_version,
+            labs_vat=_labs_for_skew,
+            ue=None,
+        )
+        version_triple = VersionTriple(
+            houdini=houdini_version,
+            labs_vat=labs_vat,
+            verdict=_skew_verdict,
+            notes=_skew_notes,
+        )
+
+        manifest = ExportManifest(
+            tool="houdini_export_niagara",
+            args={
+                "node_path": node_path,
+                "out_path": out_path,
+                "frame_range": [f1, f2],
+            },
+            out_paths=[_out_path],
+            version_triple=version_triple,
+            validator={},
+        )
+        _stem = _os.path.splitext(_os.path.basename(_out_path))[0]
+        sidecar_path = _os.path.join(_out_dir or ".", f"{_stem}.export.json")
+        with open(sidecar_path, "w", encoding="utf-8") as _fh:
+            _json.dump(manifest.to_dict(), _fh, indent=2)
+
+        manifest_dict = manifest.to_dict()
+        return {
+            "ok": True,
+            "node": node_path,
+            "out_path": _out_path,
+            "sidecar": sidecar_path,
+            "tool_version": houdini_version,
+            "manifest": manifest_dict,
+        }
+
+    except Exception as exc:
+        if rop is not None:
+            try:
+                rop.destroy()
+            except Exception:
+                pass
+        return {"ok": False, "error": str(exc), "wrote_files": False}
+
+
 # ---------------------------------------------------------------------------
 # Handler registration — MUST be at the BOTTOM of the file
 # (grounded against character_handlers.py registration pattern)
@@ -830,3 +1258,5 @@ register_handler("validate_budget", validate_budget, Capability.READONLY)
 register_handler("export_vat", export_vat, Capability.MUTATING)
 register_handler("export_alembic_ue", export_alembic_ue, Capability.MUTATING)
 register_handler("export_fbx", export_fbx, Capability.MUTATING)
+register_handler("export_chaos_gc", export_chaos_gc, Capability.MUTATING)
+register_handler("export_niagara", export_niagara, Capability.MUTATING)

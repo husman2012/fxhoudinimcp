@@ -44,7 +44,10 @@ from fxhoudinimcp.export_model import (
     ExportManifest,
     ExportRequest,
     verdict_from_checks,
+    gc_export_refusal,        # pp12-111f: does not exist yet → ImportError (RED)
+    niagara_normalize_output, # pp12-111f: does not exist yet → ImportError (RED)
 )
+from fxhoudinimcp.budget_rules import check_gc_sequential  # already exists; used in §11
 
 
 # ===========================================================================
@@ -1449,4 +1452,151 @@ class TestAlembicPackedTransformValue:
         """True and False must map to different int values (not both the same)."""
         assert self._fn(True) != self._fn(False), (
             "alembic_packed_transform_value(True) and (False) must return different ints"
+        )
+
+
+# ===========================================================================
+# Section 11 — gc_export_refusal
+#
+# pp12-111f locked contract:
+#   gc_export_refusal(check: BudgetCheck) -> dict | None
+#
+#   - If check.status == "pass"  → return None  (no refusal; bake may proceed)
+#   - If check.status == "fail"  → return {"ok": False, "wrote_files": False,
+#                                           "error": <str containing check.detail>}
+#
+# Uses check_gc_sequential() from budget_rules to build real BudgetCheck objects,
+# so the tests exercise the public contract without touching internals.
+#
+# TDD phase: RED — gc_export_refusal does NOT exist in export_model.py yet.
+#   ImportError fires at collection time (→ all tests in this class are RED).
+# ===========================================================================
+
+class TestGcExportRefusal:
+    """gc_export_refusal: None on pass, refusal dict on fail."""
+
+    # ------------------------------------------------------------------
+    # §11.1  Pass check → None (no refusal; bake is permitted)
+    # ------------------------------------------------------------------
+
+    def test_pass_check_returns_none(self):
+        """A contiguous [0,1,2] sequence passes; refusal must be None."""
+        check = check_gc_sequential([0, 1, 2])
+        assert check.status == "pass", (
+            f"test pre-condition failed: expected pass, got {check.status!r}"
+        )
+        result = gc_export_refusal(check)
+        assert result is None, (
+            f"gc_export_refusal must return None for a passing check, got {result!r}"
+        )
+
+    # ------------------------------------------------------------------
+    # §11.2  Fail check (non-contiguous) → refusal dict
+    # ------------------------------------------------------------------
+
+    def test_fail_check_non_contiguous_returns_refusal(self):
+        """A non-contiguous [0,2] sequence fails; refusal dict must be returned."""
+        check = check_gc_sequential([0, 2])
+        assert check.status == "fail", (
+            f"test pre-condition failed: expected fail, got {check.status!r}"
+        )
+        result = gc_export_refusal(check)
+        assert result is not None, (
+            "gc_export_refusal must return a dict (not None) for a failing check"
+        )
+        assert result["ok"] is False, (
+            f"refusal dict must have ok=False, got {result.get('ok')!r}"
+        )
+        assert result["wrote_files"] is False, (
+            f"refusal dict must have wrote_files=False, got {result.get('wrote_files')!r}"
+        )
+        assert "error" in result, (
+            "refusal dict must contain an 'error' key"
+        )
+        # The error string must mention the gap (detail from the check)
+        assert check.detail in result["error"] or "gap" in result["error"].lower(), (
+            f"error string should reference the gap detail; got {result['error']!r}, "
+            f"check.detail={check.detail!r}"
+        )
+
+    # ------------------------------------------------------------------
+    # §11.3  Fail check (empty list) → refusal dict
+    # ------------------------------------------------------------------
+
+    def test_fail_check_empty_returns_refusal(self):
+        """An empty piece list fails; refusal dict must be returned."""
+        check = check_gc_sequential([])
+        assert check.status == "fail", (
+            f"test pre-condition failed: expected fail, got {check.status!r}"
+        )
+        result = gc_export_refusal(check)
+        assert result is not None, (
+            "gc_export_refusal must return a dict (not None) for a failing check"
+        )
+        assert result["ok"] is False, (
+            f"refusal dict must have ok=False, got {result.get('ok')!r}"
+        )
+        assert result["wrote_files"] is False, (
+            f"refusal dict must have wrote_files=False, got {result.get('wrote_files')!r}"
+        )
+        assert "error" in result, (
+            "refusal dict must contain an 'error' key"
+        )
+        # Error string must be non-empty
+        assert result["error"], (
+            "refusal dict 'error' must be a non-empty string"
+        )
+
+
+# ===========================================================================
+# Section 12 — niagara_normalize_output
+#
+# pp12-111f locked contract:
+#   niagara_normalize_output(out_path: str) -> str
+#
+#   Normalises the output path to always carry the .hbjson extension:
+#     - Bare path (no extension)  → append ".hbjson"
+#     - Path already ending in ".hbjson"  → return unchanged (idempotent)
+#     - Path with any OTHER extension     → replace with ".hbjson"
+#
+# TDD phase: RED — niagara_normalize_output does NOT exist in export_model.py yet.
+#   ImportError fires at collection time (→ all tests in this class are RED).
+# ===========================================================================
+
+class TestNiagaraNormalizeOutput:
+    """niagara_normalize_output: always produces a .hbjson path."""
+
+    _fn = staticmethod(niagara_normalize_output)
+
+    # ------------------------------------------------------------------
+    # §12.1  Bare path → .hbjson appended
+    # ------------------------------------------------------------------
+
+    def test_bare_path_gets_hbjson_extension(self):
+        """A path with no extension gets .hbjson appended."""
+        result = self._fn("x/out")
+        assert result == "x/out.hbjson", (
+            f"bare path 'x/out' must become 'x/out.hbjson', got {result!r}"
+        )
+
+    # ------------------------------------------------------------------
+    # §12.2  Already .hbjson → idempotent
+    # ------------------------------------------------------------------
+
+    def test_hbjson_path_is_idempotent(self):
+        """A path already ending in .hbjson is returned unchanged."""
+        result = self._fn("x/out.hbjson")
+        assert result == "x/out.hbjson", (
+            f"'x/out.hbjson' must be returned unchanged, got {result!r}"
+        )
+
+    # ------------------------------------------------------------------
+    # §12.3  Other extension → replaced with .hbjson
+    # ------------------------------------------------------------------
+
+    def test_other_extension_is_replaced_with_hbjson(self):
+        """A path with a non-.hbjson extension has its extension replaced."""
+        result = self._fn("x/out.bgeo")
+        assert result == "x/out.hbjson", (
+            f"'x/out.bgeo' must become 'x/out.hbjson', got {result!r}"
         )

@@ -184,3 +184,77 @@ async def houdini_export_validate_budget(
         "validate_budget",
         {"node": node, "target": target, "budget_preset": budget_preset},
     )
+
+
+@mcp.tool(meta={"require_approval": True})
+async def houdini_export_chaos_gc(
+    ctx: Context,
+    node_path: str,
+    out_abc: str,
+    deforming: bool = True,
+    frame_range: list | None = None,
+) -> dict[str, Any]:
+    """Bake a Chaos Geometry Cache (.abc) via rop_alembic for Unreal Engine import. GATED — mutating.
+
+    FR-7: checks that the unreal_gc_piece prim attribute forms a contiguous 0-based
+    sequence BEFORE creating any ROP. Returns ok=False if non-contiguous or absent
+    (no .abc written on refusal).
+
+    Creates and cooks a SOP-context rop_alembic ROP, writes the .abc file, and
+    emits an ExportManifest sidecar (.export.json) for downstream validation.
+
+    Args:
+        ctx:         MCP context (injected by FastMCP).
+        node_path:   Houdini SOP node path (e.g. "/obj/geo1/attribwrangle1").
+        out_abc:     Output .abc file path (e.g. "/tmp/geo_cache.abc").
+        deforming:   True -> Deform Geometry (packed_transform=0, default);
+                     False -> Transform Geometry (packed_transform=1).
+        frame_range: [start, end] or [start, end, inc] frame list.
+                     Uses scene playbar range when None.
+
+    Returns:
+        dict with keys: ok, node, out_abc, sidecar, tool_version, manifest.
+        On FR-7 refusal or failure: ok=False, error=..., wrote_files=False.
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute("export_chaos_gc", {
+        "node_path": node_path,
+        "out_abc": out_abc,
+        "deforming": deforming,
+        "frame_range": frame_range,
+    })
+
+
+@mcp.tool(meta={"require_approval": True})
+async def houdini_export_niagara(
+    ctx: Context,
+    node_path: str,
+    out_path: str,
+    frame_range: list | None = None,
+) -> dict[str, Any]:
+    """Bake particle geometry to .hbjson via labs::niagara_rop for Unreal Engine Niagara import. GATED — mutating.
+
+    Creates and cooks a labs::niagara_rop ROP under /out, writes the .hbjson
+    Houdini Bgeo JSON file, and emits an ExportManifest sidecar (.export.json)
+    for downstream validation.
+
+    The output path is normalised to .hbjson (any other extension is replaced;
+    no extension appends .hbjson).
+
+    Args:
+        ctx:         MCP context (injected by FastMCP).
+        node_path:   Houdini SOP node path (e.g. "/obj/geo1/attribwrangle1").
+        out_path:    Output file path. Extension is normalised to .hbjson.
+        frame_range: [start, end] or [start, end, inc] frame list.
+                     Uses scene playbar range when None.
+
+    Returns:
+        dict with keys: ok, node, out_path, sidecar, tool_version, manifest.
+        On failure: ok=False, error=..., wrote_files=False.
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute("export_niagara", {
+        "node_path": node_path,
+        "out_path": out_path,
+        "frame_range": frame_range,
+    })

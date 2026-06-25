@@ -416,3 +416,58 @@ class ExportRequest:
             out_path_or_dir=d["out_path_or_dir"],
             params=dict(d.get("params", {})),
         )
+
+
+# ---------------------------------------------------------------------------
+# pp12-111f helpers — pure-logic, no hou / Qt / pxr
+# ---------------------------------------------------------------------------
+
+
+def gc_export_refusal(check) -> Optional[dict]:
+    """Return None if check passes; return a refusal dict if check fails (FR-7).
+
+    Used by export_chaos_gc to gate on check_gc_sequential BEFORE any hou
+    mutation.  When the check passes the handler proceeds normally.  When the
+    check fails the handler returns this dict immediately (no ROP created, no
+    .abc written).
+
+    Args:
+        check: a BudgetCheck instance returned by budget_rules.check_gc_sequential.
+
+    Returns:
+        None if check.status == "pass".
+        dict {"ok": False, "wrote_files": False, "error": <message>} on fail.
+    """
+    if check.status == "pass":
+        return None
+    # Build error string from check.detail (always set by check_gc_sequential on fail).
+    error_msg = check.detail if check.detail else "GC piece IDs are not contiguous"
+    if check.msg:
+        error_msg = f"{error_msg} {check.msg}"
+    return {"ok": False, "error": error_msg, "wrote_files": False}
+
+
+def niagara_normalize_output(out_path: str) -> str:
+    """Normalise out_path to always carry a .hbjson extension (idempotent).
+
+    The labs::niagara_rop writes a Houdini Bgeo JSON (.hbjson) file.
+    This helper ensures the caller-supplied path always ends in .hbjson
+    regardless of whether they supplied no extension, .hbjson, or some
+    other extension.
+
+    Args:
+        out_path: the caller-supplied output path string.
+
+    Returns:
+        out_path with extension replaced (or appended) to .hbjson.
+
+    Examples:
+        "x/out"        -> "x/out.hbjson"   (no extension: append)
+        "x/out.hbjson" -> "x/out.hbjson"   (idempotent)
+        "x/out.bgeo"   -> "x/out.hbjson"   (other extension: replace)
+    """
+    import os
+    if out_path.endswith(".hbjson"):
+        return out_path
+    root, _ = os.path.splitext(out_path)
+    return root + ".hbjson"
