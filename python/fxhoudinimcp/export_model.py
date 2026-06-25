@@ -304,6 +304,80 @@ def vat_mode_from_export_type(export_type: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Frame-range helpers (PR-5 — Alembic-UE + FBX bake)
+# ---------------------------------------------------------------------------
+
+def resolve_frame_range(
+    frame_range: object,
+    default_start: int,
+    default_end: int,
+    default_inc: int = 1,
+) -> tuple:
+    """Resolve a caller-supplied frame_range into a (start, end, inc) tuple of ints.
+
+    Args:
+        frame_range:   None  -> use defaults.
+                       list of 2 ints -> (start, end, default_inc).
+                       list of 3 ints -> (start, end, inc).
+                       Anything else  -> raises ValueError.
+        default_start: int used when frame_range is None.
+        default_end:   int used when frame_range is None.
+        default_inc:   int used when frame_range is None or a 2-element list.
+
+    Returns:
+        (start, end, inc) — a tuple of exactly 3 ints.
+
+    Raises:
+        ValueError: for non-None non-list inputs, empty lists, lists with 1
+                    element, lists with 4+ elements, or any element that cannot
+                    be coerced to int.
+    """
+    if frame_range is None:
+        return (int(default_start), int(default_end), int(default_inc))
+
+    if not isinstance(frame_range, list):
+        raise ValueError(
+            f"frame_range must be None or a list, got {type(frame_range).__name__!r}: {frame_range!r}"
+        )
+
+    length = len(frame_range)
+    if length < 2 or length > 3:
+        raise ValueError(
+            f"frame_range list must have 2 or 3 elements, got {length}: {frame_range!r}"
+        )
+
+    try:
+        start = int(frame_range[0])
+        end = int(frame_range[1])
+        inc = int(frame_range[2]) if length == 3 else int(default_inc)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"frame_range elements must be coercible to int: {frame_range!r}"
+        ) from exc
+
+    return (start, end, inc)
+
+
+def alembic_packed_transform_value(deforming: bool) -> int:
+    """Return the rop_alembic 'packed_transform' parameter value for the given mode.
+
+    Houdini rop_alembic packed_transform parm:
+        0 = Deform Geometry  (write per-frame vertex positions; use when deforming=True)
+        1 = Transform Geometry (write transform only; use when deforming=False)
+
+    Args:
+        deforming: True -> deform geometry (0); False -> transform only (1).
+
+    Returns:
+        int 0 or 1 (plain int, NOT bool — isinstance(result, bool) is False).
+    """
+    # Use integer literals explicitly so the return type is int, not bool.
+    # bool is a subclass of int in Python: `True == 1` but `isinstance(True, bool)` is True.
+    # The test asserts isinstance(result, bool) is False, so we must not return True/False.
+    return 0 if deforming else 1
+
+
+# ---------------------------------------------------------------------------
 # ExportRequest
 # ---------------------------------------------------------------------------
 

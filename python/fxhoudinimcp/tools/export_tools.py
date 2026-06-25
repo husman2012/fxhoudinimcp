@@ -85,6 +85,77 @@ async def houdini_export_vat(
     })
 
 
+@mcp.tool(meta={"require_approval": True})
+async def houdini_export_alembic_ue(
+    ctx: Context,
+    node: str,
+    out_path: str,
+    deforming: bool = True,
+    frame_range: list | None = None,
+) -> dict[str, Any]:
+    """Bake an Alembic (.abc) via rop_alembic for Unreal Engine import. GATED — mutating.
+
+    Creates and cooks a SOP-context rop_alembic ROP, writes the .abc file, and
+    emits an ExportManifest sidecar (.export.json) for downstream validation.
+
+    When deforming=True (default), packed_transform=0 (Deform Geometry) is used,
+    preserving per-frame vertex positions for skeletal/deforming assets.
+    When deforming=False, packed_transform=1 (Transform Geometry) is used,
+    writing only the transform matrix per frame (rigid bodies).
+
+    Args:
+        ctx:         MCP context (injected by FastMCP).
+        node:        Houdini SOP node path (e.g. "/obj/geo1/attribwrangle1").
+        out_path:    Output .abc file path (e.g. "/tmp/out.abc").
+        deforming:   True -> Deform Geometry (packed_transform=0, default);
+                     False -> Transform Geometry (packed_transform=1).
+        frame_range: [start, end] or [start, end, inc] frame list.
+                     Uses scene playbar range when None.
+
+    Returns:
+        dict with keys: ok, node, out_path, sidecar, tool_version, manifest.
+        On failure: ok=False, error=..., wrote_files=False.
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute("export_alembic_ue", {
+        "node": node,
+        "out_path": out_path,
+        "deforming": deforming,
+        "frame_range": frame_range,
+    })
+
+
+@mcp.tool(meta={"require_approval": True})
+async def houdini_export_fbx(
+    ctx: Context,
+    node: str,
+    out_path: str,
+    frame_range: list | None = None,
+) -> dict[str, Any]:
+    """Bake an FBX (.fbx) via rop_fbx for Unreal Engine or other DCC import. GATED — mutating.
+
+    Creates and cooks a SOP-context rop_fbx ROP, writes the .fbx file, and
+    emits an ExportManifest sidecar (.export.json) for downstream validation.
+
+    Args:
+        ctx:         MCP context (injected by FastMCP).
+        node:        Houdini SOP node path (e.g. "/obj/geo1/attribwrangle1").
+        out_path:    Output .fbx file path (e.g. "/tmp/out.fbx").
+        frame_range: [start, end] or [start, end, inc] frame list.
+                     Uses scene playbar range when None.
+
+    Returns:
+        dict with keys: ok, node, out_path, sidecar, tool_version, manifest.
+        On failure: ok=False, error=..., wrote_files=False.
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute("export_fbx", {
+        "node": node,
+        "out_path": out_path,
+        "frame_range": frame_range,
+    })
+
+
 @mcp.tool(meta={"require_approval": False})
 async def houdini_export_validate_budget(
     ctx: Context,

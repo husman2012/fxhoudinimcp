@@ -51,6 +51,8 @@ from fxhoudinimcp import budget_rules, skew_table  # noqa: E402
 from fxhoudinimcp.export_model import (  # noqa: E402
     ExportManifest,
     VersionTriple,
+    alembic_packed_transform_value,
+    resolve_frame_range,
     vat_mode_from_export_type,
 )
 
@@ -461,6 +463,363 @@ def export_vat(
         return {"ok": False, "error": str(exc), "wrote_files": False}
 
 
+def export_alembic_ue(
+    node: str,
+    out_path: str,
+    deforming: bool = True,
+    frame_range: list | None = None,
+) -> dict:
+    """Bake a rop_alembic ROP: write Alembic (.abc) + ExportManifest sidecar.
+
+    Creates a SOP-context rop_alembic under the source SOP's parent geo node,
+    wires the SOP input, sets frame-range and packed_transform, triggers the
+    bake, and writes an ExportManifest sidecar (.export.json).
+
+    FR-2 (fail-loud): param validation BEFORE the outer try; the entire
+    mutating body is wrapped in a single try/except Exception.
+
+    Args:
+        node:        Houdini SOP node path (e.g. "/obj/geo1/box1").
+        out_path:    Output .abc file path.
+        deforming:   True -> packed_transform=0 (Deform Geometry — default);
+                     False -> packed_transform=1 (Transform Geometry).
+        frame_range: [start, end] or [start, end, inc].  Uses playbar range when None.
+
+    Returns:
+        {ok, node, out_path, sidecar, tool_version, manifest}  on success.
+        {ok: False, error, wrote_files: False}                  on failure.
+    """
+    import json as _json
+    import os as _os
+
+    # ── param validation (FR-2 early-return — before outer try) ──────────────
+    if not node:
+        return {"ok": False, "error": "export_alembic_ue requires 'node'", "wrote_files": False}
+    if not out_path:
+        return {"ok": False, "error": "export_alembic_ue requires 'out_path'", "wrote_files": False}
+
+    # Resolve frame range early (pure-logic — raises ValueError on bad input).
+    try:
+        playbar_fr = hou.playbar.frameRange()
+        f1, f2, _finc = resolve_frame_range(
+            frame_range,
+            default_start=int(playbar_fr[0]),
+            default_end=int(playbar_fr[1]),
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc), "wrote_files": False}
+
+    packed_transform = alembic_packed_transform_value(deforming)
+
+    # ── FR-2 outer envelope ───────────────────────────────────────────────────
+    try:
+        rop = None
+
+        sop_node = hou.node(node)
+        if sop_node is None:
+            return {"ok": False, "error": f"Node not found: {node!r}", "wrote_files": False}
+
+        # rop_alembic is SOP-context — create in the parent geo (OBJ) node.
+        parent_geo = sop_node.parent()
+        if parent_geo is None:
+            return {"ok": False, "error": f"SOP {node!r} has no parent geo node", "wrote_files": False}
+
+        # Expand path and ensure the output directory exists.
+        _out_path = hou.text.expandString(out_path).replace("\\", "/")
+        _out_dir = _os.path.dirname(_out_path)
+        if _out_dir:
+            _os.makedirs(_out_dir, exist_ok=True)
+
+        # Get Labs version for VersionTriple.
+        labs_vat = _get_labs_vat_version()
+        houdini_version = hou.applicationVersionString()
+
+        # Create rop_alembic node inside the parent geo container.
+        rop = parent_geo.createNode("rop_alembic", "mcp_abc_export")
+
+        def _fail_destroy(msg):
+            try:
+                rop.destroy()
+            except Exception:
+                pass
+            return {"ok": False, "error": msg, "wrote_files": False}
+
+        # ── Set ROP parms (grounded from plan riskNotes) ──────────────────────
+
+        # SOP export wiring: use_sop_path + sop_path (prim-path wiring).
+        use_sop_parm = rop.parm("use_sop_path")
+        sop_path_parm = rop.parm("sop_path")
+        if use_sop_parm is None or sop_path_parm is None:
+            # Fallback: wire SOP directly as first input.
+            try:
+                rop.setInput(0, sop_node)
+            except Exception as exc:
+                return _fail_destroy(f"Cannot wire SOP to rop_alembic: {exc}")
+        else:
+            use_sop_parm.set(1)
+            sop_path_parm.set(node)
+
+        # filename — output .abc path.
+        filename_parm = rop.parm("filename")
+        if filename_parm is None:
+            return _fail_destroy("parm 'filename' not found on rop_alembic — SDK version mismatch?")
+        filename_parm.set(_out_path)
+
+        # Frame range: trange=1 (use range), f tuple = (f1, f2, 1).
+        trange_parm = rop.parm("trange")
+        if trange_parm is not None:
+            trange_parm.set(1)  # 0=current, 1=range, 2=full
+        f_tuple = rop.parmTuple("f")
+        if f_tuple is not None:
+            f_tuple.set((f1, f2, _finc))
+
+        # packed_transform: 0=Deform, 1=Transform.
+        pt_parm = rop.parm("packed_transform")
+        if pt_parm is not None:
+            pt_parm.set(packed_transform)
+
+        # ── Trigger the bake ──────────────────────────────────────────────────
+        try:
+            exec_parm = rop.parm("execute")
+            if exec_parm is not None:
+                exec_parm.pressButton()
+            else:
+                rop.render()
+        except Exception as cook_exc:
+            errs = rop.errors()
+            err_msg = "\n".join(errs) if errs else str(cook_exc)
+            return _fail_destroy(err_msg)
+
+        errs = rop.errors()
+        if errs:
+            return _fail_destroy("\n".join(errs))
+
+        # Destroy rop_alembic now that bake succeeded.
+        rop.destroy()
+        rop = None
+
+        # ── Build VersionTriple + ExportManifest sidecar ──────────────────────
+        _labs_for_skew = labs_vat if labs_vat is not None else "0.0"
+        _skew_verdict, _skew_notes = skew_table.skew_verdict(
+            houdini=houdini_version,
+            labs_vat=_labs_for_skew,
+            ue=None,
+        )
+        version_triple = VersionTriple(
+            houdini=houdini_version,
+            labs_vat=labs_vat,
+            verdict=_skew_verdict,
+            notes=_skew_notes,
+        )
+
+        manifest = ExportManifest(
+            tool="houdini_export_alembic_ue",
+            args={
+                "node": node,
+                "out_path": out_path,
+                "deforming": deforming,
+                "frame_range": [f1, f2],
+            },
+            out_paths=[_out_path],
+            version_triple=version_triple,
+            validator={},
+        )
+        _stem = _os.path.splitext(_os.path.basename(_out_path))[0]
+        sidecar_path = _os.path.join(_out_dir or ".", f"{_stem}.export.json")
+        with open(sidecar_path, "w", encoding="utf-8") as _fh:
+            _json.dump(manifest.to_dict(), _fh, indent=2)
+
+        manifest_dict = manifest.to_dict()
+        return {
+            "ok": True,
+            "node": node,
+            "out_path": _out_path,
+            "sidecar": sidecar_path,
+            "tool_version": houdini_version,
+            "manifest": manifest_dict,
+        }
+
+    except Exception as exc:
+        if rop is not None:
+            try:
+                rop.destroy()
+            except Exception:
+                pass
+        return {"ok": False, "error": str(exc), "wrote_files": False}
+
+
+def export_fbx(
+    node: str,
+    out_path: str,
+    frame_range: list | None = None,
+) -> dict:
+    """Bake a rop_fbx ROP: write FBX (.fbx) + ExportManifest sidecar.
+
+    Creates a SOP-context rop_fbx under the source SOP's parent geo node,
+    wires the SOP input, sets frame-range, triggers the bake, and writes an
+    ExportManifest sidecar (.export.json).
+
+    FR-2 (fail-loud): param validation BEFORE the outer try; the entire
+    mutating body is wrapped in a single try/except Exception.
+
+    Args:
+        node:        Houdini SOP node path (e.g. "/obj/geo1/box1").
+        out_path:    Output .fbx file path.
+        frame_range: [start, end] or [start, end, inc].  Uses playbar range when None.
+
+    Returns:
+        {ok, node, out_path, sidecar, tool_version, manifest}  on success.
+        {ok: False, error, wrote_files: False}                  on failure.
+    """
+    import json as _json
+    import os as _os
+
+    # ── param validation (FR-2 early-return — before outer try) ──────────────
+    if not node:
+        return {"ok": False, "error": "export_fbx requires 'node'", "wrote_files": False}
+    if not out_path:
+        return {"ok": False, "error": "export_fbx requires 'out_path'", "wrote_files": False}
+
+    # Resolve frame range early (pure-logic — raises ValueError on bad input).
+    try:
+        playbar_fr = hou.playbar.frameRange()
+        f1, f2, _finc = resolve_frame_range(
+            frame_range,
+            default_start=int(playbar_fr[0]),
+            default_end=int(playbar_fr[1]),
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc), "wrote_files": False}
+
+    # ── FR-2 outer envelope ───────────────────────────────────────────────────
+    try:
+        rop = None
+
+        sop_node = hou.node(node)
+        if sop_node is None:
+            return {"ok": False, "error": f"Node not found: {node!r}", "wrote_files": False}
+
+        # rop_fbx is SOP-context — create in the parent geo (OBJ) node.
+        parent_geo = sop_node.parent()
+        if parent_geo is None:
+            return {"ok": False, "error": f"SOP {node!r} has no parent geo node", "wrote_files": False}
+
+        # Expand path and ensure the output directory exists.
+        _out_path = hou.text.expandString(out_path).replace("\\", "/")
+        _out_dir = _os.path.dirname(_out_path)
+        if _out_dir:
+            _os.makedirs(_out_dir, exist_ok=True)
+
+        # Get Labs version for VersionTriple.
+        labs_vat = _get_labs_vat_version()
+        houdini_version = hou.applicationVersionString()
+
+        # Create rop_fbx node inside the parent geo container.
+        rop = parent_geo.createNode("rop_fbx", "mcp_fbx_export")
+
+        def _fail_destroy(msg):
+            try:
+                rop.destroy()
+            except Exception:
+                pass
+            return {"ok": False, "error": msg, "wrote_files": False}
+
+        # ── Set ROP parms (grounded from plan riskNotes) ──────────────────────
+
+        # SOP wiring: setInput(0, sop_node) is the primary approach for rop_fbx.
+        try:
+            rop.setInput(0, sop_node)
+        except Exception:
+            # Fallback: startnode string parm (some versions use string path).
+            startnode_parm = rop.parm("startnode")
+            if startnode_parm is not None:
+                startnode_parm.set(node)
+            else:
+                return _fail_destroy("Cannot wire SOP to rop_fbx: setInput failed and 'startnode' parm absent")
+
+        # sopoutput — output .fbx path.
+        sopoutput_parm = rop.parm("sopoutput")
+        if sopoutput_parm is None:
+            return _fail_destroy("parm 'sopoutput' not found on rop_fbx — SDK version mismatch?")
+        sopoutput_parm.set(_out_path)
+
+        # Frame range: trange=1 (use range), f tuple = (f1, f2, 1).
+        trange_parm = rop.parm("trange")
+        if trange_parm is not None:
+            trange_parm.set(1)  # 0=current, 1=range, 2=full
+        f_tuple = rop.parmTuple("f")
+        if f_tuple is not None:
+            f_tuple.set((f1, f2, _finc))
+
+        # ── Trigger the bake ──────────────────────────────────────────────────
+        try:
+            exec_parm = rop.parm("execute")
+            if exec_parm is not None:
+                exec_parm.pressButton()
+            else:
+                rop.render()
+        except Exception as cook_exc:
+            errs = rop.errors()
+            err_msg = "\n".join(errs) if errs else str(cook_exc)
+            return _fail_destroy(err_msg)
+
+        errs = rop.errors()
+        if errs:
+            return _fail_destroy("\n".join(errs))
+
+        # Destroy rop_fbx now that bake succeeded.
+        rop.destroy()
+        rop = None
+
+        # ── Build VersionTriple + ExportManifest sidecar ──────────────────────
+        _labs_for_skew = labs_vat if labs_vat is not None else "0.0"
+        _skew_verdict, _skew_notes = skew_table.skew_verdict(
+            houdini=houdini_version,
+            labs_vat=_labs_for_skew,
+            ue=None,
+        )
+        version_triple = VersionTriple(
+            houdini=houdini_version,
+            labs_vat=labs_vat,
+            verdict=_skew_verdict,
+            notes=_skew_notes,
+        )
+
+        manifest = ExportManifest(
+            tool="houdini_export_fbx",
+            args={
+                "node": node,
+                "out_path": out_path,
+                "frame_range": [f1, f2],
+            },
+            out_paths=[_out_path],
+            version_triple=version_triple,
+            validator={},
+        )
+        _stem = _os.path.splitext(_os.path.basename(_out_path))[0]
+        sidecar_path = _os.path.join(_out_dir or ".", f"{_stem}.export.json")
+        with open(sidecar_path, "w", encoding="utf-8") as _fh:
+            _json.dump(manifest.to_dict(), _fh, indent=2)
+
+        manifest_dict = manifest.to_dict()
+        return {
+            "ok": True,
+            "node": node,
+            "out_path": _out_path,
+            "sidecar": sidecar_path,
+            "tool_version": houdini_version,
+            "manifest": manifest_dict,
+        }
+
+    except Exception as exc:
+        if rop is not None:
+            try:
+                rop.destroy()
+            except Exception:
+                pass
+        return {"ok": False, "error": str(exc), "wrote_files": False}
+
+
 # ---------------------------------------------------------------------------
 # Handler registration — MUST be at the BOTTOM of the file
 # (grounded against character_handlers.py registration pattern)
@@ -469,3 +828,5 @@ def export_vat(
 register_handler("probe_versions", probe_versions, Capability.READONLY)
 register_handler("validate_budget", validate_budget, Capability.READONLY)
 register_handler("export_vat", export_vat, Capability.MUTATING)
+register_handler("export_alembic_ue", export_alembic_ue, Capability.MUTATING)
+register_handler("export_fbx", export_fbx, Capability.MUTATING)

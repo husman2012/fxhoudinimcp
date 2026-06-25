@@ -1100,3 +1100,353 @@ class TestVatModeFromExportType:
             assert name in modes, (
                 f"VAT_EXPORT_MODES missing key {name!r}; present: {list(modes.keys())}"
             )
+
+
+# ===========================================================================
+# Section 9 — resolve_frame_range(frame_range, default_start, default_end,
+#                                  default_inc=1) -> (int, int, int)
+#
+# PP12-111e (PR-5) — new pure helper in export_model.py.
+#
+# Locked contract:
+#   resolve_frame_range(None, 1, 240)      == (1, 240, 1)   # defaults
+#   resolve_frame_range([5, 20], 1, 240)   == (5, 20, 1)    # 2-elem list, inc defaults to 1
+#   resolve_frame_range([5, 20, 2], 1, 240) == (5, 20, 2)   # 3-elem list, inc explicit
+#   resolve_frame_range("garbage", 1, 240) -> raises ValueError
+#   resolve_frame_range([1], 1, 240)       -> raises ValueError (too few elements)
+#   resolve_frame_range([], 1, 240)        -> raises ValueError (empty list)
+#
+# Return type: tuple of three ints (start, end, inc) for rop_alembic / rop_fbx 'f' parm.
+# Grounded source: plan pp12-111e riskNotes GROUNDED FIELD TABLE (live hython probe).
+#
+# TDD phase: RED — resolve_frame_range does NOT exist yet in export_model.
+# Expected failure: ImportError on import of the symbol.
+#
+# Cross-references:
+#   - Plan pp12-111e decomposition[0].acceptanceTests
+#   - CL-015: pure-logic module, no hou/Qt/pxr
+#   - tdd-with-agents.md §4: hou-test writes red; hou-dev turns green
+# ===========================================================================
+
+class TestResolveFrameRange:
+    """resolve_frame_range — normalises frame_range arg to (start, end, inc) tuple."""
+
+    @pytest.fixture(autouse=True)
+    def _import_subject(self):
+        """Import resolve_frame_range from export_model (must fail at RED phase)."""
+        from fxhoudinimcp.export_model import resolve_frame_range
+        self._fn = resolve_frame_range
+
+    # -----------------------------------------------------------------------
+    # None → defaults
+    # -----------------------------------------------------------------------
+
+    def test_none_returns_defaults(self):
+        """resolve_frame_range(None, 1, 240) == (1, 240, 1) — playbar defaults."""
+        result = self._fn(None, 1, 240)
+        assert result == (1, 240, 1), (
+            f"resolve_frame_range(None, 1, 240) must return (1, 240, 1), got {result!r}"
+        )
+
+    def test_none_returns_tuple_not_list(self):
+        """Return value must be a tuple, not a list."""
+        result = self._fn(None, 1, 240)
+        assert isinstance(result, tuple), (
+            f"resolve_frame_range must return a tuple, got {type(result).__name__!r}"
+        )
+
+    def test_none_uses_default_start(self):
+        """None input uses the supplied default_start."""
+        result = self._fn(None, 10, 100)
+        assert result[0] == 10, (
+            f"resolve_frame_range(None, 10, 100) start must be 10, got {result[0]!r}"
+        )
+
+    def test_none_uses_default_end(self):
+        """None input uses the supplied default_end."""
+        result = self._fn(None, 10, 100)
+        assert result[1] == 100, (
+            f"resolve_frame_range(None, 10, 100) end must be 100, got {result[1]!r}"
+        )
+
+    def test_none_uses_default_inc(self):
+        """None input uses default_inc=1."""
+        result = self._fn(None, 1, 240)
+        assert result[2] == 1, (
+            f"resolve_frame_range(None, 1, 240) inc must be 1, got {result[2]!r}"
+        )
+
+    # -----------------------------------------------------------------------
+    # [start, end] — 2-element list: inc defaults to 1
+    # -----------------------------------------------------------------------
+
+    def test_two_elem_list_returns_correct_triple(self):
+        """resolve_frame_range([5, 20], 1, 240) == (5, 20, 1)."""
+        result = self._fn([5, 20], 1, 240)
+        assert result == (5, 20, 1), (
+            f"resolve_frame_range([5, 20], 1, 240) must return (5, 20, 1), got {result!r}"
+        )
+
+    def test_two_elem_start_correct(self):
+        """2-element input: start is list[0]."""
+        result = self._fn([5, 20], 1, 240)
+        assert result[0] == 5
+
+    def test_two_elem_end_correct(self):
+        """2-element input: end is list[1]."""
+        result = self._fn([5, 20], 1, 240)
+        assert result[1] == 20
+
+    def test_two_elem_inc_defaults_to_1(self):
+        """2-element input: inc defaults to 1 (not default_inc from caller)."""
+        result = self._fn([5, 20], 1, 240)
+        assert result[2] == 1, (
+            f"2-element frame_range must give inc=1, got {result[2]!r}"
+        )
+
+    def test_two_elem_tuple_result(self):
+        """2-element input returns a tuple."""
+        result = self._fn([5, 20], 1, 240)
+        assert isinstance(result, tuple)
+
+    # -----------------------------------------------------------------------
+    # [start, end, inc] — 3-element list: explicit inc
+    # -----------------------------------------------------------------------
+
+    def test_three_elem_list_returns_correct_triple(self):
+        """resolve_frame_range([5, 20, 2], 1, 240) == (5, 20, 2)."""
+        result = self._fn([5, 20, 2], 1, 240)
+        assert result == (5, 20, 2), (
+            f"resolve_frame_range([5, 20, 2], 1, 240) must return (5, 20, 2), got {result!r}"
+        )
+
+    def test_three_elem_start_correct(self):
+        """3-element input: start is list[0]."""
+        result = self._fn([5, 20, 2], 1, 240)
+        assert result[0] == 5
+
+    def test_three_elem_end_correct(self):
+        """3-element input: end is list[1]."""
+        result = self._fn([5, 20, 2], 1, 240)
+        assert result[1] == 20
+
+    def test_three_elem_inc_explicit(self):
+        """3-element input: inc is list[2]."""
+        result = self._fn([5, 20, 2], 1, 240)
+        assert result[2] == 2, (
+            f"3-element frame_range inc must be 2, got {result[2]!r}"
+        )
+
+    def test_three_elem_inc_1(self):
+        """3-element input with inc=1: (1, 240, 1) -- round-trip from a 2-elem default."""
+        result = self._fn([1, 240, 1], 1, 240)
+        assert result == (1, 240, 1)
+
+    def test_three_elem_tuple_result(self):
+        """3-element input returns a tuple."""
+        result = self._fn([5, 20, 2], 1, 240)
+        assert isinstance(result, tuple)
+
+    # -----------------------------------------------------------------------
+    # Return-type contract: all three elements are ints
+    # -----------------------------------------------------------------------
+
+    def test_start_is_int(self):
+        """Returned start must be a plain Python int."""
+        result = self._fn([5, 20], 1, 240)
+        assert isinstance(result[0], int), (
+            f"start must be int, got {type(result[0]).__name__!r}"
+        )
+
+    def test_end_is_int(self):
+        """Returned end must be a plain Python int."""
+        result = self._fn([5, 20], 1, 240)
+        assert isinstance(result[1], int), (
+            f"end must be int, got {type(result[1]).__name__!r}"
+        )
+
+    def test_inc_is_int(self):
+        """Returned inc must be a plain Python int."""
+        result = self._fn([5, 20], 1, 240)
+        assert isinstance(result[2], int), (
+            f"inc must be int, got {type(result[2]).__name__!r}"
+        )
+
+    def test_result_length_is_3(self):
+        """Returned tuple always has exactly 3 elements."""
+        result = self._fn(None, 1, 240)
+        assert len(result) == 3, (
+            f"resolve_frame_range must return a 3-tuple, got len={len(result)!r}"
+        )
+
+    # -----------------------------------------------------------------------
+    # Invalid inputs → ValueError
+    # -----------------------------------------------------------------------
+
+    def test_garbage_string_raises_value_error(self):
+        """A garbage string raises ValueError (not a silent default)."""
+        with pytest.raises(ValueError):
+            self._fn("garbage", 1, 240)
+
+    def test_empty_list_raises_value_error(self):
+        """An empty list raises ValueError."""
+        with pytest.raises(ValueError):
+            self._fn([], 1, 240)
+
+    def test_one_elem_list_raises_value_error(self):
+        """A 1-element list raises ValueError (too few elements)."""
+        with pytest.raises(ValueError):
+            self._fn([5], 1, 240)
+
+    def test_four_elem_list_raises_value_error(self):
+        """A 4-element list raises ValueError (too many elements)."""
+        with pytest.raises(ValueError):
+            self._fn([1, 10, 2, 4], 1, 240)
+
+    def test_int_raises_value_error(self):
+        """A bare int raises ValueError (not a valid frame_range)."""
+        with pytest.raises(ValueError):
+            self._fn(42, 1, 240)
+
+    def test_dict_raises_value_error(self):
+        """A dict raises ValueError (not a valid frame_range type)."""
+        with pytest.raises(ValueError):
+            self._fn({"start": 1, "end": 10}, 1, 240)
+
+    def test_float_in_list_coerces_or_raises(self):
+        """A float value in the list must either coerce to int or raise ValueError.
+
+        The contract requires the returned tuple elements be ints (see test_start_is_int
+        etc.). If the implementation coerces floats, that is acceptable. If it raises,
+        that is also acceptable. What is NOT acceptable: returning a float in the tuple.
+        """
+        try:
+            result = self._fn([1.0, 10.0], 1, 240)
+            # If no exception: all elements must be int
+            assert isinstance(result[0], int), "coerced float start must be int"
+            assert isinstance(result[1], int), "coerced float end must be int"
+        except (ValueError, TypeError):
+            pass  # raising is also acceptable
+
+
+# ===========================================================================
+# Section 10 — alembic_packed_transform_value(deforming: bool) -> int
+#
+# PP12-111e (PR-5) — new pure helper in export_model.py.
+#
+# Locked contract (grounded from live hython probe against Houdini 21.0.729):
+#   alembic_packed_transform_value(True)  == 0   # packed_transform=0 → Deform Geometry
+#   alembic_packed_transform_value(False) == 1   # packed_transform=1 → Transform Geometry
+#
+# Return type: plain Python int (not a bool, not a str).
+#
+# Rationale: rop_alembic SOP-context node has a 'packed_transform' parm (int menu):
+#   0 = Deform Geometry (save per-point positions per frame — needed for deforming meshes)
+#   1 = Transform Geometry (save only transform matrices — needed for rigid assets)
+# When deforming=True the artist wants per-point deform data, so packed_transform=0.
+# When deforming=False the artist wants rigid transform data, so packed_transform=1.
+#
+# Grounded source: plan pp12-111e riskNotes GROUNDED FIELD TABLE (live hython probe
+# against Houdini 21.0.729; the spec's §7.4 prose was WRONG and must not be followed).
+#
+# TDD phase: RED — alembic_packed_transform_value does NOT exist yet in export_model.
+# Expected failure: ImportError on import of the symbol.
+#
+# Cross-references:
+#   - Plan pp12-111e decomposition[0].acceptanceTests
+#   - CL-015: pure-logic module, no hou/Qt/pxr
+#   - tdd-with-agents.md §4: hou-test writes red; hou-dev turns green
+# ===========================================================================
+
+class TestAlembicPackedTransformValue:
+    """alembic_packed_transform_value — bool -> rop_alembic packed_transform int."""
+
+    @pytest.fixture(autouse=True)
+    def _import_subject(self):
+        """Import alembic_packed_transform_value from export_model (must fail at RED)."""
+        from fxhoudinimcp.export_model import alembic_packed_transform_value
+        self._fn = alembic_packed_transform_value
+
+    # -----------------------------------------------------------------------
+    # The two canonical mappings (locked from grounded hython probe)
+    # -----------------------------------------------------------------------
+
+    def test_deforming_true_returns_0(self):
+        """alembic_packed_transform_value(True) == 0 (Deform Geometry — per-point positions)."""
+        result = self._fn(True)
+        assert result == 0, (
+            f"alembic_packed_transform_value(True) must return 0 "
+            f"(rop_alembic packed_transform=0 Deform Geometry), got {result!r}"
+        )
+
+    def test_deforming_false_returns_1(self):
+        """alembic_packed_transform_value(False) == 1 (Transform Geometry — matrices only)."""
+        result = self._fn(False)
+        assert result == 1, (
+            f"alembic_packed_transform_value(False) must return 1 "
+            f"(rop_alembic packed_transform=1 Transform Geometry), got {result!r}"
+        )
+
+    # -----------------------------------------------------------------------
+    # Return-type contract: plain Python int, not bool
+    # -----------------------------------------------------------------------
+
+    def test_true_returns_int_not_bool(self):
+        """Return value for True must be a plain int (isinstance(r, bool) is False)."""
+        result = self._fn(True)
+        assert isinstance(result, int) and not isinstance(result, bool), (
+            f"alembic_packed_transform_value must return int, not bool; "
+            f"got {type(result).__name__!r}: {result!r}"
+        )
+
+    def test_false_returns_int_not_bool(self):
+        """Return value for False must be a plain int (isinstance(r, bool) is False)."""
+        result = self._fn(False)
+        assert isinstance(result, int) and not isinstance(result, bool), (
+            f"alembic_packed_transform_value must return int, not bool; "
+            f"got {type(result).__name__!r}: {result!r}"
+        )
+
+    # -----------------------------------------------------------------------
+    # The mapping is not inverted (catches an off-by-one implementation error)
+    # -----------------------------------------------------------------------
+
+    def test_deform_is_not_1(self):
+        """Deforming=True must NOT return 1 (that is the rigid/transform value)."""
+        result = self._fn(True)
+        assert result != 1, (
+            f"alembic_packed_transform_value(True) must NOT return 1 "
+            f"(that is packed_transform=1 Transform Geometry, the rigid/non-deforming mode)"
+        )
+
+    def test_transform_is_not_0(self):
+        """Deforming=False must NOT return 0 (that is the deform value)."""
+        result = self._fn(False)
+        assert result != 0, (
+            f"alembic_packed_transform_value(False) must NOT return 0 "
+            f"(that is packed_transform=0 Deform Geometry, the deforming mode)"
+        )
+
+    # -----------------------------------------------------------------------
+    # Values are 0 and 1 specifically (not arbitrary ints like -1 or 2)
+    # -----------------------------------------------------------------------
+
+    def test_true_value_is_exactly_0(self):
+        """The deform value is exactly 0, not any other int."""
+        result = self._fn(True)
+        assert result == 0
+
+    def test_false_value_is_exactly_1(self):
+        """The transform value is exactly 1, not any other int."""
+        result = self._fn(False)
+        assert result == 1
+
+    # -----------------------------------------------------------------------
+    # Round-trip: True and False give distinct values
+    # -----------------------------------------------------------------------
+
+    def test_true_and_false_give_different_values(self):
+        """True and False must map to different int values (not both the same)."""
+        assert self._fn(True) != self._fn(False), (
+            "alembic_packed_transform_value(True) and (False) must return different ints"
+        )
