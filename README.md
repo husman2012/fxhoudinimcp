@@ -66,6 +66,8 @@ A comprehensive [MCP](https://modelcontextprotocol.io/) (Model Context Protocol)
 >
 > Both extensions layer cleanly on top of the upstream fork's `@hwebserver.apiFunction` + `hdefereval.executeInMainThreadWithResult()` bridge pattern — no upstream handler edits beyond registration.
 
+Engine-export hooks (VAT, Alembic/UE, FBX, Chaos GC, Niagara) are documented in [`handlers/EXPORT_HANDLERS.md`](houdini/scripts/python/fxhoudinimcp_server/handlers/EXPORT_HANDLERS.md) — tool list, version-skew table, gated call sequence, and UE-side verification steps.
+
 <!-- FEATURES -->
 ## Features
 
