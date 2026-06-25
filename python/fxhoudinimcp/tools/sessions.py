@@ -94,6 +94,8 @@ async def houdini_list_sessions(
     return {
         "sessions": session_model.mark_active(entries, active_port),
         "active_port": active_port,
+        "active_pid": state.get("active_pid"),
+        "active_pid_stale": session_model.active_pid_stale(entries, active_port, state.get("active_pid")),
     }
 
 
@@ -128,9 +130,14 @@ async def houdini_select_session(
     if selector is None:
         return {"ok": False, "error": "select_session requires 'port' or 'hip'", "active_port": state["active_port"]}
     entries = await _scan_sessions(state["host"], state["base_port"], _DEFAULT_MAX_PORTS)
-    target = session_model.resolve_target(entries, selector)
+    target, reason = session_model.resolve_with_reason(entries, selector)
     if target is None:
-        return {"ok": False, "error": f"no live session matches {selector!r}", "active_port": state["active_port"]}
+        if reason == "ambiguous":
+            err = f"ambiguous: multiple live sessions match {selector!r} — pass a more specific hip substring or a port"
+        else:
+            err = f"no live session matches {selector!r}"
+        return {"ok": False, "error": err, "active_port": state["active_port"]}
     state["active_port"] = target
     entry = next((e for e in entries if e["port"] == target), None)
-    return {"ok": True, "session": entry, "active_port": target}
+    state["active_pid"] = entry.get("pid") if entry else None
+    return {"ok": True, "session": entry, "active_port": target, "active_pid": state["active_pid"]}

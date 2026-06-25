@@ -607,3 +607,277 @@ class TestSelectSession:
             f"Case-insensitive hip match must resolve to ok=True; got {result!r}"
         )
         assert ctx.request_context.lifespan_context["active_port"] == 8101
+
+
+# ===========================================================================
+# Section 7 — AMBIGUOUS-VS-NO-MATCH error message distinction (PP12-115c)
+#
+# Current behaviour: houdini_select_session returns a generic error string for
+# BOTH zero-match and multi-match cases.  The v1.1 contract requires distinct
+# messages so the caller can differentiate them.
+#
+# Expected contracts (RED until hou-dev implements resolve_with_reason):
+#   no-match  → error contains "no session" or "no match" (NOT "ambiguous")
+#   ambiguous → error contains "ambiguous" (NOT "no session"/"no match" alone)
+#
+# All tests in this class are RED because the distinction does not yet exist
+# in the shipped houdini_select_session.
+# ===========================================================================
+
+class TestSelectSessionErrorDistinction:
+    """houdini_select_session error message must distinguish no-match from ambiguous."""
+
+    @pytest.mark.asyncio
+    async def test_no_match_error_does_not_say_ambiguous(self):
+        """AT-8a (PIN/RED): no-match error must NOT say 'ambiguous'.
+
+        When zero sessions match the hip selector, the error must clearly
+        indicate no match was found — NOT hint at multiple matches.
+        """
+        lifespan = _make_lifespan(base_port=8100, active_port=8100)
+        ctx = _make_ctx(lifespan)
+
+        with patch.object(HoudiniBridge, "health_check", _scan_two_live(8100)):
+            result = await sessions_tools.houdini_select_session(ctx, hip="nomatch")
+
+        assert result.get("ok") is False
+        error = result.get("error", "")
+        assert isinstance(error, str)
+        assert "ambiguous" not in error.lower(), (
+            f"No-match error must not say 'ambiguous'; got error={error!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_error_says_ambiguous(self):
+        """AT-8b (PIN/RED): ambiguous (multi-match) error MUST say 'ambiguous'.
+
+        When two or more sessions match the hip selector, the error must say
+        'ambiguous' so the caller knows to use a more specific selector.
+
+        This test is RED because current select_session returns the same generic
+        "no live session matches" for both zero-match and multi-match cases.
+        """
+        lifespan = _make_lifespan(base_port=8100, active_port=8100)
+        ctx = _make_ctx(lifespan)
+
+        # Two sessions both containing "layout" — ambiguous match.
+        async def _two_layout_scan(self):
+            port = int(self.base_url.split(":")[-1])
+            if port in (8100, 8101):
+                return {
+                    "status": "ok",
+                    "pid": 1000 + port,
+                    "hip_file": f"C:/scenes/layout_{port}.hip",
+                    "houdini_version": "21.0.729",
+                }
+            raise HoudiniConnectionError("dead", details={})
+
+        with patch.object(HoudiniBridge, "health_check", _two_layout_scan):
+            result = await sessions_tools.houdini_select_session(ctx, hip="layout")
+
+        assert result.get("ok") is False
+        error = result.get("error", "")
+        assert isinstance(error, str)
+        assert "ambiguous" in error.lower(), (
+            f"Ambiguous error must contain 'ambiguous'; got error={error!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_match_error_is_informative(self):
+        """AT-8c: no-match error message is a non-empty informative string.
+
+        Must contain enough information to diagnose the problem (e.g. the
+        selector value or 'no session').
+        """
+        lifespan = _make_lifespan(base_port=8100, active_port=8100)
+        ctx = _make_ctx(lifespan)
+
+        with patch.object(HoudiniBridge, "health_check", _scan_two_live(8100)):
+            result = await sessions_tools.houdini_select_session(ctx, hip="zzznomatchzzz")
+
+        error = result.get("error", "")
+        assert len(error) > 0, "No-match error message must not be empty"
+        # Must reference the selector or 'no session'
+        assert "zzznomatchzzz" in error or "no" in error.lower(), (
+            f"No-match error must reference selector or 'no session'; got {error!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_error_is_informative(self):
+        """AT-8d: ambiguous error message is a non-empty informative string.
+
+        Must say 'ambiguous' and ideally reference the selector.
+        """
+        lifespan = _make_lifespan(base_port=8100, active_port=8100)
+        ctx = _make_ctx(lifespan)
+
+        async def _two_layout_scan(self):
+            port = int(self.base_url.split(":")[-1])
+            if port in (8100, 8101):
+                return {
+                    "status": "ok",
+                    "pid": 1000 + port,
+                    "hip_file": f"C:/scenes/layout_{port}.hip",
+                    "houdini_version": "21.0.729",
+                }
+            raise HoudiniConnectionError("dead", details={})
+
+        with patch.object(HoudiniBridge, "health_check", _two_layout_scan):
+            result = await sessions_tools.houdini_select_session(ctx, hip="layout")
+
+        error = result.get("error", "")
+        assert len(error) > 0, "Ambiguous error message must not be empty"
+        assert "ambiguous" in error.lower(), (
+            f"Ambiguous error must contain 'ambiguous'; got {error!r}"
+        )
+
+
+# ===========================================================================
+# Section 8 — PID PINNING: select_session records pid; list_sessions reports
+#             stale_pid flag when pid has drifted (PP12-115c)
+#
+# v1.1 lifespan shape adds active_pid: int|None.
+# On select_session success: state["active_pid"] = session_entry["pid"]
+# On list_sessions: each entry gets "active_pid_stale": bool
+#
+# These tests are RED because neither active_pid tracking nor the stale flag
+# exist in the current implementation.
+# ===========================================================================
+
+def _make_lifespan_v11(
+    *,
+    host: str = "localhost",
+    base_port: int = 8100,
+    active_port: int = 8100,
+    active_pid: int | None = None,
+) -> dict:
+    """Build a v1.1-shaped lifespan context dict (adds active_pid)."""
+    return {
+        "host": host,
+        "base_port": base_port,
+        "active_port": active_port,
+        "active_pid": active_pid,
+        "bridges": {},
+    }
+
+
+class TestSelectSessionPidPinning:
+    """select_session must record pid on success (v1.1 — RED until hou-dev implements)."""
+
+    @pytest.mark.asyncio
+    async def test_select_success_records_pid_in_lifespan(self):
+        """AT-9a (PIN/RED): successful select stores pid in lifespan['active_pid'].
+
+        After a successful houdini_select_session(port=8101), the lifespan
+        context must have active_pid == the pid from the selected session entry.
+        """
+        lifespan = _make_lifespan_v11(base_port=8100, active_port=8100, active_pid=None)
+        ctx = _make_ctx(lifespan)
+
+        with patch.object(HoudiniBridge, "health_check", _scan_two_live(8100)):
+            result = await sessions_tools.houdini_select_session(ctx, port=8101)
+
+        assert result.get("ok") is True, f"Expected ok=True; got {result!r}"
+        # pid for port 8101 in _scan_two_live: 1000 + 8101 = 9101
+        expected_pid = 1000 + 8101
+        assert lifespan.get("active_pid") == expected_pid, (
+            f"lifespan['active_pid'] must be {expected_pid} after successful select; "
+            f"got {lifespan.get('active_pid')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_select_failure_does_not_change_active_pid(self):
+        """AT-9b (PIN/RED): failed select must NOT change lifespan['active_pid'].
+
+        An absent-port failure must leave active_pid intact (same guard as
+        the active_port invariant — no partial state mutation).
+        """
+        initial_pid = 5000
+        lifespan = _make_lifespan_v11(base_port=8100, active_port=8100, active_pid=initial_pid)
+        ctx = _make_ctx(lifespan)
+
+        with patch.object(HoudiniBridge, "health_check", _scan_two_live(8100)):
+            result = await sessions_tools.houdini_select_session(ctx, port=9999)
+
+        assert result.get("ok") is False, f"Expected ok=False; got {result!r}"
+        assert lifespan.get("active_pid") == initial_pid, (
+            f"Failed select must not change active_pid; "
+            f"expected {initial_pid}, got {lifespan.get('active_pid')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_select_by_hip_success_records_pid(self):
+        """AT-9c (PIN/RED): successful by-hip select also records pid in active_pid."""
+        lifespan = _make_lifespan_v11(base_port=8100, active_port=8100, active_pid=None)
+        ctx = _make_ctx(lifespan)
+
+        with patch.object(HoudiniBridge, "health_check", _scan_two_live(8100)):
+            result = await sessions_tools.houdini_select_session(ctx, hip="asset")
+
+        assert result.get("ok") is True, f"Expected ok=True; got {result!r}"
+        # asset.hip is on 8101 in _scan_two_live: pid = 1000 + 8101 = 9101
+        expected_pid = 1000 + 8101
+        assert lifespan.get("active_pid") == expected_pid, (
+            f"lifespan['active_pid'] must be {expected_pid} after by-hip select; "
+            f"got {lifespan.get('active_pid')!r}"
+        )
+
+
+class TestListSessionsStalePid:
+    """houdini_list_sessions must report active_pid_stale flag (v1.1 — RED)."""
+
+    @pytest.mark.asyncio
+    async def test_list_sessions_reports_stale_pid_when_drifted(self):
+        """AT-10a (PIN/RED): list_sessions includes active_pid_stale=True when pid drifted.
+
+        Scenario: we selected port 8100 when its pid was 5000.
+        The live scan now returns pid=9999 for port 8100 (Houdini restarted).
+        houdini_list_sessions must set active_pid_stale=True in the result.
+        """
+        lifespan = _make_lifespan_v11(
+            base_port=8100, active_port=8100, active_pid=5000,
+        )
+        ctx = _make_ctx(lifespan)
+
+        async def _stale_pid_scan(self):
+            port = int(self.base_url.split(":")[-1])
+            if port == 8100:
+                return {
+                    "status": "ok",
+                    "pid": 9999,   # drifted from recorded 5000
+                    "hip_file": "C:/scenes/layout.hip",
+                    "houdini_version": "21.0.729",
+                }
+            raise HoudiniConnectionError("dead", details={})
+
+        with patch.object(HoudiniBridge, "health_check", _stale_pid_scan):
+            result = await sessions_tools.houdini_list_sessions(ctx)
+
+        assert "active_pid_stale" in result, (
+            f"houdini_list_sessions v1.1 must include 'active_pid_stale'; got keys={list(result.keys())}"
+        )
+        assert result["active_pid_stale"] is True, (
+            f"Pid drift 5000→9999 must set active_pid_stale=True; got {result['active_pid_stale']!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_sessions_reports_stale_pid_false_when_stable(self):
+        """AT-10b (PIN/RED): list_sessions includes active_pid_stale=False when pid stable.
+
+        Scenario: live pid on port 8100 still matches recorded active_pid=9100.
+        """
+        # pid from _scan_two_live for port 8100: 1000 + 8100 = 9100
+        lifespan = _make_lifespan_v11(
+            base_port=8100, active_port=8100, active_pid=9100,
+        )
+        ctx = _make_ctx(lifespan)
+
+        with patch.object(HoudiniBridge, "health_check", _scan_two_live(8100)):
+            result = await sessions_tools.houdini_list_sessions(ctx)
+
+        assert "active_pid_stale" in result, (
+            f"houdini_list_sessions v1.1 must include 'active_pid_stale'; got keys={list(result.keys())}"
+        )
+        assert result["active_pid_stale"] is False, (
+            f"Stable pid 9100==9100 must set active_pid_stale=False; got {result['active_pid_stale']!r}"
+        )

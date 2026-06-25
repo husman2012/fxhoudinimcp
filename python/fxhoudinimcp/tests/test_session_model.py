@@ -448,3 +448,305 @@ class TestHouFreeImport:
         assert "import hou" not in source_no_comments, (
             "session_model.py must not import hou (CL-015 — pure-logic boundary)"
         )
+
+
+# ===========================================================================
+# Section 5 — resolve_with_reason(sessions, selector) -> tuple[int|None, str]
+#
+# PP12-115c: new pure helper that `resolve_target` will delegate to.
+# Reason strings:
+#   "ok"          — exactly one match found, port returned
+#   "no_match"    — zero sessions match the selector
+#   "ambiguous"   — two or more sessions match the selector
+#   "no_selector" — selector is None or not int/str
+#
+# Contract (must NOT exist yet → ImportError/AttributeError = RED):
+#   (port, reason) = resolve_with_reason(sessions, selector)
+#   - "ok"          → (port: int, "ok")
+#   - "no_match"    → (None, "no_match")
+#   - "ambiguous"   → (None, "ambiguous")
+#   - "no_selector" → (None, "no_selector")
+#
+# CRITICAL: resolve_target must keep returning int|None (delegates to [0]).
+# ===========================================================================
+
+class TestResolveWithReason:
+    """resolve_with_reason — returns (port|None, reason_str) for each outcome."""
+
+    def _sessions(self) -> list[dict]:
+        return [
+            build_session_entry(8100, {**_health(8100), "hip_file": "C:/scenes/terrain.hip"}),
+            build_session_entry(8101, {**_health(8101), "hip_file": "C:/work/asset_hero.hip"}),
+        ]
+
+    # -----------------------------------------------------------------------
+    # Import guard — function must not exist yet (RED gate)
+    # -----------------------------------------------------------------------
+
+    def test_resolve_with_reason_importable(self):
+        """resolve_with_reason must be importable from session_model (RED until hou-dev adds it).
+
+        This test FAILS with ImportError or AttributeError before hou-dev implements
+        resolve_with_reason. That is the expected RED state.
+        """
+        from fxhoudinimcp.session_model import resolve_with_reason  # noqa: F401 — RED gate
+        assert callable(resolve_with_reason), (
+            "resolve_with_reason must be a callable in session_model"
+        )
+
+    # -----------------------------------------------------------------------
+    # Outcome: "ok" — exactly one match
+    # -----------------------------------------------------------------------
+
+    def test_ok_int_selector_present(self):
+        """AT-6a (PIN): int selector matching a live port returns (port, 'ok')."""
+        from fxhoudinimcp.session_model import resolve_with_reason
+        port, reason = resolve_with_reason(self._sessions(), 8101)
+        assert port == 8101, f"Expected port=8101, got {port!r}"
+        assert reason == "ok", f"Expected reason='ok', got {reason!r}"
+
+    def test_ok_str_single_match(self):
+        """AT-6b (PIN): str selector matching exactly one hip_file returns (port, 'ok')."""
+        from fxhoudinimcp.session_model import resolve_with_reason
+        port, reason = resolve_with_reason(self._sessions(), "asset")
+        assert port == 8101, f"Expected port=8101 for 'asset', got {port!r}"
+        assert reason == "ok", f"Expected reason='ok', got {reason!r}"
+
+    # -----------------------------------------------------------------------
+    # Outcome: "no_match" — zero sessions match
+    # -----------------------------------------------------------------------
+
+    def test_no_match_int_absent(self):
+        """AT-6c (PIN): int selector with no matching port returns (None, 'no_match')."""
+        from fxhoudinimcp.session_model import resolve_with_reason
+        port, reason = resolve_with_reason(self._sessions(), 9999)
+        assert port is None, f"Expected None, got {port!r}"
+        assert reason == "no_match", f"Expected 'no_match', got {reason!r}"
+
+    def test_no_match_str_no_hip_match(self):
+        """AT-6d (PIN): str selector matching no hip_file returns (None, 'no_match')."""
+        from fxhoudinimcp.session_model import resolve_with_reason
+        port, reason = resolve_with_reason(self._sessions(), "nonexistent")
+        assert port is None, f"Expected None, got {port!r}"
+        assert reason == "no_match", f"Expected 'no_match', got {reason!r}"
+
+    def test_no_match_empty_sessions_int(self):
+        """Empty sessions list + int selector returns (None, 'no_match')."""
+        from fxhoudinimcp.session_model import resolve_with_reason
+        port, reason = resolve_with_reason([], 8100)
+        assert port is None
+        assert reason == "no_match"
+
+    def test_no_match_empty_sessions_str(self):
+        """Empty sessions list + str selector returns (None, 'no_match')."""
+        from fxhoudinimcp.session_model import resolve_with_reason
+        port, reason = resolve_with_reason([], "asset")
+        assert port is None
+        assert reason == "no_match"
+
+    # -----------------------------------------------------------------------
+    # Outcome: "ambiguous" — two or more matches
+    # -----------------------------------------------------------------------
+
+    def test_ambiguous_str_multiple_hip_match(self):
+        """AT-6e (PIN): str selector matching multiple hip_files returns (None, 'ambiguous').
+
+        CRITICAL distinction from no_match: caller can use 'ambiguous' to show
+        "use a more specific selector" vs no_match which means "not found".
+        """
+        from fxhoudinimcp.session_model import resolve_with_reason
+        # Both entries contain '.hip' → ambiguous
+        port, reason = resolve_with_reason(self._sessions(), ".hip")
+        assert port is None, f"Expected None for ambiguous match, got {port!r}"
+        assert reason == "ambiguous", f"Expected 'ambiguous', got {reason!r}"
+
+    def test_ambiguous_empty_string_is_ambiguous_when_multiple(self):
+        """Empty string matches all hip_files (multiple) → (None, 'ambiguous')."""
+        from fxhoudinimcp.session_model import resolve_with_reason
+        port, reason = resolve_with_reason(self._sessions(), "")
+        assert port is None
+        assert reason == "ambiguous"
+
+    def test_ambiguous_two_matching_sessions(self):
+        """Two sessions both matching 'asset' returns (None, 'ambiguous')."""
+        from fxhoudinimcp.session_model import resolve_with_reason
+        sessions = [
+            build_session_entry(8100, {**_health(8100), "hip_file": "C:/work/asset_A.hip"}),
+            build_session_entry(8101, {**_health(8101), "hip_file": "C:/work/asset_B.hip"}),
+        ]
+        port, reason = resolve_with_reason(sessions, "asset")
+        assert port is None
+        assert reason == "ambiguous"
+
+    # -----------------------------------------------------------------------
+    # Outcome: "no_selector" — None or wrong type selector
+    # -----------------------------------------------------------------------
+
+    def test_no_selector_none(self):
+        """AT-6f (PIN): None selector returns (None, 'no_selector')."""
+        from fxhoudinimcp.session_model import resolve_with_reason
+        port, reason = resolve_with_reason(self._sessions(), None)
+        assert port is None, f"Expected None, got {port!r}"
+        assert reason == "no_selector", f"Expected 'no_selector', got {reason!r}"
+
+    def test_no_selector_wrong_type_list(self):
+        """Non-int/str selector (list) returns (None, 'no_selector')."""
+        from fxhoudinimcp.session_model import resolve_with_reason
+        port, reason = resolve_with_reason(self._sessions(), [8100])
+        assert port is None
+        assert reason == "no_selector"
+
+    # -----------------------------------------------------------------------
+    # Return shape
+    # -----------------------------------------------------------------------
+
+    def test_returns_tuple_of_two(self):
+        """resolve_with_reason always returns a 2-tuple."""
+        from fxhoudinimcp.session_model import resolve_with_reason
+        result = resolve_with_reason(self._sessions(), 8100)
+        assert isinstance(result, tuple), f"Expected tuple, got {type(result).__name__!r}"
+        assert len(result) == 2, f"Expected 2-tuple, got length {len(result)}"
+
+    def test_first_element_is_int_or_none(self):
+        """First element of the returned tuple is int or None."""
+        from fxhoudinimcp.session_model import resolve_with_reason
+        port, _ = resolve_with_reason(self._sessions(), 8100)
+        assert port is None or isinstance(port, int)
+
+    def test_second_element_is_str(self):
+        """Second element of the returned tuple is always a str."""
+        from fxhoudinimcp.session_model import resolve_with_reason
+        _, reason = resolve_with_reason(self._sessions(), 8100)
+        assert isinstance(reason, str)
+
+    # -----------------------------------------------------------------------
+    # resolve_target contract preservation — must keep returning int|None
+    # -----------------------------------------------------------------------
+
+    def test_resolve_target_still_returns_int_on_match(self):
+        """resolve_target still returns an int on a successful match (contract preserved)."""
+        result = resolve_target(self._sessions(), 8101)
+        assert isinstance(result, int), (
+            f"resolve_target must still return int on match, got {type(result).__name__!r}"
+        )
+
+    def test_resolve_target_still_returns_none_on_no_match(self):
+        """resolve_target still returns None on no-match (contract preserved)."""
+        result = resolve_target(self._sessions(), 9999)
+        assert result is None, f"resolve_target must return None for absent port, got {result!r}"
+
+    def test_resolve_target_still_returns_none_on_ambiguous(self):
+        """resolve_target still returns None on ambiguous match (contract preserved)."""
+        result = resolve_target(self._sessions(), ".hip")
+        assert result is None, f"resolve_target must return None on ambiguous, got {result!r}"
+
+
+# ===========================================================================
+# Section 6 — active_pid_stale(sessions, active_port, active_pid) -> bool
+#
+# PP12-115c: new pure helper that detects when the live pid on the active port
+# has drifted from the pid recorded at select-time (Houdini restarted).
+#
+# Contract (must NOT exist yet → ImportError/AttributeError = RED):
+#   active_pid_stale(sessions, active_port, active_pid) -> bool
+#   - True  when the active session's current pid != active_pid
+#   - True  when active_port is NOT in sessions (selection died → stale; agent must re-select)
+#   - False when the active session's current pid == active_pid
+#   - False when active_pid is None (no pid was recorded at select-time)
+# ===========================================================================
+
+class TestActivePidStale:
+    """active_pid_stale — detects pid drift on the active session."""
+
+    def _sessions(self, active_pid: int = 5000) -> list[dict]:
+        """Two sessions; port 8100 has pid=active_pid, port 8101 has pid=5001."""
+        return [
+            build_session_entry(8100, {**_health(8100), "pid": active_pid}),
+            build_session_entry(8101, {**_health(8101), "pid": 5001}),
+        ]
+
+    # -----------------------------------------------------------------------
+    # Import guard — function must not exist yet (RED gate)
+    # -----------------------------------------------------------------------
+
+    def test_active_pid_stale_importable(self):
+        """active_pid_stale must be importable from session_model (RED until hou-dev adds it).
+
+        This test FAILS with ImportError or AttributeError before hou-dev implements
+        active_pid_stale. That is the expected RED state.
+        """
+        from fxhoudinimcp.session_model import active_pid_stale  # noqa: F401 — RED gate
+        assert callable(active_pid_stale), (
+            "active_pid_stale must be a callable in session_model"
+        )
+
+    # -----------------------------------------------------------------------
+    # Stale: live pid has drifted from recorded pid
+    # -----------------------------------------------------------------------
+
+    def test_stale_when_pid_changed(self):
+        """AT-7a (PIN): live pid != recorded pid → True (Houdini restarted)."""
+        from fxhoudinimcp.session_model import active_pid_stale
+        sessions = self._sessions(active_pid=5000)
+        # sessions[0] (port 8100) now has pid=9999 (simulated restart)
+        sessions[0]["pid"] = 9999
+        result = active_pid_stale(sessions, active_port=8100, active_pid=5000)
+        assert result is True, (
+            f"Pid drift (5000 -> 9999) must return True; got {result!r}"
+        )
+
+    # -----------------------------------------------------------------------
+    # Not stale: pid matches
+    # -----------------------------------------------------------------------
+
+    def test_not_stale_when_pid_matches(self):
+        """AT-7b (PIN): live pid == recorded pid → False (same Houdini process)."""
+        from fxhoudinimcp.session_model import active_pid_stale
+        sessions = self._sessions(active_pid=5000)
+        result = active_pid_stale(sessions, active_port=8100, active_pid=5000)
+        assert result is False, (
+            f"Matching pid must return False; got {result!r}"
+        )
+
+    # -----------------------------------------------------------------------
+    # Not stale edge cases
+    # -----------------------------------------------------------------------
+
+    def test_stale_when_active_port_not_in_sessions(self):
+        """AT-7c (PIN): active_port absent from sessions → True (selection died → stale).
+
+        The active session (port 8199) no longer exists in the live session list —
+        the Houdini instance closed.  The agent MUST re-select a session.
+        Contract: active_pid_stale([{port:8100,pid:111},{port:8101,pid:222}],
+                                    active_port=8199, active_pid=111) -> True
+        """
+        from fxhoudinimcp.session_model import active_pid_stale
+        sessions = [
+            build_session_entry(8100, {**_health(8100), "pid": 111}),
+            build_session_entry(8101, {**_health(8101), "pid": 222}),
+        ]
+        result = active_pid_stale(sessions, active_port=8199, active_pid=111)
+        assert result is True, (
+            f"Absent active_port must return True (selection died = stale); got {result!r}"
+        )
+
+    def test_not_stale_when_active_pid_is_none(self):
+        """AT-7d (PIN): active_pid=None → False (no baseline to compare against)."""
+        from fxhoudinimcp.session_model import active_pid_stale
+        sessions = self._sessions(active_pid=5000)
+        result = active_pid_stale(sessions, active_port=8100, active_pid=None)
+        assert result is False, (
+            f"active_pid=None must return False (no baseline); got {result!r}"
+        )
+
+    # -----------------------------------------------------------------------
+    # Return type
+    # -----------------------------------------------------------------------
+
+    def test_returns_bool(self):
+        """active_pid_stale always returns a Python bool."""
+        from fxhoudinimcp.session_model import active_pid_stale
+        result = active_pid_stale(self._sessions(5000), 8100, 5000)
+        assert isinstance(result, bool), (
+            f"active_pid_stale must return bool, got {type(result).__name__!r}"
+        )

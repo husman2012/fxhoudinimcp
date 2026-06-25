@@ -33,6 +33,7 @@ def _get_bridge(ctx) -> HoudiniBridge:
             "host": str,
             "base_port": int,
             "active_port": int,
+            "active_pid": int | None,
             "bridges": dict[int, HoudiniBridge],
         }
     """
@@ -74,6 +75,7 @@ async def lifespan(server: FastMCP):
         "host": host,
         "base_port": base_port,
         "active_port": base_port,
+        "active_pid": None,
         "bridges": {base_port: base_bridge},
     }
 
