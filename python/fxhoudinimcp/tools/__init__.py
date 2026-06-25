@@ -61,3 +61,4 @@ from fxhoudinimcp.tools import takes  # noqa: F401
 from fxhoudinimcp.tools import gate  # noqa: F401
 from fxhoudinimcp.tools import kinefx_tools  # noqa: F401
 from fxhoudinimcp.tools import export_tools  # noqa: F401
+from fxhoudinimcp.tools import sessions  # noqa: F401
