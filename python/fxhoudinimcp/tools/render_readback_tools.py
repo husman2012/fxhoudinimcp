@@ -53,3 +53,42 @@ async def render_lint_settings(
         "render_lint_settings",
         {"render_node": render_node, "preset": preset},
     )
+
+
+@mcp.tool(meta={"require_approval": False})
+async def render_parse_exr(
+    ctx: Context,
+    exr_path: str,
+    subimage: int | None = None,
+) -> dict:
+    """Parse an EXR file via hoiiotool and return its channel/metadata manifest.
+
+    Returns the §4.2 ExrManifest shape::
+
+        {
+            "exr_path": str,
+            "is_multipart": bool,
+            "subimages": int,
+            "compression": str,
+            "xres": int,
+            "yres": int,
+            "channels": [{"name": str, "layer": str | None, "dtype": str}, ...],
+            "crypto_layers": [...],
+            "metadata": {str: str},
+        }
+
+    or an FR-2/FR-5 error shape if the path is invalid or hoiiotool fails::
+
+        {"ok": False, "error": "<reason>"}
+
+    Args:
+        ctx: MCP lifespan context — injected by FastMCP; hidden from client schema.
+        exr_path: Path to the EXR file; supports Houdini variable expansion.
+        subimage: When set, inspect only this subimage index.  ``None`` (default)
+            inspects all subimages.
+    """
+    bridge = _fxserver._get_bridge(ctx)
+    return await bridge.execute(
+        "render_parse_exr",
+        {"exr_path": exr_path, "subimage": subimage},
+    )

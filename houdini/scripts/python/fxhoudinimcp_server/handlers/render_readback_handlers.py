@@ -126,3 +126,80 @@ def render_lint_settings(render_node: str, preset: str = "nuke_safe") -> dict:
 # ---------------------------------------------------------------------------
 
 register_handler("render_lint_settings", render_lint_settings, Capability.READONLY)
+
+
+# ---------------------------------------------------------------------------
+# Handler: render_parse_exr
+# ---------------------------------------------------------------------------
+
+def render_parse_exr(exr_path: str, subimage: "int | None" = None) -> dict:
+    """Run hoiiotool on exr_path and return an ExrManifest dict (§4.2 shape).
+
+    Args:
+        exr_path: Path to the EXR file; supports Houdini variable expansion
+            (e.g. ``"$HIP/render/beauty.0001.exr"``).  FR-2: must not be
+            empty or whitespace-only.
+        subimage: When set, passes ``--subimage N`` to hoiiotool so only the
+            requested subimage block is inspected.  ``None`` inspects all.
+
+    Returns:
+        §4.2 shape on success::
+
+            {
+                "exr_path": str,          # original (unexpanded) input path
+                "is_multipart": bool,
+                "subimages": int,
+                "compression": str,
+                "xres": int,
+                "yres": int,
+                "channels": [{"name": str, "layer": str | None, "dtype": str}, ...],
+                "crypto_layers": [...],
+                "metadata": {str: str},
+            }
+
+        FR-2/FR-5 error shape on failure::
+
+            {"ok": False, "error": "<human-readable message>"}
+    """
+    # FR-2: reject obviously invalid exr_path values before touching hou.*.
+    if not exr_path or not exr_path.strip():
+        return {"ok": False, "error": "exr_path must be a non-empty path"}
+
+    try:
+        # Ensure homedini is importable; fail-loud if the engine is missing.
+        if not handoff_linter_loader.ensure_on_path():
+            return {
+                "ok": False,
+                "error": (
+                    "handoff_linter engine not found on sys.path. "
+                    "Set $HOMEDINI_PYTHON or ensure $UT is configured."
+                ),
+            }
+
+        # Expand Houdini variables ($HIP, $HFS, $JOB, etc.) in the path.
+        expanded = hou.text.expandString(exr_path)
+
+        # Import the manifest parser via the loader (never vendor it here).
+        from homedini.rendering.handoff_linter.exr_inspector import (  # noqa: PLC0415
+            parse_exr_manifest,
+        )
+
+        # Parse the EXR into an ExrManifest.
+        manifest = parse_exr_manifest(expanded, subimage=subimage)
+
+        # Serialise; echo the ORIGINAL (unexpanded) input path as exr_path
+        # so callers can round-trip the value they passed in.
+        d = manifest.to_dict()
+        d["exr_path"] = exr_path
+        return d
+
+    except Exception as exc:  # noqa: BLE001 — all failures surface as {ok: False}
+        _log.warning("render_parse_exr failed for %r: %s", exr_path, exc, exc_info=True)
+        return {"ok": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Registration (READONLY — FR-10, ungated)
+# ---------------------------------------------------------------------------
+
+register_handler("render_parse_exr", render_parse_exr, Capability.READONLY)
