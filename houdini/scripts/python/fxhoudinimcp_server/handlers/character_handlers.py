@@ -443,10 +443,22 @@ def import_fbx_character(path: str, dest: str = None) -> dict:
             skin_geo is not None and skin_geo.intrinsicValue("pointcount") > 0
         )
 
+        # ── FR-12 verify-after-mutate: query skeleton post-cook ──────────────
+        validator: dict = {"note": "verify-after-mutate", "fields": ["skeleton_summary"]}
+        try:
+            skel_summary = query_skeleton(imp.path() + "_skeleton" if hou.node(imp.path() + "_skeleton") is not None else imp.path())
+            validator["skeleton_summary"] = skel_summary
+        except Exception as vexc:
+            # fail-loud: do NOT supply a fake count — the post-cook re-query
+            # genuinely failed; surface the error honestly (fail-loud-discipline.md).
+            _log.warning("import_fbx_character: post-cook verify-after-mutate re-query failed: %s", vexc)
+            validator["skeleton_summary"] = {"error": f"post-cook re-query failed: {vexc}"}
+
         return {
             "ok": True,
             "node": imp.path(),
             "skeleton": {"joints": joint_count, "has_skin_geo": has_skin_geo},
+            "validator": validator,
         }
 
     except Exception as exc:
@@ -558,7 +570,18 @@ def import_fbx_animation(path: str, dest: str = None, cascadeur: bool = False) -
         except (hou.OperationFailed, hou.Error, RuntimeError) as exc:
             _log.warning("import_fbx_animation: could not read frame range parms: %s", exc)
 
-        return {"ok": True, "node": imp.path(), "skeleton": skeleton}
+        # ── FR-12 verify-after-mutate: best-effort skeleton re-query ─────────
+        validator: dict = {"note": "verify-after-mutate", "fields": ["skeleton_summary"]}
+        try:
+            skel_summary = query_skeleton(imp.path())
+            validator["skeleton_summary"] = skel_summary
+        except Exception as vexc:
+            # fail-loud: do NOT supply a fake count — the post-cook re-query
+            # genuinely failed; surface the error honestly (fail-loud-discipline.md).
+            _log.warning("import_fbx_animation: post-cook verify-after-mutate re-query failed: %s", vexc)
+            validator["skeleton_summary"] = {"error": f"post-cook re-query failed: {vexc}"}
+
+        return {"ok": True, "node": imp.path(), "skeleton": skeleton, "validator": validator}
 
     except Exception as exc:
         # FR-2: catch everything from createNode / parm.set / cook / geometry reads.
@@ -1010,6 +1033,19 @@ def apply_secondarymotion(node, joints=None, params=None, dest=None) -> dict:
         }
         if ignored_params:
             result["ignored_params"] = ignored_params
+
+        # ── FR-12 verify-after-mutate: best-effort skeleton re-query ─────────
+        validator: dict = {"note": "verify-after-mutate", "fields": ["skeleton_summary"]}
+        try:
+            skel_summary = query_skeleton(sm.path())
+            validator["skeleton_summary"] = skel_summary
+        except Exception as vexc:
+            # fail-loud: do NOT supply a fake count — the post-cook re-query
+            # genuinely failed; surface the error honestly (fail-loud-discipline.md).
+            _log.warning("apply_secondarymotion: post-cook verify-after-mutate re-query failed: %s", vexc)
+            validator["skeleton_summary"] = {"error": f"post-cook re-query failed: {vexc}"}
+        result["validator"] = validator
+
         return result
 
     except Exception as exc:
@@ -1018,15 +1054,199 @@ def apply_secondarymotion(node, joints=None, params=None, dest=None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Registration — ALL three read-only + TWO mutating (PR-3) + ONE mutating (PR-4)
-#                + ONE mutating (PR-5) + ONE mutating (PR-6)
+# Preview functions — §4.3 approval payload for each MUTATING tool (PR-8)
+#
+# Each preview_fn receives a single positional params dict (the dispatcher
+# calls preview_fn(params)).  They return:
+#   {tool, args, node_plan, skeleton_summary, validator_contract}
+# The operator sees this payload in the gate dialog before approving the
+# mutation.  preview_required=True → if the skeleton can't be queried (e.g.
+# the source node is missing), DENY immediately rather than queue blind.
+# ---------------------------------------------------------------------------
+
+def _preview_import_fbx_character(params: dict) -> dict:
+    """Preview payload for import_fbx_character — no pre-existing skeleton to query.
+
+    Middleware calls preview_fn(params) with a single positional dict; all args
+    are extracted internally (mirroring export_handlers.py _preview_* convention).
+    """
+    path = params.get("path", "")
+    dest = params.get("dest")
+    args = {"path": path, "dest": dest}
+    return {
+        "tool": "import_fbx_character",
+        "args": args,
+        "node_plan": kinefx_model.node_plan("import_fbx_character", {"path": path}),
+        "skeleton_summary": {"count": 0, "note": "to-be-created"},
+        "validator_contract": {
+            "fields": ["skeleton_summary"],
+            "note": "verify-after-mutate",
+        },
+    }
+
+
+def _preview_import_fbx_animation(params: dict) -> dict:
+    """Preview payload for import_fbx_animation — no pre-existing skeleton to query.
+
+    Middleware calls preview_fn(params) with a single positional dict; all args
+    are extracted internally (mirroring export_handlers.py _preview_* convention).
+    """
+    path = params.get("path", "")
+    dest = params.get("dest")
+    cascadeur = params.get("cascadeur", False)
+    args = {"path": path, "dest": dest, "cascadeur": cascadeur}
+    return {
+        "tool": "import_fbx_animation",
+        "args": args,
+        "node_plan": kinefx_model.node_plan("import_fbx_animation", {"path": path}),
+        "skeleton_summary": {"count": 0, "note": "to-be-created"},
+        "validator_contract": {
+            "fields": ["skeleton_summary"],
+            "note": "verify-after-mutate",
+        },
+    }
+
+
+def _preview_setup_bonedeform(params: dict) -> dict:
+    """Preview payload for setup_bonedeform — queries the anim skeleton for joint count.
+
+    Middleware calls preview_fn(params) with a single positional dict; all args
+    are extracted internally (mirroring export_handlers.py _preview_* convention).
+    """
+    rest = params.get("rest", "")
+    anim = params.get("anim", "")
+    geo = params.get("geo", "")
+    dest = params.get("dest")
+    args = {"rest": rest, "anim": anim, "geo": geo, "dest": dest}
+    skeleton_summary: dict
+    try:
+        skeleton_summary = query_skeleton(anim)
+    except Exception as exc:
+        skeleton_summary = {"count": 0, "note": f"pre-cook query failed: {exc}"}
+    return {
+        "tool": "setup_bonedeform",
+        "args": args,
+        "node_plan": kinefx_model.node_plan("setup_bonedeform", args),
+        "skeleton_summary": skeleton_summary,
+        "validator_contract": {
+            "fields": ["deformed_points", "has_capture_weight"],
+            "note": "verify-after-mutate",
+        },
+    }
+
+
+def _preview_setup_retarget(params: dict) -> dict:
+    """Preview payload for setup_retarget — queries the target skeleton for joint count.
+
+    Middleware calls preview_fn(params) with a single positional dict; all args
+    are extracted internally (mirroring export_handlers.py _preview_* convention).
+    """
+    source = params.get("source", "")
+    target = params.get("target", "")
+    mapping_method = params.get("mapping_method", params.get("method", "rigmatchpose+fullbodyik"))
+    match_size = params.get("match_size", True)
+    mapping = params.get("mapping")
+    dest = params.get("dest")
+    args = {"source": source, "target": target, "mapping_method": mapping_method,
+            "match_size": match_size, "mapping": mapping, "dest": dest}
+    skeleton_summary: dict
+    try:
+        skeleton_summary = query_skeleton(target)
+    except Exception as exc:
+        skeleton_summary = {"count": 0, "note": f"pre-cook query failed: {exc}"}
+    return {
+        "tool": "setup_retarget",
+        "args": args,
+        "node_plan": kinefx_model.node_plan("setup_retarget", args),
+        "skeleton_summary": skeleton_summary,
+        "validator_contract": {
+            "fields": ["target_skeleton", "unmapped_target_joints"],
+            "note": "verify-after-mutate",
+        },
+    }
+
+
+def _preview_apply_secondarymotion(params: dict) -> dict:
+    """Preview payload for apply_secondarymotion — queries the skeleton SOP for joint count.
+
+    Middleware calls preview_fn(params) with a single positional dict; all args
+    are extracted internally (mirroring export_handlers.py _preview_* convention).
+
+    preview_required=True means if query_skeleton fails (node missing / no @name
+    attrib), the gate will DENY rather than show a blind payload.  The skeleton
+    node must be cooked and readable before the gate opens.
+
+    kinefx::secondarymotion cannot cook headless in hython — the validator_contract
+    field in the preview is therefore a STRUCTURAL DECLARATION (what will be
+    verified) rather than actual post-cook data; actual verification is
+    operator-smoke (Hamza confirms post-cook skeleton state in live Houdini).
+    """
+    node = params.get("node", "")
+    joints = params.get("joints")
+    # Note: avoid shadowing the outer `params` dict — the tool arg is `params`
+    # in the MCP schema but we rename it `motion_params` here for clarity.
+    motion_params = params.get("params")
+    dest = params.get("dest")
+    args = {"node": node, "joints": joints, "params": motion_params, "dest": dest}
+    skeleton_summary: dict
+    try:
+        skeleton_summary = query_skeleton(node)
+    except Exception as exc:
+        skeleton_summary = {"count": 0, "note": f"pre-cook query failed: {exc}"}
+    return {
+        "tool": "apply_secondarymotion",
+        "args": args,
+        "node_plan": kinefx_model.node_plan("apply_secondarymotion", args),
+        "skeleton_summary": skeleton_summary,
+        "validator_contract": {
+            "fields": ["skeleton_summary"],
+            "note": "verify-after-mutate",
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# M-04: reload-stable registry eviction — evict this module's own command
+# names from the preview registry on each (re)load so stale keys don't block
+# fresh registrations.  Mirrors the pattern from export_handlers.py.
+# ---------------------------------------------------------------------------
+
+_OWN_COMMANDS = (
+    "kinefx_probe",
+    "query_skeleton",
+    "inspect_apex",
+    "import_fbx_character",
+    "import_fbx_animation",
+    "setup_bonedeform",
+    "setup_retarget",
+    "apply_secondarymotion",
+)
+
+try:
+    import hou as _hou_m04
+    _reg = getattr(_hou_m04.session, "_fxhoudinimcp_preview_registry", None)
+    if _reg is not None:
+        for _cmd in _OWN_COMMANDS:
+            _reg.pop(_cmd, None)
+    del _reg, _hou_m04, _cmd
+except (ImportError, NameError):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Registration — ALL three read-only + FIVE mutating with preview hooks (PR-8)
 # ---------------------------------------------------------------------------
 
 register_handler("kinefx_probe", kinefx_probe, Capability.READONLY)
 register_handler("query_skeleton", query_skeleton, Capability.READONLY)
 register_handler("inspect_apex", inspect_apex, Capability.READONLY)
-register_handler("import_fbx_character", import_fbx_character, Capability.MUTATING)
-register_handler("import_fbx_animation", import_fbx_animation, Capability.MUTATING)
-register_handler("setup_bonedeform", setup_bonedeform, Capability.MUTATING)
-register_handler("setup_retarget", setup_retarget, Capability.MUTATING)
-register_handler("apply_secondarymotion", apply_secondarymotion, Capability.MUTATING)
+register_handler("import_fbx_character", import_fbx_character, Capability.MUTATING,
+                 preview_fn=_preview_import_fbx_character, preview_required=True)
+register_handler("import_fbx_animation", import_fbx_animation, Capability.MUTATING,
+                 preview_fn=_preview_import_fbx_animation, preview_required=True)
+register_handler("setup_bonedeform", setup_bonedeform, Capability.MUTATING,
+                 preview_fn=_preview_setup_bonedeform, preview_required=True)
+register_handler("setup_retarget", setup_retarget, Capability.MUTATING,
+                 preview_fn=_preview_setup_retarget, preview_required=True)
+register_handler("apply_secondarymotion", apply_secondarymotion, Capability.MUTATING,
+                 preview_fn=_preview_apply_secondarymotion, preview_required=True)

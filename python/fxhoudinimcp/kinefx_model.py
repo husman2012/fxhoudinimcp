@@ -438,3 +438,78 @@ def validate_mapping(
             target_claimed_by[tgt_joint] = src_joint
 
     return errors
+
+
+# ---------------------------------------------------------------------------
+# node_plan — pure-logic node-creation plan for each KineFX mutating tool
+# ---------------------------------------------------------------------------
+
+def node_plan(tool: str, args: dict) -> dict:
+    """Return {node_type, inputs, key_parms} for each KineFX mutating tool.
+
+    Pure-logic: no hou / Qt / pxr imports (CL-015).
+    This is consumed by preview_fn hooks so the §4.3 approval payload can
+    show the operator exactly what node(s) will be created before the gate
+    opens.
+
+    Args:
+        tool: one of the five KineFX mutating tool names registered in
+              character_handlers.py.
+        args: the kwargs dict the handler will receive (same dict the
+              preview_fn receives).
+
+    Returns:
+        A dict with keys:
+            node_type  — primary Houdini node type name
+            inputs     — list of input slot labels (positional order)
+            key_parms  — dict of parameter names to example values from args
+
+    Raises:
+        ValueError: if *tool* is not one of the five supported mutating tools.
+    """
+    if tool == "import_fbx_character":
+        return {
+            "node_type": "kinefx::fbxcharacterimport",
+            "inputs": [],
+            "key_parms": {"fbxfile": args.get("path", args.get("fbxfile", ""))},
+        }
+    elif tool == "import_fbx_animation":
+        return {
+            "node_type": "kinefx::fbxanimimport",
+            "inputs": [],
+            "key_parms": {"fbxfile": args.get("path", args.get("fbxfile", ""))},
+        }
+    elif tool == "setup_bonedeform":
+        return {
+            "node_type": "bonedeform",
+            "inputs": ["geo", "rest", "anim"],
+            "key_parms": {},
+        }
+    elif tool == "setup_retarget":
+        mapping_method = args.get("mapping_method", args.get("method", "by_name"))
+        if mapping_method == "explicit" or (args.get("mapping") is not None):
+            chain = ["kinefx::rigmatchpose", "kinefx::mappoints", "kinefx::fullbodyik"]
+        else:
+            chain = ["kinefx::rigmatchpose", "kinefx::fullbodyik"]
+        return {
+            "node_type": "kinefx::fullbodyik",
+            "inputs": ["source_node", "target_node"],
+            "key_parms": {
+                "chain": chain,
+                "mapping_method": mapping_method,
+            },
+        }
+    elif tool == "apply_secondarymotion":
+        _params = args.get("params") or {}
+        if not isinstance(_params, dict):
+            _params = {}
+        return {
+            "node_type": "kinefx::secondarymotion",
+            "inputs": ["skeleton_sop"],
+            "key_parms": {
+                "effect": _params.get("effect", args.get("effect", 0.5)),
+                "joint_group": args.get("joints") or "",
+            },
+        }
+    else:
+        raise ValueError(f"node_plan: unknown or unsupported tool {tool!r}")
