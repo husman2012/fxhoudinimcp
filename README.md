@@ -68,6 +68,8 @@ A comprehensive [MCP](https://modelcontextprotocol.io/) (Model Context Protocol)
 
 Engine-export hooks (VAT, Alembic/UE, FBX, Chaos GC, Niagara) are documented in [`handlers/EXPORT_HANDLERS.md`](houdini/scripts/python/fxhoudinimcp_server/handlers/EXPORT_HANDLERS.md) — tool list, version-skew table, gated call sequence, and UE-side verification steps.
 
+KineFX / APEX character tools (probe, skeleton query, APEX inspect, FBX import, bonedeform, retarget, secondary motion) are documented in [`handlers/KINEFX_HANDLERS.md`](houdini/scripts/python/fxhoudinimcp_server/handlers/KINEFX_HANDLERS.md) — tool list, §4.2 agent↔operator call sequence, §4.3 approval payload, node-type table, and operator-in-viewport confirmation note.
+
 <!-- FEATURES -->
 ## Features
 
