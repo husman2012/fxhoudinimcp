@@ -298,7 +298,7 @@ class TestRenderLintSettingsShape:
     @classmethod
     def setup_class(cls):
         hou.hipFile.clear(suppress_save_prompt=True)
-        cls._dispatch = _get_dispatcher()
+        cls._dispatch = staticmethod(_get_dispatcher())
         # Build a real LOP node whose stage() carries the broken-Karma prims.
         # The handler calls stage_reader.read(node) -> node.stage(); the node
         # path is the required render_node argument (not a bare lopnet or Stage).
@@ -386,7 +386,7 @@ class TestRenderLintSettingsRuleResults:
     @classmethod
     def setup_class(cls):
         hou.hipFile.clear(suppress_save_prompt=True)
-        cls._dispatch = _get_dispatcher()
+        cls._dispatch = staticmethod(_get_dispatcher())
         # Build a real LOP node with the broken-Karma stage content.
         cls._render_node_path = _build_lop_stage("smoke_lint_rules")
         cls._result_data = _data(
@@ -466,7 +466,7 @@ class TestRenderLintSettingsFailLoud:
     @classmethod
     def setup_class(cls):
         hou.hipFile.clear(suppress_save_prompt=True)
-        cls._dispatch = _get_dispatcher()
+        cls._dispatch = staticmethod(_get_dispatcher())
 
     def test_invalid_render_node_returns_error_dict(self):
         """FR-2 fail-loud: non-existent path must return a dict with ok=False and error str."""
