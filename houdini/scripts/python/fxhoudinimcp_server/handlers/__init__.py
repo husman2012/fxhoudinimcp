@@ -40,6 +40,7 @@ _HANDLER_MODULES = [
     "cache_handlers",
     "take_handlers",
     "export_handlers",
+    "render_readback_handlers",
 ]
 
 _loaded = []
