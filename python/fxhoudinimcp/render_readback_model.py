@@ -604,3 +604,224 @@ def clamp_and_paginate(
         total_pages=total_pages,
         truncated=truncated,
     )
+
+
+def build_readback(
+    channels: List[List[float]],
+    plane: str,
+    xres: int,
+    yres: int,
+    dtype: str = "float32",
+    mode: str = "summary",
+    roi: Optional[List[int]] = None,
+    max_pixels: int = 4096,
+    downsample: int = 1,
+    page: int = 0,
+    page_size: int = 1024,
+    num_bins: int = 16,
+) -> dict:
+    """Assemble the §4.2 render_read_pixels response dict from per-channel pixel buffers.
+
+    Pure Python — no hou, no numpy, no OIIO imports.  Off-DCC, pytest-able.
+
+    Parameters
+    ----------
+    channels : List[List[float]]
+        Per-channel flat pixel buffers: ``channels[ch][pixel_index]``.
+        Pixel index = ``y * xres + x`` (row-major).
+    plane : str
+        Name of the AOV plane (e.g. "C", "N", "depth").
+    xres : int
+        Horizontal resolution of the SOURCE frame (ALWAYS reflected verbatim in output).
+    yres : int
+        Vertical resolution of the SOURCE frame (ALWAYS reflected verbatim in output).
+    dtype : str
+        Data type string (e.g. "float32", "float16").
+    mode : str
+        One of "summary", "roi", or "sample".
+        - "summary": return stats + histogram; pixels=[].
+        - "roi": crop to ``roi`` rect, then paginate.
+        - "sample": full frame strided by ``downsample``, then paginate.
+    roi : Optional[List[int]]
+        ``[x0, y0, x1, y1]`` — half-open rect (x1/y1 are exclusive).
+        Bounds are clamped to ``[0, xres)`` / ``[0, yres)``.
+        ``None`` in "roi" mode defaults to the full frame ``[0, 0, xres, yres]``.
+        Ignored in "summary" and "sample" modes.
+    max_pixels : int
+        Maximum total pixels to paginate (clamping limit for clamp_and_paginate).
+    downsample : int
+        Stride for "sample" mode.  Values < 1 are treated as 1.
+    page : int
+        Zero-based page index (for "roi" and "sample" modes).
+    page_size : int
+        Maximum pixels per page (for "roi" and "sample" modes).
+    num_bins : int
+        Number of histogram bins for summarize_pixels.
+
+    Returns
+    -------
+    dict
+        §4.2 locked shape::
+
+            {
+              'plane':       str,
+              'xres':        int,   # SOURCE dims, never roi dims
+              'yres':        int,
+              'channels':    int,
+              'dtype':       str,
+              'mode':        str,
+              'stats':       {'min':[..], 'max':[..], 'mean':[..],
+                              'nan_count':int, 'inf_count':int},
+              'histogram':   {'bins':int, 'counts':[[..],..] },
+              'pixels':      [[..], ..],   # [] in 'summary' mode
+              'page':        int,
+              'page_size':   int,
+              'total_pages': int,
+              'truncated':   bool,
+            }
+    """
+    # ------------------------------------------------------------------
+    # Empty-channels fast path (AC-4) — always a valid zero response.
+    # ------------------------------------------------------------------
+    if not channels:
+        return {
+            "plane": plane,
+            "xres": xres,
+            "yres": yres,
+            "channels": 0,
+            "dtype": dtype,
+            "mode": mode,
+            "stats": {
+                "min": [],
+                "max": [],
+                "mean": [],
+                "nan_count": 0,
+                "inf_count": 0,
+            },
+            "histogram": {"bins": num_bins, "counts": []},
+            "pixels": [],
+            "page": page,
+            "page_size": page_size,
+            "total_pages": 1,
+            "truncated": False,
+        }
+
+    # ------------------------------------------------------------------
+    # Mode dispatch.
+    # ------------------------------------------------------------------
+
+    if mode == "summary":
+        # Stats over all pixels; no pixel rows returned.
+        summary = summarize_pixels(channels, plane, xres, yres, dtype, num_bins)
+        stats_dict = dict(summary.stats)
+        hist_dict = {
+            "bins": summary.histogram["bins"],
+            "counts": [list(c) for c in summary.histogram["counts"]],
+        }
+        return {
+            "plane": plane,
+            "xres": xres,
+            "yres": yres,
+            "channels": len(channels),
+            "dtype": dtype,
+            "mode": mode,
+            "stats": stats_dict,
+            "histogram": hist_dict,
+            "pixels": [],
+            "page": page,
+            "page_size": page_size,
+            "total_pages": 1,
+            "truncated": False,
+        }
+
+    elif mode == "roi":
+        # Crop to roi rect (bounds clamped), then paginate.
+        if roi is None:
+            x0, y0, x1, y1 = 0, 0, xres, yres
+        else:
+            x0 = max(0, roi[0])
+            y0 = max(0, roi[1])
+            x1 = min(xres, roi[2])
+            y1 = min(yres, roi[3])
+
+        # Build pixel rows for the cropped region (row-major traversal).
+        pixel_rows: List[List[float]] = []
+        for row_y in range(y0, y1):
+            for col_x in range(x0, x1):
+                flat_idx = row_y * xres + col_x
+                pixel_rows.append([ch[flat_idx] for ch in channels])
+
+        # Rebuild per-channel buffers for the roi pixels for stats.
+        n_ch = len(channels)
+        roi_channels: List[List[float]] = [[] for _ in range(n_ch)]
+        for row in pixel_rows:
+            for ch_i, val in enumerate(row):
+                roi_channels[ch_i].append(val)
+
+        summary = summarize_pixels(roi_channels, plane, xres, yres, dtype, num_bins)
+        stats_dict = dict(summary.stats)
+        hist_dict = {
+            "bins": summary.histogram["bins"],
+            "counts": [list(c) for c in summary.histogram["counts"]],
+        }
+
+        rb_page = clamp_and_paginate(pixel_rows, page, page_size, max_pixels)
+
+        return {
+            "plane": plane,
+            "xres": xres,     # AC-5: source dims, never roi dims
+            "yres": yres,
+            "channels": len(channels),
+            "dtype": dtype,
+            "mode": mode,
+            "stats": stats_dict,
+            "histogram": hist_dict,
+            "pixels": rb_page.pixels,
+            "page": rb_page.page,
+            "page_size": rb_page.page_size,
+            "total_pages": rb_page.total_pages,
+            "truncated": rb_page.truncated,
+        }
+
+    else:  # mode == "sample"
+        # Full frame with stride = max(downsample, 1).
+        stride = max(downsample, 1)
+
+        # Walk the source frame in stride steps on both axes.
+        pixel_rows_s: List[List[float]] = []
+        for row_y in range(0, yres, stride):
+            for col_x in range(0, xres, stride):
+                flat_idx = row_y * xres + col_x
+                pixel_rows_s.append([ch[flat_idx] for ch in channels])
+
+        # Rebuild per-channel buffers for the strided pixels for stats.
+        n_ch = len(channels)
+        sample_channels: List[List[float]] = [[] for _ in range(n_ch)]
+        for row in pixel_rows_s:
+            for ch_i, val in enumerate(row):
+                sample_channels[ch_i].append(val)
+
+        summary = summarize_pixels(sample_channels, plane, xres, yres, dtype, num_bins)
+        stats_dict = dict(summary.stats)
+        hist_dict = {
+            "bins": summary.histogram["bins"],
+            "counts": [list(c) for c in summary.histogram["counts"]],
+        }
+
+        rb_page = clamp_and_paginate(pixel_rows_s, page, page_size, max_pixels)
+
+        return {
+            "plane": plane,
+            "xres": xres,     # AC-5: source dims always
+            "yres": yres,
+            "channels": len(channels),
+            "dtype": dtype,
+            "mode": mode,
+            "stats": stats_dict,
+            "histogram": hist_dict,
+            "pixels": rb_page.pixels,
+            "page": rb_page.page,
+            "page_size": rb_page.page_size,
+            "total_pages": rb_page.total_pages,
+            "truncated": rb_page.truncated,
+        }
