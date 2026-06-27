@@ -554,3 +554,25 @@ class TestMetadataFields:
     def test_mode_preserved_sample(self):
         result = _call_sample()
         assert result["mode"] == "sample"
+
+
+class TestUnknownModeHardening:
+    """M-01: build_readback must raise ValueError for unknown mode.
+
+    RED until hou-dev hardens the mode dispatch in render_readback_model.py.
+    Currently the 'else:' branch silently runs sample for any unrecognised mode,
+    which masks caller errors.  After hardening, an unrecognised mode must raise
+    ValueError immediately.
+    """
+
+    def test_unknown_mode_raises_value_error(self):
+        """M-01 hardening: unknown mode must raise ValueError, not silently run sample."""
+        with pytest.raises(ValueError):
+            build_readback(
+                channels=[[0.0, 1.0]],
+                plane="C",
+                xres=2,
+                yres=1,
+                dtype="float32",
+                mode="bogus",
+            )

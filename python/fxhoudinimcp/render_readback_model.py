@@ -744,6 +744,13 @@ def build_readback(
             x1 = min(xres, roi[2])
             y1 = min(yres, roi[3])
 
+        # M-02: guard against undersized channel buffers before indexing.
+        if any(len(ch) < xres * yres for ch in channels):
+            raise ValueError(
+                f"build_readback: channel buffer too short for {xres}x{yres} frame "
+                f"(mode={mode!r})"
+            )
+
         # Build pixel rows for the cropped region (row-major traversal).
         pixel_rows: List[List[float]] = []
         for row_y in range(y0, y1):
@@ -752,8 +759,7 @@ def build_readback(
                 pixel_rows.append([ch[flat_idx] for ch in channels])
 
         # Rebuild per-channel buffers for the roi pixels for stats.
-        n_ch = len(channels)
-        roi_channels: List[List[float]] = [[] for _ in range(n_ch)]
+        roi_channels: List[List[float]] = [[] for _ in range(len(channels))]
         for row in pixel_rows:
             for ch_i, val in enumerate(row):
                 roi_channels[ch_i].append(val)
@@ -783,9 +789,16 @@ def build_readback(
             "truncated": rb_page.truncated,
         }
 
-    else:  # mode == "sample"
+    elif mode == "sample":
         # Full frame with stride = max(downsample, 1).
         stride = max(downsample, 1)
+
+        # M-02: guard against undersized channel buffers before indexing.
+        if any(len(ch) < xres * yres for ch in channels):
+            raise ValueError(
+                f"build_readback: channel buffer too short for {xres}x{yres} frame "
+                f"(mode={mode!r})"
+            )
 
         # Walk the source frame in stride steps on both axes.
         pixel_rows_s: List[List[float]] = []
@@ -795,8 +808,7 @@ def build_readback(
                 pixel_rows_s.append([ch[flat_idx] for ch in channels])
 
         # Rebuild per-channel buffers for the strided pixels for stats.
-        n_ch = len(channels)
-        sample_channels: List[List[float]] = [[] for _ in range(n_ch)]
+        sample_channels: List[List[float]] = [[] for _ in range(len(channels))]
         for row in pixel_rows_s:
             for ch_i, val in enumerate(row):
                 sample_channels[ch_i].append(val)
@@ -825,3 +837,6 @@ def build_readback(
             "total_pages": rb_page.total_pages,
             "truncated": rb_page.truncated,
         }
+
+    else:
+        raise ValueError(f"build_readback: unknown mode {mode!r}")

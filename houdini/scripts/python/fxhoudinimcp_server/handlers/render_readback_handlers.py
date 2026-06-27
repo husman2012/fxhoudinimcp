@@ -1,13 +1,15 @@
-"""Handler: render_lint_settings — Karma render graph pre-render linting.
+"""Handlers: render_lint_settings, render_parse_exr, render_read_pixels.
 
-Reads the USD stage from a Karma render node and runs the homedini
-handoff_linter engine against it, returning per-rule results and a
-ready_to_render flag.
+render_lint_settings — Karma render graph pre-render linting.
+render_parse_exr     — Parse an on-disk EXR via hoiiotool (ExrManifest).
+render_read_pixels   — Read pixel data from an on-disk EXR via OIIO.
 
-READ-ONLY, UNGATED (Capability.READONLY) — FR-10.
-FR-2: missing/invalid render_node → {ok: False, error: "..."} (never silent).
+All handlers are READ-ONLY, UNGATED (Capability.READONLY) — FR-10.
+FR-2: missing/invalid arguments → {ok: False, error: "..."} (never silent).
+FR-5: unexpected exceptions → {ok: False, error: str(exc)} (never propagate).
 
-PP12-114 / pp12-114c — unitId: pp12-114c
+PP12-114 / pp12-114c (render_lint_settings, render_parse_exr)
+PP12-114 / pp12-114e (render_read_pixels)
 """
 from __future__ import annotations
 
@@ -203,3 +205,126 @@ def render_parse_exr(exr_path: str, subimage: "int | None" = None) -> dict:
 # ---------------------------------------------------------------------------
 
 register_handler("render_parse_exr", render_parse_exr, Capability.READONLY)
+
+
+# ---------------------------------------------------------------------------
+# Handler: render_read_pixels
+# ---------------------------------------------------------------------------
+
+def render_read_pixels(
+    source: str,
+    plane: str = "C",
+    mode: str = "summary",
+    roi: list[int] | None = None,
+    max_pixels: int = 4096,
+    downsample: int = 1,
+    page: int = 0,
+    page_size: int = 1024,
+) -> dict:
+    """Read pixel data from an on-disk EXR file and return a readback dict.
+
+    EXR-source v1: ``source`` must be a file-system path (supports Houdini
+    variable expansion such as ``$HIP``).  In-scene COP node paths are not
+    yet supported and return ``{ok: False, error: …}``.
+
+    Args:
+        source:    Path to the EXR file; supports Houdini variable expansion
+                   (e.g. ``"$HIP/render/beauty.0001.exr"``).  FR-2: must not
+                   be empty or whitespace-only.
+        plane:     AOV plane name.  ``"C"`` / ``"beauty"`` select the top-level
+                   beauty channels (R/G/B, no dot in name).  Default: ``"C"``.
+        mode:      Readback mode — ``"summary"`` (metadata only, no pixel data),
+                   ``"sample"`` (spaced sample of pixels), or ``"roi"``
+                   (bounding-box slice).
+        roi:       ``[x0, y0, x1, y1]`` half-open bounding box for
+                   ``mode="roi"``.
+        max_pixels: Maximum pixel count before auto-downsampling.
+                   Default: 4096.
+        downsample: Manual downsample factor (1 = no downsampling).
+        page:      Page index for paginated reads.
+        page_size: Page size in pixels.  Default: 1024.
+
+    Returns:
+        §4.2 ReadbackResult dict on success::
+
+            {
+                "ok": True,
+                "xres": int,
+                "yres": int,
+                "channels": int,
+                "dtype": str,
+                "mode": str,
+                "plane": str,
+                "pixels": [...],
+            }
+
+        FR-2/FR-5 error shape on failure::
+
+            {"ok": False, "error": "<human-readable message>"}
+    """
+    # FR-2: reject obviously invalid source values.
+    if not source or not source.strip():
+        return {"ok": False, "error": "source must be a non-empty path"}
+
+    # FR-2: reject unknown mode values before touching the file system.
+    _VALID_MODES = {"summary", "roi", "sample"}
+    if mode not in _VALID_MODES:
+        return {
+            "ok": False,
+            "error": f"mode must be one of {sorted(_VALID_MODES)!r}, got {mode!r}",
+        }
+
+    try:
+        from fxhoudinimcp import render_readback_reader  # noqa: PLC0415
+        from fxhoudinimcp.render_readback_model import build_readback  # noqa: PLC0415
+
+        # Expand Houdini variables ($HIP, $HFS, $JOB, etc.) in the path.
+        expanded = hou.text.expandString(source)
+
+        # EXR-source v1: detect in-scene COP/scene-node paths.
+        # After expansion, real on-disk paths resolve to an existing file.
+        # A hou.node() match (scene path) is not supported in this version.
+        if not _os.path.isfile(expanded):
+            if hou.node(expanded) is not None:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"in-scene plane source not yet supported "
+                        f"(EXR-source v1): {source!r}"
+                    ),
+                }
+            return {
+                "ok": False,
+                "error": f"EXR file not found: {expanded!r}",
+            }
+
+        # Read the EXR channels (no subimage arg — reader defaults to None).
+        channels, xres, yres, dtype = render_readback_reader.read_exr_plane(
+            expanded, plane
+        )
+
+        # Delegate all readback logic to the pure-logic model function.
+        return build_readback(
+            channels=channels,
+            plane=plane,
+            xres=xres,
+            yres=yres,
+            dtype=dtype,
+            mode=mode,
+            roi=roi,
+            max_pixels=max_pixels,
+            downsample=downsample,
+            page=page,
+            page_size=page_size,
+        )
+
+    except Exception as exc:  # noqa: BLE001 — FR-5: all failures surface as {ok: False}
+        _log.warning("render_read_pixels failed for %r: %s", source, exc, exc_info=True)
+        return {"ok": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Registration (READONLY — FR-10, ungated)
+# ---------------------------------------------------------------------------
+
+register_handler("render_read_pixels", render_read_pixels, Capability.READONLY)

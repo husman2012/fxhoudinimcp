@@ -1,12 +1,13 @@
-"""MCP wrapper: render_lint_settings — Karma render graph pre-render linting.
+"""MCP wrappers: render_lint_settings, render_parse_exr, render_read_pixels.
 
-READ-ONLY, UNGATED (require_approval=False, Capability.READONLY) — FR-10.
+All wrappers are READ-ONLY, UNGATED (require_approval=False,
+Capability.READONLY) — FR-10.  Each wrapper delegates to the correspondingly
+named handler registered on the Houdini side via bridge.execute.  No logic
+lives here; all domain logic is in the homedini engine / OIIO reader accessed
+Houdini-side through the handlers.
 
-The wrapper delegates to the handler registered as "render_lint_settings"
-via bridge.execute.  No logic lives here; all lint logic is in the
-homedini handoff_linter engine, accessed Houdini-side through the handler.
-
-PP12-114 / pp12-114c — unitId: pp12-114c
+PP12-114 / pp12-114c (render_lint_settings, render_parse_exr)
+PP12-114 / pp12-114e (render_read_pixels)
 """
 from __future__ import annotations
 
@@ -91,4 +92,67 @@ async def render_parse_exr(
     return await bridge.execute(
         "render_parse_exr",
         {"exr_path": exr_path, "subimage": subimage},
+    )
+
+
+@mcp.tool(meta={"require_approval": False})
+async def render_read_pixels(
+    ctx: Context,
+    source: str,
+    plane: str = "C",
+    mode: str = "summary",
+    roi: list[int] | None = None,
+    max_pixels: int = 4096,
+    downsample: int = 1,
+    page: int = 0,
+    page_size: int = 1024,
+) -> dict:
+    """Read pixel data from an on-disk EXR file via OIIO.
+
+    Returns the §4.2 ReadbackResult shape::
+
+        {
+            "ok": True,
+            "xres": int,
+            "yres": int,
+            "channels": int,
+            "dtype": str,
+            "mode": str,
+            "plane": str,
+            "pixels": [...],
+        }
+
+    or an FR-2/FR-5 error shape on failure::
+
+        {"ok": False, "error": "<reason>"}
+
+    Args:
+        ctx: MCP lifespan context — injected by FastMCP; hidden from client schema.
+        source: Path to the EXR file; supports Houdini variable expansion
+            (e.g. ``"$HIP/render/beauty.0001.exr"``).  In-scene COP node
+            paths are not yet supported (EXR-source v1).
+        plane: AOV plane name.  ``"C"`` or ``"beauty"`` select the top-level
+            beauty channels (R/G/B with no dot in name).  Default: ``"C"``.
+        mode: Readback mode — ``"summary"`` (metadata only, no pixel data),
+            ``"sample"`` (spaced sample of pixels), or ``"roi"``
+            (``[x0, y0, x1, y1]`` half-open bounding-box slice).
+        roi: ``[x0, y0, x1, y1]`` half-open bounding box for ``mode="roi"``.
+        max_pixels: Maximum pixel count before auto-downsampling.  Default: 4096.
+        downsample: Manual downsample factor (1 = no downsampling).
+        page: Page index for paginated reads.
+        page_size: Page size in pixels.  Default: 1024.
+    """
+    bridge = _fxserver._get_bridge(ctx)
+    return await bridge.execute(
+        "render_read_pixels",
+        {
+            "source": source,
+            "plane": plane,
+            "mode": mode,
+            "roi": roi,
+            "max_pixels": max_pixels,
+            "downsample": downsample,
+            "page": page,
+            "page_size": page_size,
+        },
     )
