@@ -1,4 +1,5 @@
-"""MCP wrappers: render_lint_settings, render_parse_exr, render_read_pixels.
+"""MCP wrappers: render_lint_settings, render_parse_exr, render_read_pixels,
+render_compare.
 
 All wrappers are READ-ONLY, UNGATED (require_approval=False,
 Capability.READONLY) — FR-10.  Each wrapper delegates to the correspondingly
@@ -8,6 +9,7 @@ Houdini-side through the handlers.
 
 PP12-114 / pp12-114c (render_lint_settings, render_parse_exr)
 PP12-114 / pp12-114e (render_read_pixels)
+PP12-114 / pp12-114f (render_compare)
 """
 from __future__ import annotations
 
@@ -155,4 +157,46 @@ async def render_read_pixels(
             "page": page,
             "page_size": page_size,
         },
+    )
+
+
+@mcp.tool(meta={"require_approval": False})
+async def render_compare(
+    ctx: Context,
+    a: str,
+    b: str,
+    planes: list[str] | None = None,
+    metric: str = "stats",
+) -> dict:
+    """Compare two EXR renders A and B plane-by-plane and return comparison metrics.
+
+    Returns the §4.2 CompareReport shape **directly** on success (no ``ok``
+    key — callers must NOT gate on ``result.get("ok")`` being True)::
+
+        {
+            "aovs_a": [...],
+            "aovs_b": [...],
+            "common": [...],
+            "selected": [...],
+            "per_plane": {plane: {metric_key: value, ...}, ...},
+        }
+
+    or an FR-2/FR-5 error shape on failure::
+
+        {"ok": False, "error": "<reason>"}
+
+    Args:
+        ctx: MCP lifespan context — injected by FastMCP; hidden from client schema.
+        a: Path to render A; supports Houdini variable expansion.  In-scene
+            COP node paths are not yet supported (EXR-source v1).
+        b: Path to render B; same constraints as ``a``.
+        planes: List of AOV plane names to compare.  ``None`` (default) compares
+            all planes common to both renders.
+        metric: Comparison metric — ``"stats"``, ``"mae"``, or ``"psnr"``.
+            Validated before file access.  Default: ``"stats"``.
+    """
+    bridge = _fxserver._get_bridge(ctx)
+    return await bridge.execute(
+        "render_compare",
+        {"a": a, "b": b, "planes": planes, "metric": metric},
     )
