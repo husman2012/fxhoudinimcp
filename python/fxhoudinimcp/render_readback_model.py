@@ -251,9 +251,15 @@ def compute_plane_delta(
     Raises
     ------
     ValueError
-        If ``a`` and ``b`` have a different number of channels, or if any
-        corresponding channel has a different number of pixels.
+        If ``peak_value <= 0``, or if ``a`` and ``b`` have a different number of
+        channels, or if any corresponding channel has a different number of pixels.
     """
+    # RR-2: peak_value must be positive; guard before any computation.
+    if peak_value <= 0:
+        raise ValueError(
+            f"compute_plane_delta: peak_value must be > 0, got {peak_value}"
+        )
+
     num_channels = len(a)
 
     # F5: validate shape before any computation
@@ -286,22 +292,24 @@ def compute_plane_delta(
     # Accumulate absolute errors across all channels and pixels for MAE and MSE.
     # F3/F1: non-finite pixels (NaN or Inf) are excluded from mae/psnr but their
     # presence is tracked to set moved=True.
+    # RR-1: total_finite_count tracks only finite-sample pairs so the denominator
+    # of MAE and MSE is the finite-sample count, not the full buffer length.
     total_abs_error = 0.0
     total_sq_error = 0.0
-    total_count = 0
+    total_finite_count = 0  # RR-1: count only finite-sample pairs
     has_nonfinite = False  # F3: flag set when any pixel is NaN or Inf
 
     for ch in range(num_channels):
         ch_a = a[ch]
         ch_b = b[ch]
-        n = len(ch_a)
 
         ch_sum_signed = 0.0
         ch_max_abs = 0.0
         ch_sum_abs = 0.0
         ch_sum_sq = 0.0
+        ch_finite_count = 0  # RR-1: per-channel finite-sample count
 
-        for px in range(n):
+        for px in range(len(ch_a)):
             va = ch_a[px]
             vb = ch_b[px]
             # F3/F1: exclude non-finite samples from numeric aggregation
@@ -315,19 +323,21 @@ def compute_plane_delta(
             ch_sum_sq += diff * diff
             if abs_diff > ch_max_abs:
                 ch_max_abs = abs_diff
+            ch_finite_count += 1
 
         total_abs_error += ch_sum_abs
         total_sq_error += ch_sum_sq
-        total_count += n
+        total_finite_count += ch_finite_count  # RR-1: accumulate finite-only count
 
-        mean_delta.append(ch_sum_signed / n if n > 0 else 0.0)
+        # RR-1: divide signed mean by finite-sample count per channel, not full length
+        mean_delta.append(ch_sum_signed / ch_finite_count if ch_finite_count > 0 else 0.0)
         max_abs_delta.append(ch_max_abs)
 
-    # MAE over all channels and pixels (finite samples only)
-    mae = total_abs_error / total_count if total_count > 0 else 0.0
+    # MAE over all channels and pixels (finite samples only — RR-1 fix)
+    mae = total_abs_error / total_finite_count if total_finite_count > 0 else 0.0
 
     # PSNR: 10 * log10(peak_value**2 / mse) — F4 adds peak_value param
-    mse = total_sq_error / total_count if total_count > 0 else 0.0
+    mse = total_sq_error / total_finite_count if total_finite_count > 0 else 0.0
     if mse == 0.0:
         psnr = math.inf
     elif not math.isfinite(mse):
@@ -604,6 +614,156 @@ def clamp_and_paginate(
         total_pages=total_pages,
         truncated=truncated,
     )
+
+
+def build_compare(
+    aovs_a: List[str],
+    aovs_b: List[str],
+    channels_a: Dict[str, List[List[float]]],
+    channels_b: Dict[str, List[List[float]]],
+    planes: Optional[List[str]] = None,
+    metric: str = "stats",
+    peak_value: float = 1.0,
+) -> dict:
+    """Orchestrate a full render comparison and return the §4.2 envelope.
+
+    Reuses ``aov_presence_diff``, ``compute_plane_delta``, ``build_verdict``,
+    and ``CompareReport.to_dict()`` — does NOT re-implement their logic.
+
+    Parameters
+    ----------
+    aovs_a : List[str]
+        AOV names present in render A (order-stable).
+    aovs_b : List[str]
+        AOV names present in render B (order-stable).
+    channels_a : Dict[str, List[List[float]]]
+        Per-AOV channel buffers for render A.
+        ``channels_a[aov][channel_index][pixel_index]``.
+    channels_b : Dict[str, List[List[float]]]
+        Per-AOV channel buffers for render B.
+    planes : Optional[List[str]]
+        Which planes to include in ``per_plane``.
+        ``None`` (default) -> all common AOVs.
+        A list -> intersection with common AOVs, in requested order.
+        A plane in the list that is not in the common set is silently skipped.
+        A SELECTED plane that is present in both AOV lists (i.e. in ``common``)
+        but absent from ``channels_a`` or ``channels_b`` raises ``ValueError``
+        (rev2 contract — callers must supply channel data for every selected
+        plane; silent skipping would yield a false "no-change" verdict).
+    metric : str
+        One of ``"stats"``, ``"mae"``, or ``"psnr"``.
+
+        **v1 client-projection hint.** This parameter does NOT change the
+        returned shape: all three values always return the full ``per_plane``
+        list with every field (``plane``, ``mean_delta``, ``max_abs_delta``,
+        ``mae``, ``psnr``, ``moved``).  ``metric`` is validated and reserved
+        for future server-side field filtering in a later API version.
+    peak_value : float
+        Signal peak forwarded to every ``compute_plane_delta`` call.
+        Must be > 0 (enforced by ``compute_plane_delta``).
+
+        **PSNR meaningfulness caveat.** PSNR is well-defined only for planes
+        whose pixel values are normalised to ``[0, peak_value]``.  The default
+        ``peak_value=1.0`` gives sensible results for beauty (C), normals (N),
+        alpha (A), and other [0, 1]-range AOVs.  For unbounded planes — depth
+        (``Pz``), world-space position (``P``), motion vectors, object/material
+        IDs — the global ``peak_value=1.0`` produces *misleadingly low* dB
+        values because real pixel magnitudes far exceed 1.0.  Supply a
+        per-plane peak map at the call site (e.g. ``peak_value=100.0`` for a
+        depth plane clipped at 100 scene units) or treat ``psnr`` as
+        informational-only for those planes.  A future v2 API will accept a
+        per-plane peak map directly.
+
+    Returns
+    -------
+    dict
+        ``CompareReport.to_dict()`` shape::
+
+            {
+              "aovs_only_in_a": list[str],
+              "aovs_only_in_b": list[str],
+              "aovs_common":    list[str],
+              "per_plane": [
+                {
+                  "plane":         str,
+                  "mean_delta":    list[float],
+                  "max_abs_delta": list[float],
+                  "mae":           float,
+                  "psnr":          float | None,
+                  "moved":         bool,
+                },
+                ...
+              ],
+              "verdict": str,
+            }
+
+        **All-non-finite sentinel.** When a selected plane has NO finite pixel
+        samples in both renders, ``compute_plane_delta`` returns the triple
+        ``moved=True``, ``mae=0.0``, ``psnr=None``.  This sentinel means
+        *"no numeric comparison was possible"* — it MUST NOT be read as
+        "renders are identical/unchanged".  It is distinct from an unchanged
+        plane (``moved=False``, ``mae=0.0``, ``psnr=None``).
+
+        **Finite-count weighting.** ``mae`` and the MSE used to compute
+        ``psnr`` are averaged over the *global* finite-sample count across all
+        channels and pixels; non-finite samples (NaN, Inf) are excluded from
+        both numerator and denominator (RR-1 fix).  ``mean_delta`` per channel
+        uses that channel's *own* finite count — not the global total.
+
+    Raises
+    ------
+    ValueError
+        If ``metric`` is not one of ``"stats"``, ``"mae"``, ``"psnr"``, or if
+        a SELECTED plane is absent from ``channels_a`` or ``channels_b``.
+    """
+    _VALID_METRICS = {"stats", "mae", "psnr"}
+    if metric not in _VALID_METRICS:
+        raise ValueError(
+            f"build_compare: unknown metric {metric!r}; "
+            f"must be one of {sorted(_VALID_METRICS)}"
+        )
+
+    # Step 1: determine AOV presence sets via the existing primitive.
+    only_in_a, only_in_b, common = aov_presence_diff(aovs_a, aovs_b)
+
+    # Step 2: determine which planes to delta.
+    if planes is None:
+        selected = common
+    else:
+        common_set = set(common)
+        selected = [p for p in planes if p in common_set]
+
+    # Step 3: compute per-plane deltas.
+    # rev2: a SELECTED plane absent from either channels dict raises ValueError
+    # (silent skip would yield a false "no-change" verdict with no signal).
+    per_plane: List[PlaneDelta] = []
+    for plane_name in selected:
+        if plane_name not in channels_a or plane_name not in channels_b:
+            raise ValueError(
+                f"build_compare: plane '{plane_name}' is selected but absent "
+                f"from the channel dict(s) — ensure channel data is provided "
+                f"for every selected plane"
+            )
+        delta = compute_plane_delta(
+            channels_a[plane_name],
+            channels_b[plane_name],
+            plane_name,
+            peak_value=peak_value,
+        )
+        per_plane.append(delta)
+
+    # Step 4: assemble the CompareReport and populate the verdict.
+    report = CompareReport(
+        aovs_only_in_a=only_in_a,
+        aovs_only_in_b=only_in_b,
+        aovs_common=common,
+        per_plane=per_plane,
+        verdict="",
+    )
+    report.verdict = build_verdict(report)
+
+    # Step 5: return the §4.2 locked shape via CompareReport.to_dict().
+    return report.to_dict()
 
 
 def build_readback(
