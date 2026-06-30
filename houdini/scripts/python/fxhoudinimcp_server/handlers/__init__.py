@@ -41,6 +41,7 @@ _HANDLER_MODULES = [
     "take_handlers",
     "export_handlers",
     "render_readback_handlers",
+    "usd_export_handlers",
 ]
 
 _loaded = []
