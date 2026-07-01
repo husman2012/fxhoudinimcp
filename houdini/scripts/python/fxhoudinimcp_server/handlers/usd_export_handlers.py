@@ -1,13 +1,21 @@
-"""Handlers: usd_inspect_layer, usd_validate.
+"""Handlers: usd_inspect_layer, usd_validate, usd_export_layer.
 
 usd_inspect_layer — Inspect a USD layer from a LOP node or file path.
 usd_validate      — Run USD discipline checks against a layer summary.
+usd_export_layer  — Write a composed USD layer to disk (Sdf.Layer.Export()).
+                     GATED (Capability.MUTATING) — the first mutating tool of
+                     the USD/MaterialX export family. Registered with a
+                     preview_fn (_preview_export_layer) + preview_required=True
+                     so the PP12-109 security gate can show a pre-flight
+                     preview before approving the write (ADR-0005 pattern).
 
-All handlers are READ-ONLY, UNGATED (Capability.READONLY) — FR-10.
+usd_inspect_layer / usd_validate are READ-ONLY, UNGATED (Capability.READONLY)
+— FR-10.
 FR-2: missing/invalid arguments -> {ok: False, error: "..."} (never silent).
 FR-5: unexpected exceptions -> {ok: False, error: str(exc)} (never propagate).
 
 PP12-112 / pp12-112b (usd_inspect_layer, usd_validate)
+PP12-112 / pp12-112c (usd_export_layer, _preview_export_layer)
 """
 from __future__ import annotations
 
@@ -38,7 +46,11 @@ if _PY not in _sys.path:
 import hou  # noqa: E402  (hython / Houdini-side interpreter only)
 from fxhoudinimcp_server.dispatcher import Capability, register_handler  # noqa: E402
 from fxhoudinimcp.usd_export_model import LayerSummary  # noqa: E402
-from fxhoudinimcp.discipline_checks import run_discipline_checks, format_for_extension  # noqa: E402
+from fxhoudinimcp.discipline_checks import (  # noqa: E402
+    run_discipline_checks,
+    format_for_extension,
+    format_from_magic_bytes,
+)
 
 # USD modules — required; fail loud if unavailable (M-1: no silent fabrication)
 try:
@@ -381,3 +393,181 @@ def usd_validate(
 
 
 register_handler("usd_validate", usd_validate, Capability.READONLY)
+
+
+# ---------------------------------------------------------------------------
+# usd_export_layer (GATED — Capability.MUTATING) + _preview_export_layer
+# ---------------------------------------------------------------------------
+#
+# 109-gate preview function (pp12-112c / ADR-0005 pattern, mirrors
+# export_handlers._preview_vat exactly). Runs on the main thread via
+# _run_preview / hdefereval (CL-016); hou.* access is safe here. It is pure
+# read-only — no scene mutation, no file write — so preview_required=True
+# causes DENY on raise/timeout only.
+
+
+def _preview_export_layer(params: dict) -> dict:
+    """Return the 109-gate approval payload for usd_export_layer WITHOUT writing.
+
+    READ-ONLY: performs the pre-flight usd_validate (preflight mode — out_path
+    set, actual_format None) and reports the resolved output format, but does
+    NOT export/write anything. A raise here causes the gate to DENY the call
+    (preview_required=True).
+
+    Called POSITIONALLY by the gate middleware as ``preview_fn(params)`` — a
+    single ``params: dict`` argument, NOT ``**params`` (the opposite
+    convention from the keyword-only handler; matches _preview_vat's shape).
+
+    Args:
+        params: dict with keys node_path, out_path, flatten, default_prim
+            (the same params dict the handler will later receive as kwargs).
+
+    Returns:
+        {
+            "out_path": <hou.text.expandString(out_path)>,
+            "resolved_format": "usda" | "usdc" | "usdz",
+            "pre_validation": <usd_validate(...) preflight-mode result>,
+            "flatten": bool,
+            "default_prim": str | None,
+            "no_world_wrapper": True,
+        }
+
+    Raises:
+        ValueError: propagated from format_for_extension() when out_path's
+            extension is not a recognized USD format — the gate DENIES the
+            call so the operator is never asked to approve an unknown-format
+            export (rev3 lockedFieldContract).
+        hou.OperationFailed: propagated from usd_validate's underlying
+            _get_stage() when node_path cannot be resolved.
+    """
+    node_path = params["node_path"]
+    out_path = params["out_path"]
+
+    expanded = hou.text.expandString(out_path)
+    resolved_format = format_for_extension(expanded)  # ValueError -> gate DENY
+
+    pre = usd_validate(target=node_path, out_path=out_path)  # preflight mode
+
+    return {
+        "out_path": expanded,
+        "resolved_format": resolved_format,
+        "pre_validation": pre,
+        "flatten": params.get("flatten", False),
+        "default_prim": params.get("default_prim"),
+        "no_world_wrapper": True,
+    }
+
+
+def usd_export_layer(
+    *,
+    node_path: str,
+    out_path: str,
+    flatten: bool = False,
+    default_prim: "str | None" = None,
+) -> dict:
+    """Write a composed USD layer to disk via Sdf.Layer.Export(). GATED — mutating.
+
+    Format is chosen by *out_path*'s file EXTENSION (.usda -> ascii,
+    .usdc/.usd -> crate, .usdz -> packaged) — reuses format_for_extension().
+    Injects NO /World or /root wrapper: the authored stage's root layer (or
+    its Flatten()-ed composition) is exported as-is (usd-publish-discipline.md).
+
+    Runs an INLINE post-write usd_validate (postwrite mode: out_path +
+    actual_format both set) after the write and embeds the result under
+    'validator_post'.
+
+    Returns:
+        On success::
+
+            {
+                "ok": True,
+                "out_path": <expanded out_path>,
+                "format": <format_for_extension(expanded)>,
+                "actual_format": <format_from_magic_bytes(header)>,
+                "validator_post": <usd_validate(...) postwrite-mode result>,
+            }
+
+        On failure (FR-2/FR-5)::
+
+            {"ok": False, "error": "<reason>"}
+
+    Args:
+        node_path: Houdini LOP node path (e.g. "/stage/lop1") or a USD file
+            path — resolved via _get_stage() (node-or-file source). The
+            mutation this handler performs is the WRITE to out_path, not to
+            node_path — reading a file-backed node_path is not itself a
+            mutation risk.
+        out_path: Output file path; supports Houdini variable expansions
+            (e.g. "$HIP/out.usdc").
+        flatten: When True, export stage.Flatten() (a single flattened
+            layer). When False (default), export stage.GetRootLayer() as-is.
+        default_prim: When set, resolves to a prim on the stage via
+            GetPrimAtPath() and calls stage.SetDefaultPrim(prim) BEFORE
+            flatten/export so a subsequent Flatten() captures it (Phase-0
+            probe confirmed: SetDefaultPrim before Flatten propagates into
+            the flattened layer's defaultPrim). An invalid default_prim path
+            returns an FR-2-style error WITHOUT calling SetDefaultPrim.
+    """
+    try:
+        # FR-2: reject empty node_path/out_path before touching hou.*.
+        # Moved INSIDE the try (green-1, codex-pair-reviewer Major): the
+        # dispatcher calls handler(**params) from a JSON-decoded dict with no
+        # runtime type enforcement, so a non-string truthy arg (int/dict/list/
+        # bool from a malformed direct-dispatch call) would raise
+        # AttributeError on .strip() — that must land in the FR-5 envelope
+        # below, not leak as an unhandled exception from a MUTATING handler.
+        if not node_path or not node_path.strip():
+            return {"ok": False, "error": "node_path must be a non-empty node path or file path"}
+        if not out_path or not out_path.strip():
+            return {"ok": False, "error": "out_path must be a non-empty file path"}
+
+        stage, _source_kind = _get_stage(node_path)
+
+        if default_prim:
+            prim = stage.GetPrimAtPath(default_prim)
+            if not prim.IsValid():
+                return {
+                    "ok": False,
+                    "error": f"default_prim {default_prim!r} does not resolve to a valid prim",
+                }
+            stage.SetDefaultPrim(prim)  # BEFORE flatten so Flatten() captures it
+
+        layer = stage.Flatten() if flatten else stage.GetRootLayer()
+
+        expanded = hou.text.expandString(out_path)
+        # No /World or /root wrapper injected — the authored root is preserved
+        # as-is (usd-publish-discipline.md).
+        ok = layer.Export(expanded)
+
+        with open(expanded, "rb") as fh:
+            header = fh.read(16)
+        actual_format = format_from_magic_bytes(header)  # ValueError -> FR-5 below
+        ext_format = format_for_extension(expanded)
+
+        validator_post = usd_validate(
+            target=expanded, out_path=out_path, actual_format=actual_format
+        )  # postwrite mode
+
+        return {
+            "ok": bool(ok),
+            "out_path": expanded,
+            "format": ext_format,
+            "actual_format": actual_format,
+            "validator_post": validator_post,
+        }
+
+    except Exception as exc:
+        _log.warning(
+            "usd_export_layer failed for node_path=%r out_path=%r: %s",
+            node_path, out_path, exc,
+        )
+        return {"ok": False, "error": str(exc)}
+
+
+register_handler(
+    "usd_export_layer",
+    usd_export_layer,
+    Capability.MUTATING,
+    preview_fn=_preview_export_layer,
+    preview_required=True,
+)
