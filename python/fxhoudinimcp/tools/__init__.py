@@ -63,3 +63,4 @@ from fxhoudinimcp.tools import kinefx_tools  # noqa: F401
 from fxhoudinimcp.tools import export_tools  # noqa: F401
 from fxhoudinimcp.tools import render_readback_tools  # noqa: F401
 from fxhoudinimcp.tools import usd_export_tools  # noqa: F401
+from fxhoudinimcp.tools import cop_onnx_tools  # noqa: F401

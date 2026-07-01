@@ -739,3 +739,274 @@ class TestModulePurity:
             assert token not in source, (
                 f"cop_onnx_model.py must not contain {token!r} (CL-015 purity boundary)"
             )
+
+
+# ===========================================================================
+# Section 10 — contract_from_setup_shapes(model_path, raw_inputs, raw_outputs,
+#                                          opset=None, producer=None) -> OnnxContract
+#              (PP12-113 PR-2 — RED, does not exist yet)
+#
+# Locked contract (plan pp12-113b lockedFieldContract):
+#   NEW pure function APPENDED to cop_onnx_model.py. PR-1 symbols (above)
+#   are BYTE-UNCHANGED — this section only ADDS coverage for the new symbol.
+#
+#   Signature: contract_from_setup_shapes(model_path: str, raw_inputs: list,
+#                                          raw_outputs: list, opset=None,
+#                                          producer=None) -> OnnxContract
+#
+#   raw_inputs / raw_outputs are plain dicts the HANDLER assembles from node
+#   parms: [{'name': str, 'dtype': str|None, 'shape': list[int|'dynamic']}, ...]
+#
+#   Behavior:
+#     - Builds a TensorSpec per raw entry.
+#     - INPUT TensorSpecs get layout_guess = guess_layout(shape).
+#     - OUTPUT TensorSpecs get layout_guess = 'unknown' (fixed, not guessed).
+#     - dtype passed through verbatim from the raw dict's 'dtype' key.
+#     - Dynamic dims (the literal string 'dynamic') preserved verbatim.
+#     - Sets loadable=True, error=None on the returned OnnxContract.
+#     - opset / producer forwarded verbatim (default None).
+#     - to_dict() on the result round-trips per the existing OnnxContract
+#       contract (Section 2 above) — inputs/outputs as lists of dicts.
+#
+#   This is a SYNTHETIC-input pure test: independent of any live Houdini
+#   parm read. The handler (hou-dev, hython-smoke) owns normalizing the
+#   ACTUAL parm sentinel (-1/0/blank) to the 'dynamic' literal BEFORE
+#   calling this helper — that normalization is out of scope here.
+# ===========================================================================
+
+class TestContractFromSetupShapes:
+    """contract_from_setup_shapes — pure raw-dict -> OnnxContract mapping (RED)."""
+
+    def _raw_input_nchw_dynamic(self):
+        return {
+            "name": "input",
+            "dtype": "float32",
+            "shape": [1, 3, "dynamic", "dynamic"],
+        }
+
+    def _raw_output_basic(self):
+        return {
+            "name": "output",
+            "dtype": "float32",
+            "shape": [1, 3, "dynamic", "dynamic"],
+        }
+
+    def test_module_exposes_contract_from_setup_shapes(self):
+        """RED GATE: contract_from_setup_shapes must be importable from cop_onnx_model."""
+        from fxhoudinimcp.cop_onnx_model import contract_from_setup_shapes  # noqa: F401
+        assert callable(contract_from_setup_shapes)
+
+    def test_returns_onnx_contract_instance(self):
+        from fxhoudinimcp.cop_onnx_model import contract_from_setup_shapes
+
+        result = contract_from_setup_shapes(
+            model_path="/models/identity.onnx",
+            raw_inputs=[self._raw_input_nchw_dynamic()],
+            raw_outputs=[self._raw_output_basic()],
+        )
+        assert isinstance(result, OnnxContract), (
+            f"contract_from_setup_shapes must return an OnnxContract, got {type(result)!r}"
+        )
+
+    def test_model_path_forwarded(self):
+        from fxhoudinimcp.cop_onnx_model import contract_from_setup_shapes
+
+        result = contract_from_setup_shapes(
+            model_path="/models/identity.onnx",
+            raw_inputs=[self._raw_input_nchw_dynamic()],
+            raw_outputs=[self._raw_output_basic()],
+        )
+        assert result.model_path == "/models/identity.onnx"
+
+    def test_input_layout_guess_matches_guess_layout(self):
+        """Input TensorSpec.layout_guess must equal guess_layout(shape) — pinned NCHW case."""
+        from fxhoudinimcp.cop_onnx_model import contract_from_setup_shapes
+
+        raw_input = self._raw_input_nchw_dynamic()
+        expected_layout = guess_layout(raw_input["shape"])
+        assert expected_layout == "NCHW", (
+            "sanity: [1,3,'dynamic','dynamic'] must guess NCHW per Section 5 pinned case"
+        )
+
+        result = contract_from_setup_shapes(
+            model_path="/models/identity.onnx",
+            raw_inputs=[raw_input],
+            raw_outputs=[self._raw_output_basic()],
+        )
+        assert len(result.inputs) == 1
+        assert result.inputs[0].layout_guess == expected_layout, (
+            f"input TensorSpec.layout_guess must equal guess_layout(shape) == {expected_layout!r}, "
+            f"got {result.inputs[0].layout_guess!r}"
+        )
+
+    def test_output_layout_guess_is_always_unknown(self):
+        """Output TensorSpecs get layout_guess='unknown' regardless of shape (fixed, not guessed)."""
+        from fxhoudinimcp.cop_onnx_model import contract_from_setup_shapes
+
+        # Use a shape that WOULD guess NCHW on an input, to prove outputs are NOT guessed.
+        raw_output = {
+            "name": "output",
+            "dtype": "float32",
+            "shape": [1, 3, 512, 512],
+        }
+        result = contract_from_setup_shapes(
+            model_path="/models/identity.onnx",
+            raw_inputs=[self._raw_input_nchw_dynamic()],
+            raw_outputs=[raw_output],
+        )
+        assert len(result.outputs) == 1
+        assert result.outputs[0].layout_guess == "unknown", (
+            f"output TensorSpec.layout_guess must always be 'unknown', "
+            f"got {result.outputs[0].layout_guess!r}"
+        )
+
+    def test_dynamic_dim_preserved_verbatim(self):
+        """The literal 'dynamic' string in a raw shape must survive into the TensorSpec."""
+        from fxhoudinimcp.cop_onnx_model import contract_from_setup_shapes
+
+        result = contract_from_setup_shapes(
+            model_path="/models/identity.onnx",
+            raw_inputs=[self._raw_input_nchw_dynamic()],
+            raw_outputs=[self._raw_output_basic()],
+        )
+        assert result.inputs[0].shape == [1, 3, "dynamic", "dynamic"], (
+            f"dynamic dims must be preserved verbatim, got {result.inputs[0].shape!r}"
+        )
+        assert result.outputs[0].shape == [1, 3, "dynamic", "dynamic"], (
+            f"dynamic dims must be preserved verbatim in outputs too, got {result.outputs[0].shape!r}"
+        )
+
+    def test_dtype_passthrough_from_raw_dict(self):
+        """dtype must pass through verbatim from the raw dict's 'dtype' key."""
+        from fxhoudinimcp.cop_onnx_model import contract_from_setup_shapes
+
+        raw_input = dict(self._raw_input_nchw_dynamic())
+        raw_input["dtype"] = "float16"
+        raw_output = dict(self._raw_output_basic())
+        raw_output["dtype"] = "int64"
+
+        result = contract_from_setup_shapes(
+            model_path="/models/identity.onnx",
+            raw_inputs=[raw_input],
+            raw_outputs=[raw_output],
+        )
+        assert result.inputs[0].dtype == "float16", (
+            f"input dtype must pass through verbatim, got {result.inputs[0].dtype!r}"
+        )
+        assert result.outputs[0].dtype == "int64", (
+            f"output dtype must pass through verbatim, got {result.outputs[0].dtype!r}"
+        )
+
+    def test_name_passthrough_from_raw_dict(self):
+        from fxhoudinimcp.cop_onnx_model import contract_from_setup_shapes
+
+        result = contract_from_setup_shapes(
+            model_path="/models/identity.onnx",
+            raw_inputs=[self._raw_input_nchw_dynamic()],
+            raw_outputs=[self._raw_output_basic()],
+        )
+        assert result.inputs[0].name == "input"
+        assert result.outputs[0].name == "output"
+
+    def test_loadable_true_error_none(self):
+        """A successful build must set loadable=True, error=None."""
+        from fxhoudinimcp.cop_onnx_model import contract_from_setup_shapes
+
+        result = contract_from_setup_shapes(
+            model_path="/models/identity.onnx",
+            raw_inputs=[self._raw_input_nchw_dynamic()],
+            raw_outputs=[self._raw_output_basic()],
+        )
+        assert result.loadable is True
+        assert result.error is None
+
+    def test_opset_and_producer_forwarded(self):
+        """opset/producer are forwarded verbatim; default to None when omitted."""
+        from fxhoudinimcp.cop_onnx_model import contract_from_setup_shapes
+
+        result_defaults = contract_from_setup_shapes(
+            model_path="/models/identity.onnx",
+            raw_inputs=[self._raw_input_nchw_dynamic()],
+            raw_outputs=[self._raw_output_basic()],
+        )
+        assert result_defaults.opset is None
+        assert result_defaults.producer is None
+
+        result_set = contract_from_setup_shapes(
+            model_path="/models/identity.onnx",
+            raw_inputs=[self._raw_input_nchw_dynamic()],
+            raw_outputs=[self._raw_output_basic()],
+            opset=17,
+            producer="pytorch",
+        )
+        assert result_set.opset == 17
+        assert result_set.producer == "pytorch"
+
+    def test_multiple_inputs_and_outputs_all_mapped(self):
+        """Multiple raw entries all become TensorSpecs, order preserved."""
+        from fxhoudinimcp.cop_onnx_model import contract_from_setup_shapes
+
+        raw_inputs = [
+            {"name": "input_a", "dtype": "float32", "shape": [1, 3, "dynamic", "dynamic"]},
+            {"name": "input_b", "dtype": "float32", "shape": [1, 256]},
+        ]
+        raw_outputs = [
+            {"name": "output_a", "dtype": "float32", "shape": [1, 1000]},
+            {"name": "output_b", "dtype": "int64", "shape": [1]},
+        ]
+        result = contract_from_setup_shapes(
+            model_path="/models/multi.onnx",
+            raw_inputs=raw_inputs,
+            raw_outputs=raw_outputs,
+        )
+        assert [t.name for t in result.inputs] == ["input_a", "input_b"]
+        assert [t.name for t in result.outputs] == ["output_a", "output_b"]
+        # input_b is rank-2 -> guess_layout degrades to 'unknown'
+        assert result.inputs[1].layout_guess == "unknown"
+
+    def test_empty_inputs_and_outputs_produce_empty_lists(self):
+        """A model with no inputs/outputs (edge case) still returns valid empty lists."""
+        from fxhoudinimcp.cop_onnx_model import contract_from_setup_shapes
+
+        result = contract_from_setup_shapes(
+            model_path="/models/empty.onnx",
+            raw_inputs=[],
+            raw_outputs=[],
+        )
+        assert result.inputs == []
+        assert result.outputs == []
+
+    def test_to_dict_round_trips(self):
+        """The resulting OnnxContract.to_dict() must use the existing OnnxContract contract."""
+        from fxhoudinimcp.cop_onnx_model import contract_from_setup_shapes
+
+        result = contract_from_setup_shapes(
+            model_path="/models/identity.onnx",
+            raw_inputs=[self._raw_input_nchw_dynamic()],
+            raw_outputs=[self._raw_output_basic()],
+            opset=17,
+            producer="pytorch",
+        )
+        d = result.to_dict()
+        assert set(d.keys()) == {
+            "model_path", "inputs", "outputs", "opset", "producer", "loadable", "error",
+        }
+        assert d["model_path"] == "/models/identity.onnx"
+        assert d["opset"] == 17
+        assert d["producer"] == "pytorch"
+        assert d["loadable"] is True
+        assert d["error"] is None
+        assert d["inputs"][0]["shape"] == [1, 3, "dynamic", "dynamic"]
+        assert d["inputs"][0]["layout_guess"] == "NCHW"
+        assert d["outputs"][0]["layout_guess"] == "unknown"
+        json.dumps(d)
+
+    def test_is_json_serialisable_end_to_end(self):
+        from fxhoudinimcp.cop_onnx_model import contract_from_setup_shapes
+
+        result = contract_from_setup_shapes(
+            model_path="/models/identity.onnx",
+            raw_inputs=[self._raw_input_nchw_dynamic()],
+            raw_outputs=[self._raw_output_basic()],
+        )
+        json.dumps(result.to_dict())

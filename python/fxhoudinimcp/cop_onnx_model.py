@@ -473,3 +473,84 @@ def count_nan_inf(values: List[float]) -> dict:
         "nan_count": nan_count,
         "inf_count": inf_count,
     }
+
+
+# ---------------------------------------------------------------------------
+# contract_from_setup_shapes (PP12-113 PR-2)
+# ---------------------------------------------------------------------------
+
+def contract_from_setup_shapes(
+    model_path: str,
+    raw_inputs: list,
+    raw_outputs: list,
+    opset: Optional[int] = None,
+    producer: Optional[str] = None,
+) -> OnnxContract:
+    """Build an OnnxContract from raw input/output dicts assembled by the
+    cop_onnx_inspect_model handler (PP12-113 PR-2).
+
+    Pure. Never touches hou/Qt/pxr/onnx — the HANDLER is responsible for
+    reading the cop/onnx node's parms (via the temp-node-Setup-Shapes
+    mechanism) and normalizing them into plain dicts BEFORE calling this
+    function. This function only maps those dicts onto TensorSpec/
+    OnnxContract; it never reads a hou.Parm itself.
+
+    Parameters
+    ----------
+    model_path : str
+        Path to the .onnx file (forwarded verbatim into the result).
+    raw_inputs : list[dict]
+        One dict per input tensor: {"name": str, "dtype": str | None,
+        "shape": list[int | "dynamic"]}. Dynamic dims must already be
+        normalized to the literal string "dynamic" by the caller (the
+        handler) — this function does not interpret any other sentinel
+        (e.g. -1) as dynamic; it passes shape values through verbatim.
+    raw_outputs : list[dict]
+        Same shape as raw_inputs, for output tensors.
+    opset : int | None
+        ONNX opset version, forwarded verbatim (default None).
+    producer : str | None
+        Model producer_name, forwarded verbatim (default None).
+
+    Returns
+    -------
+    OnnxContract
+        loadable=True, error=None on every call (build failure diagnosis
+        — e.g. the temp node itself erroring — is the handler's FR-5
+        try/except concern, not this pure mapper's).
+
+    Layout guessing
+    ----------------
+    Input TensorSpecs get layout_guess = guess_layout(shape) (the same
+    pure heuristic used everywhere else in this module). Output
+    TensorSpecs always get layout_guess = "unknown" — cop/onnx exposes no
+    automatic layout inference for outputs, and guessing on an output
+    tensor is out of scope (Section 4 of the pp12-113b research memo).
+    """
+    inputs = [
+        TensorSpec(
+            name=raw["name"],
+            shape=list(raw["shape"]),
+            dtype=raw.get("dtype"),
+            layout_guess=guess_layout(raw["shape"]),
+        )
+        for raw in raw_inputs
+    ]
+    outputs = [
+        TensorSpec(
+            name=raw["name"],
+            shape=list(raw["shape"]),
+            dtype=raw.get("dtype"),
+            layout_guess="unknown",
+        )
+        for raw in raw_outputs
+    ]
+    return OnnxContract(
+        model_path=model_path,
+        inputs=inputs,
+        outputs=outputs,
+        opset=opset,
+        producer=producer,
+        loadable=True,
+        error=None,
+    )
