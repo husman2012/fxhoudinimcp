@@ -1,4 +1,4 @@
-"""Handlers: usd_inspect_layer, usd_validate, usd_export_layer.
+"""Handlers: usd_inspect_layer, usd_validate, usd_export_layer, usd_export_rop.
 
 usd_inspect_layer — Inspect a USD layer from a LOP node or file path.
 usd_validate      — Run USD discipline checks against a layer summary.
@@ -8,6 +8,12 @@ usd_export_layer  — Write a composed USD layer to disk (Sdf.Layer.Export()).
                      preview_fn (_preview_export_layer) + preview_required=True
                      so the PP12-109 security gate can show a pre-flight
                      preview before approving the write (ADR-0005 pattern).
+usd_export_rop    — Drive the /out-context `usd` ROP to write a chosen LOP's
+                     composed /stage to disk (current frame or a [start,end]
+                     range). GATED (Capability.MUTATING) — the SECOND mutating
+                     tool of the family. Registered with a preview_fn
+                     (_preview_export_rop) + preview_required=True, mirroring
+                     usd_export_layer's registration exactly.
 
 usd_inspect_layer / usd_validate are READ-ONLY, UNGATED (Capability.READONLY)
 — FR-10.
@@ -16,6 +22,7 @@ FR-5: unexpected exceptions -> {ok: False, error: str(exc)} (never propagate).
 
 PP12-112 / pp12-112b (usd_inspect_layer, usd_validate)
 PP12-112 / pp12-112c (usd_export_layer, _preview_export_layer)
+PP12-112 / pp12-112d (usd_export_rop, _preview_export_rop)
 """
 from __future__ import annotations
 
@@ -34,6 +41,7 @@ from __future__ import annotations
 #  +/python -> .../fxhoudinimcp/python/
 # ---------------------------------------------------------------------------
 import logging as _logging
+import math as _math
 import os as _os
 import sys as _sys
 
@@ -569,5 +577,347 @@ register_handler(
     usd_export_layer,
     Capability.MUTATING,
     preview_fn=_preview_export_layer,
+    preview_required=True,
+)
+
+
+# ---------------------------------------------------------------------------
+# usd_export_rop (GATED — Capability.MUTATING) + _preview_export_rop
+# ---------------------------------------------------------------------------
+#
+# Drives the /out-context `usd` ROP to write a chosen LOP's composed /stage to
+# disk — AT THE CURRENT FRAME (frame_range=None -> trange=0) or ACROSS A
+# GIVEN [start, end] RANGE (frame_range=[f1, f2] -> trange=1). NOT a full-
+# time-history flatten like usd_export_layer's Sdf.Layer.Export() — this is
+# the second, ROP-driven gated write of the family (pp12-112d, plan rev3).
+#
+# ROP-driving idiom grounded on the shipped export_handlers.rop_alembic
+# pattern (createNode -> set trange/f -> parm('execute').pressButton() with
+# render() fallback -> node.errors() -> destroy()), substituting the
+# LOP-targeting `loppath` path-string parm for soppath/setInput wiring.
+#
+# Phase-0 hython probe (2026-07-01, live Houdini 21.0.729) confirmed:
+#   - the /out `usd` node type exists with parms loppath / lopoutput /
+#     trange / f1,f2,f3 (accessed via parmTuple('f'), NOT parm('f') — a
+#     ParmTuple, matching rop_alembic's f-tuple pattern) / execute.
+#   - NO source-mode/enable toggle gates loppath (no use_sop_path analog) —
+#     setting loppath alone is sufficient to drive the ROP off that LOP's
+#     composed stage; the closest same-named token, 'flattensoplayers', is
+#     an unrelated SOP-import-layer option, not a source-mode gate.
+#   - loppath resolves an ABSOLUTE LOP node path from /out and the composed
+#     stage's real content (e.g. a cooked sphere LOP's '/sphere1' prim) lands
+#     in the written file — no silent no-op.
+#   - lopoutput format is resolved by file EXTENSION exactly like
+#     format_for_extension(): a .usdc lopoutput writes PXR-USDC crate magic
+#     bytes; a .usda lopoutput writes a '#usda 1.0' ASCII header.
+#   - node.errors() returns a TUPLE (empty tuple on success), not a list —
+#     truthiness-checked below, matching the shipped rop_alembic pattern.
+#   - trange=1 + parmTuple('f').set((f1, f2, finc)) on a time-varying LOP
+#     genuinely cooks + writes multiple USD time samples (confirmed via an
+#     xform LOP driven by the $F Hscript expression) — range mode is real,
+#     not a silent current-frame collapse.
+
+
+def _preview_export_rop(params: dict) -> dict:
+    """Return the 109-gate approval payload for usd_export_rop WITHOUT writing.
+
+    READ-ONLY: performs the pre-flight usd_validate (preflight mode — out_path
+    set, actual_format None) and reports the resolved output format, but does
+    NOT create a ROP or write anything. A raise here causes the gate to DENY
+    the call (preview_required=True).
+
+    Called POSITIONALLY by the gate middleware as ``preview_fn(params)`` — a
+    single ``params: dict`` argument, NOT ``**params`` (the same convention
+    as _preview_export_layer).
+
+    Unlike _preview_export_layer (which reuses _get_stage's node-or-file
+    fallback), this preview validates the SAME domain the handler will drive
+    a ROP against: lop_node MUST resolve to a real Houdini node with a
+    stage() method whose composed stage is non-None (a cooked LOP node). A
+    file path or a missing/uncooked node is rejected HERE (raise -> DENY) so
+    the operator is never asked to approve an export the handler would then
+    reject (plan-6/plan-9 fold — preview and handler agree on domain).
+
+    Args:
+        params: dict with keys lop_node, out_path, frame_range (the same
+            params dict the handler will later receive as kwargs).
+
+    Returns:
+        {
+            "out_path": <hou.text.expandString(out_path).replace('\\\\', '/')>,
+            "resolved_format": "usda" | "usdc" | "usdz",
+            "pre_validation": <usd_validate(...) preflight-mode result>,
+            "frame_range": params.get("frame_range"),
+            "driven_via": "usd ROP (/out-context)",
+            "no_world_wrapper": True,
+        }
+
+    Raises:
+        hou.OperationFailed: when lop_node does not resolve to a node, is
+            not a LOP node (no stage() method), or has no composed stage
+            (not cooked).
+        ValueError: propagated from format_for_extension() when out_path's
+            extension is not a recognized USD format — the gate DENIES the
+            call so the operator is never asked to approve an
+            unknown-format export.
+    """
+    lop_node = params["lop_node"]
+    out_path = params["out_path"]
+
+    node = hou.node(lop_node)
+    if node is None:
+        raise hou.OperationFailed(f"LOP node not found: {lop_node}")
+    if not hasattr(node, "stage"):
+        raise hou.OperationFailed(f"{lop_node} is not a LOP node")
+    stage = node.stage()
+    if stage is None:
+        raise hou.OperationFailed(f"{lop_node} has no composed stage (not cooked)")
+
+    expanded = hou.text.expandString(out_path).replace("\\", "/")
+    resolved_format = format_for_extension(expanded)  # ValueError -> gate DENY
+
+    pre = usd_validate(target=lop_node, out_path=out_path)  # preflight mode
+
+    return {
+        "out_path": expanded,
+        "resolved_format": resolved_format,
+        "pre_validation": pre,
+        "frame_range": params.get("frame_range"),
+        "driven_via": "usd ROP (/out-context)",
+        "no_world_wrapper": True,
+    }
+
+
+def usd_export_rop(
+    *,
+    lop_node: str,
+    out_path: str,
+    frame_range: "list | None" = None,
+) -> dict:
+    """Drive the /out `usd` ROP to write lop_node's composed stage to disk. GATED.
+
+    Writes AT THE CURRENT FRAME (frame_range=None -> trange=0) or ACROSS a
+    given [start, end] RANGE (frame_range=[f1, f2] -> trange=1) — NOT a
+    full-time-history flatten (that is usd_export_layer's job). Format is
+    chosen by *out_path*'s file EXTENSION (.usda -> ascii, .usdc/.usd ->
+    crate) — reuses format_for_extension(). Injects NO /World or /root
+    wrapper: the ROP renders lop_node's composed stage as-is.
+
+    Runs an INLINE post-write usd_validate (postwrite mode) after the write
+    and embeds the result under 'validator_post'. A format mismatch between
+    the requested (extension-derived) format and the actual (magic-bytes-
+    derived) format is a HARD failure (ok=False), not a silently-nested
+    validator_post discrepancy (plan-7-cap).
+
+    Returns:
+        On success::
+
+            {
+                "ok": True,
+                "out_path": <expanded out_path>,
+                "format": <format_for_extension(expanded)>,
+                "actual_format": <format_from_magic_bytes(header)>,
+                "validator_post": <usd_validate(...) postwrite-mode result>,
+            }
+
+        On failure (FR-2/FR-5)::
+
+            {"ok": False, "error": "<reason>", "out_path": <written_path or None>}
+
+    Args:
+        lop_node: Houdini LOP node path (e.g. "/stage/sphere1") whose
+            composed stage the ROP will render. Unlike usd_export_layer's
+            node_path, this does NOT fall back to opening a file path — the
+            ROP renders a specific NODE (plan-6/plan-9: the no-file-fallback
+            divergence from usd_export_layer).
+        out_path: Output file path; supports Houdini variable expansions
+            (e.g. "$HIP/out.usdc").
+        frame_range: None for the current-frame-only export (trange=0), or
+            a [start, end] pair of finite numbers (start <= end) for a range
+            export (trange=1). Any other shape is rejected before any ROP
+            is created.
+    """
+    rop = None
+    written_path = None
+    try:
+        # FR-2: reject empty lop_node/out_path INSIDE the try (mirrors the
+        # usd_export_layer green-1 fix — a non-string truthy arg's .strip()
+        # AttributeError must land in the FR-5 envelope below, not leak as
+        # an unhandled exception from a MUTATING handler). This guard fires
+        # BEFORE any hou.node()/ROP lookup, so no ROP can be leaked on this
+        # path.
+        if not lop_node or not lop_node.strip():
+            return {"ok": False, "error": "lop_node must be a non-empty node path"}
+        if not out_path or not out_path.strip():
+            return {"ok": False, "error": "out_path must be a non-empty file path"}
+
+        # frame_range shape guard — BEFORE any hou.node()/ROP creation.
+        if frame_range is not None:
+            if (
+                not isinstance(frame_range, (list, tuple))
+                or len(frame_range) != 2
+                or any(
+                    isinstance(x, bool) or not isinstance(x, (int, float))
+                    for x in frame_range
+                )
+            ):
+                return {
+                    "ok": False,
+                    "error": "frame_range must be null or a [start, end] pair of numbers",
+                }
+            # FOLD new-5-cap: also reject non-finite or reversed ranges.
+            if any(not _math.isfinite(x) for x in frame_range):
+                return {
+                    "ok": False,
+                    "error": (
+                        "frame_range must be a finite [start, end] pair with "
+                        "start <= end"
+                    ),
+                }
+            if frame_range[0] > frame_range[1]:
+                return {
+                    "ok": False,
+                    "error": (
+                        "frame_range must be a finite [start, end] pair with "
+                        "start <= end"
+                    ),
+                }
+
+        # Node validity — the ROP renders a NODE, not a file (plan-6/plan-9
+        # divergence from _get_stage's file-open fallback branch).
+        node = hou.node(lop_node)
+        if node is None:
+            return {"ok": False, "error": f"LOP node not found: {lop_node}"}
+        if not hasattr(node, "stage"):
+            return {"ok": False, "error": f"{lop_node} is not a LOP node (no stage())"}
+        if node.stage() is None:
+            return {
+                "ok": False,
+                "error": f"{lop_node} has no composed stage (not cooked)",
+            }
+
+        expanded = hou.text.expandString(out_path).replace("\\", "/")
+        ext_format = format_for_extension(expanded)  # ValueError -> FR-5 below
+
+        out_dir = _os.path.dirname(expanded)
+        if out_dir:
+            _os.makedirs(out_dir, exist_ok=True)
+
+        out_net = hou.node("/out")
+        if out_net is None:
+            return {"ok": False, "error": "/out context not found"}
+        rop = out_net.createNode("usd", "mcp_usd_rop_export")
+
+        # No source-mode/enable toggle gates loppath on the shipped `usd`
+        # ROP (Phase-0 probe confirmed) — set loppath + lopoutput directly.
+        loppath_parm = rop.parm("loppath")
+        if loppath_parm is None:
+            raise RuntimeError("parm 'loppath' not found on usd ROP")
+        loppath_parm.set(lop_node)
+
+        lopoutput_parm = rop.parm("lopoutput")
+        if lopoutput_parm is None:
+            raise RuntimeError("parm 'lopoutput' not found on usd ROP")
+        lopoutput_parm.set(expanded)
+
+        trange_parm = rop.parm("trange")
+        if frame_range:
+            if trange_parm is not None:
+                trange_parm.set(1)
+            f_tuple = rop.parmTuple("f")
+            if f_tuple is not None:
+                f_tuple.set((frame_range[0], frame_range[1], 1))
+        else:
+            if trange_parm is not None:
+                trange_parm.set(0)
+
+        # No /World or /root wrapper injected — the ROP renders the
+        # composed stage of lop_node as-is (usd-publish-discipline.md).
+
+        exec_parm = rop.parm("execute")
+        if exec_parm is not None:
+            exec_parm.pressButton()
+        else:
+            rop.render()
+
+        errs = rop.errors()
+        if errs:
+            raise RuntimeError("\n".join(errs))
+
+        # The write happened at execute (above) — confirm a file actually
+        # landed BEFORE destroying the ROP or claiming success (plan-5-cap:
+        # a clean cook with errors()==[] but no file is a silent no-op, NOT
+        # a success; written_path is set ONLY once the file is confirmed).
+        file_exists = _os.path.exists(expanded)
+        if file_exists:
+            written_path = expanded
+
+        try:
+            rop.destroy()
+        except Exception:
+            pass
+        rop = None
+
+        if not file_exists:
+            return {
+                "ok": False,
+                "out_path": None,
+                "error": f"ROP cooked without errors but produced no file at {expanded}",
+            }
+
+        # POST-WRITE — a failure here means the file WAS written.
+        with open(expanded, "rb") as fh:
+            header = fh.read(16)
+        actual_format = format_from_magic_bytes(header)  # ValueError -> except below
+
+        validator_post = usd_validate(
+            target=expanded, out_path=out_path, actual_format=actual_format
+        )  # postwrite mode
+
+        if actual_format != ext_format:
+            # plan-7-cap: a format-by-extension mismatch is a HARD failure —
+            # NOT ok=True with the mismatch merely nested in validator_post.
+            return {
+                "ok": False,
+                "out_path": expanded,
+                "error": (
+                    f"format mismatch: requested {ext_format} (by extension) "
+                    f"but ROP wrote {actual_format}"
+                ),
+                "format": ext_format,
+                "actual_format": actual_format,
+                "validator_post": validator_post,
+            }
+
+        return {
+            "ok": True,
+            "out_path": expanded,
+            "format": ext_format,
+            "actual_format": actual_format,
+            "validator_post": validator_post,
+        }
+
+    except Exception as exc:
+        if rop is not None:
+            try:
+                rop.destroy()
+            except Exception:
+                pass
+        if written_path:
+            msg = f"file written to {written_path} but post-write validation failed: {exc}"
+        else:
+            msg = str(exc)
+        _log.warning(
+            "usd_export_rop failed for lop_node=%r out_path=%r: %s",
+            lop_node, out_path, exc,
+        )
+        return {"ok": False, "error": msg, "out_path": written_path}
+
+
+register_handler(
+    "usd_export_rop",
+    usd_export_rop,
+    Capability.MUTATING,
+    preview_fn=_preview_export_rop,
     preview_required=True,
 )
