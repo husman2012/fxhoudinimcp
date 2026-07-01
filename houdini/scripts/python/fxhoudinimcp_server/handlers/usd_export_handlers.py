@@ -921,3 +921,487 @@ register_handler(
     preview_fn=_preview_export_rop,
     preview_required=True,
 )
+
+
+# ---------------------------------------------------------------------------
+# MaterialX guard (mirrors HAS_PXR/_require_pxr) — PP12-112 / pp12-112e
+# ---------------------------------------------------------------------------
+
+try:
+    import MaterialX as mx  # noqa: E402
+    HAS_MTLX = True
+except ImportError:
+    HAS_MTLX = False
+
+from fxhoudinimcp.usd_export_model import MtlxSummary  # noqa: E402
+
+
+def _require_mtlx() -> None:
+    """Raise if the MaterialX module is not available (fail-loud per M-1)."""
+    if not HAS_MTLX:
+        raise hou.OperationFailed(
+            "MaterialX module not available in this Houdini session. "
+            "Ensure you are running a Houdini build with MaterialX support."
+        )
+
+
+def _mtlx_validate(doc) -> "tuple[bool, str]":
+    """Defensively normalize doc.validate() to a (bool, str) pair.
+
+    Houdini's bundled MaterialX Python binds validate() as a (bool, str)
+    tuple (Phase-0 probe, 2026-07-01, MaterialX 1.39.3, confirmed
+    (True, '') on a valid document) -- but this helper also tolerates a
+    bare bool return, in case a different bundled version binds it that
+    way (plan-4 defensive fold).
+    """
+    r = doc.validate()
+    return r if isinstance(r, tuple) else (bool(r), "")
+
+
+def _resolve_node(doc, name: str):
+    """Resolve *name* to a (node_or_None, matches_count, resolved_path_or_None).
+
+    Two forms (FOLD new-1 -- strict, no doc.getDescendant, no ambiguity-by-
+    heuristic):
+
+    (a) QUALIFIED -- "nodegraph/node" (exactly ONE '/'): looks up the
+        nodegraph by name, then the node within it. An invalid qualified
+        form (more than one '/') returns (None, 0, None) -- the caller
+        treats matches_count==0 as "not found".
+    (b) UNQUALIFIED -- collects every node named *name* from doc.getNodes()
+        (top-level) PLUS every nodegraph's getNodes() (in-graph). Returns
+        (None, 0, None) if no match, (None, N, None) if N>1 matches
+        (ambiguous -- the caller fails loud), or (node, 1, <canonical path>)
+        if exactly one match.
+
+    GREEN-FIX (green-1): resolved_path is ALWAYS a path CANONICALIZED by
+    this function itself -- "<nodegraph.getName()>/<node.getName()>" for an
+    in-graph node, or bare "<node.getName()>" for a genuinely top-level
+    node -- never node.getNamePath() (whose qualification behavior is
+    binding-dependent and was observed to sometimes omit the nodegraph
+    prefix even for an in-graph node). This makes resolved_path an
+    unambiguous, self-consistent key we fully control, so the post-write
+    round-trip re-resolution (new-2, see mtlx_edit) can do a PURE DIRECT
+    LOOKUP by this path against the freshly re-parsed document with NO
+    search/fallback branch -- PASS 1's uniqueness proof (against `doc`)
+    stays valid against `doc2` (the re-parsed doc) because both sides
+    agree on the same canonical addressing scheme, not on a value
+    (getNamePath()) that PASS 1 never controlled.
+
+    The caller uses matches_count for the 0/1/>1 fail-loud decision
+    (plan-2) and resolved_path for the post-write round-trip re-resolution
+    (new-2 -- re-resolve by the RECORDED path, never by re-running a
+    possibly-ambiguous name search).
+    """
+    if "/" in name:
+        parts = name.split("/")
+        if len(parts) != 2:
+            return None, 0, None
+        graph_name, node_name = parts
+        ng = doc.getNodeGraph(graph_name)
+        node = ng.getNode(node_name) if ng else None
+        if node is None:
+            return None, 0, None
+        return node, 1, f"{graph_name}/{node.getName()}"
+
+    matches = []  # list of (node, canonical_rpath)
+    for n in doc.getNodes():
+        if n.getName() == name:
+            matches.append((n, n.getName()))
+    for ng in doc.getNodeGraphs():
+        for n in ng.getNodes():
+            if n.getName() == name:
+                matches.append((n, f"{ng.getName()}/{n.getName()}"))
+
+    if len(matches) == 0:
+        return None, 0, None
+    if len(matches) > 1:
+        return None, len(matches), None
+    node, canonical_rpath = matches[0]
+    return node, 1, canonical_rpath
+
+
+def _validate_edits_shape(edits) -> "tuple[bool, str]":
+    """Shared shape guard run by BOTH the preview and the handler (plan-7).
+
+    v1 accepts STRING-valued edits ONLY (plan-6/new-3 -- avoids a numeric
+    round-trip false-fail when MaterialX's own serialization of a number
+    differs from Python's str()). Returns (True, "") on a well-formed
+    edits list, else (False, "<reason>").
+    """
+    if not isinstance(edits, (list, tuple)) or len(edits) == 0:
+        return False, "edits must be a non-empty list of {node,input,value} objects"
+
+    for e in edits:
+        if not isinstance(e, dict) or not all(k in e for k in ("node", "input", "value")):
+            return False, "each edit needs node/input/value keys"
+        if not isinstance(e["value"], str):
+            return False, (
+                f"edit value for {e.get('node')!r}.{e.get('input')!r} must be a "
+                f"string (v1 supports string-valued edits only, per spec.md "
+                f"section 4.2 texture-path examples); got "
+                f"{type(e['value']).__name__}"
+            )
+
+    return True, ""
+
+
+# ---------------------------------------------------------------------------
+# mtlx_inspect (READ-ONLY, UNGATED) — PP12-112 / pp12-112e
+# ---------------------------------------------------------------------------
+
+def mtlx_inspect(*, mtlx_path_or_doc: str) -> dict:
+    """Parse a .mtlx via the MaterialX Python API and return a structural summary.
+
+    v1 accepts a FILE PATH only (with Houdini $-var expansion) — an inline
+    MaterialX doc-string is NOT supported (plan-8; the docstring says so
+    explicitly so the parameter name is not misleading, even though it is
+    named mtlx_path_or_doc per spec.md section 4.1).
+
+    Returns the MtlxSummary shape on success::
+
+        {
+            "ok": True,
+            "nodegraphs": [str, ...],
+            "surface_nodes": [str, ...],
+            "inputs_with_abs_paths": [str, ...],
+            "validate": {"ok": bool, "errors": [str, ...]},
+        }
+
+    or an FR-2/FR-5 error shape on failure::
+
+        {"ok": False, "error": "<reason>"}
+
+    Args:
+        mtlx_path_or_doc: A .mtlx file path (v1: path only); supports
+            Houdini variable expansions such as ``"$HIP/material.mtlx"``.
+    """
+    if not mtlx_path_or_doc or not mtlx_path_or_doc.strip():
+        return {"ok": False, "error": "mtlx_path_or_doc must be a non-empty file path"}
+
+    try:
+        _require_mtlx()
+
+        expanded = hou.text.expandString(mtlx_path_or_doc)
+        doc = mx.createDocument()
+        mx.readFromXmlFile(doc, expanded)  # raises on parse/missing-file -> FR-5
+
+        nodegraphs = [ng.getName() for ng in doc.getNodeGraphs()]
+
+        nodes = list(doc.getNodes())
+        for ng in doc.getNodeGraphs():
+            nodes.extend(ng.getNodes())
+
+        surface_nodes = [n.getName() for n in nodes if n.getType() == "surfaceshader"]
+
+        inputs_with_abs_paths = []
+        for n in nodes:
+            for inp in n.getInputs():
+                if inp.getType() == "filename":
+                    val = inp.getValueString()
+                    if val and _os.path.isabs(val):
+                        inputs_with_abs_paths.append(inp.getName())
+
+        valid, message = _mtlx_validate(doc)
+
+        summary = MtlxSummary(
+            nodegraphs=nodegraphs,
+            surface_nodes=surface_nodes,
+            inputs_with_abs_paths=inputs_with_abs_paths,
+            validate_ok=bool(valid),
+            validate_errors=([message] if (not valid and message) else []),
+        )
+        return {"ok": True, **summary.to_dict()}
+
+    except Exception as exc:
+        _log.warning("mtlx_inspect failed for mtlx_path_or_doc=%r: %s", mtlx_path_or_doc, exc)
+        return {"ok": False, "error": str(exc)}
+
+
+register_handler("mtlx_inspect", mtlx_inspect, Capability.READONLY)
+
+
+# ---------------------------------------------------------------------------
+# mtlx_edit (GATED — Capability.MUTATING) + _preview_mtlx_edit
+# ---------------------------------------------------------------------------
+#
+# THIRD mutating tool of the usd_export/MaterialX family (pp12-112e, plan
+# rev3). Applies node/input value edits via the MaterialX API
+# (Input.setValueString) and writes with mx.writeToXmlFile — NEVER regex on
+# the XML (usd-publish-discipline.md). Two-pass resolve-then-write: PASS 1
+# resolves EVERY edit (no mutation) and rejects the WHOLE call if any edit
+# fails to resolve (node not found / ambiguous / input not found / duplicate
+# target) BEFORE any write; PASS 2 applies + writes only once every edit is
+# known-good. A post-write round-trip re-read confirms each edit's value
+# actually landed, re-resolving by the RECORDED node path captured during
+# PASS 1 (new-2 — never by re-running a possibly-ambiguous name search
+# against the re-read document).
+
+
+def _preview_mtlx_edit(params: dict) -> dict:
+    """Return the 109-gate approval payload for mtlx_edit WITHOUT writing.
+
+    READ-ONLY: resolves each edit's target (existence + ambiguity) against
+    the parsed source document and reports a pre-validation, but does NOT
+    apply or write anything. Called POSITIONALLY by the gate middleware as
+    ``preview_fn(params)`` — a single ``params: dict`` argument (mirrors
+    _preview_export_rop's convention).
+
+    FOLD plan-7 (preview/handler domain parity): runs the SAME
+    _validate_edits_shape guard the handler runs; a shape failure returns an
+    operator-visible rejection payload rather than proceeding as if the
+    edits were well-formed.
+
+    FOLD plan-1 (do NOT rely on an unverified raise->DENY for a MaterialX
+    parse failure): CATCHES the readFromXmlFile failure itself and returns
+    an operator-visible ``source_parseable: False`` payload, rather than
+    betting on the gate's raise->DENY mechanism for an arbitrary pybind
+    exception.
+
+    _require_mtlx() still raises (propagates) when MaterialX is genuinely
+    unavailable -- this reuses the SAME raise->DENY path _preview_export_rop
+    already relies on for its own ValueError/hou.OperationFailed cases, so
+    it is not a new, unverified claim.
+
+    Args:
+        params: dict with keys mtlx_path, out_path, edits (the same params
+            dict the handler will later receive as kwargs).
+
+    Returns:
+        A shape-rejection payload (edits_shape_ok=False), a parse-failure
+        payload (source_parseable=False), or the full approval payload
+        (source_parseable=True, edits_shape_ok=True, edits_preview=[...],
+        pre_validation={...}).
+
+    Raises:
+        hou.OperationFailed: propagated from _require_mtlx() when
+            MaterialX is unavailable -- the gate DENIES the call.
+    """
+    _require_mtlx()
+
+    mtlx_path = params["mtlx_path"]
+    out_path = params["out_path"]
+    edits = params.get("edits")
+
+    shape_ok, shape_error = _validate_edits_shape(edits)
+    if not shape_ok:
+        return {
+            "edits_shape_ok": False,
+            "shape_error": shape_error,
+            "mtlx_path": mtlx_path,
+            "out_path": out_path,
+            "edits": edits,
+        }
+
+    expanded_src = hou.text.expandString(mtlx_path)
+    expanded_out = hou.text.expandString(out_path)
+
+    doc = mx.createDocument()
+    try:
+        mx.readFromXmlFile(doc, expanded_src)
+    except Exception as exc:
+        return {
+            "source": expanded_src,
+            "out_path": expanded_out,
+            "source_parseable": False,
+            "parse_error": str(exc),
+            "edits": edits,
+            "no_regex": True,
+        }
+
+    edits_preview = []
+    for e in edits:
+        node, count, _rpath = _resolve_node(doc, e["node"])
+        resolved = count == 1
+        ambiguous = count > 1
+        inp = node.getInput(e["input"]) if (resolved and node is not None) else None
+        edits_preview.append({
+            "node": e["node"],
+            "input": e["input"],
+            "value": e["value"],
+            "exists": bool(resolved and inp is not None),
+            "ambiguous": ambiguous,
+            "current_value": (inp.getValueString() if inp is not None else None),
+        })
+
+    valid, message = _mtlx_validate(doc)
+
+    return {
+        "out_path": expanded_out,
+        "source": expanded_src,
+        "source_parseable": True,
+        "edits": edits,
+        "edits_shape_ok": True,
+        "edits_preview": edits_preview,
+        "pre_validation": {"ok": bool(valid), "errors": ([message] if (not valid and message) else [])},
+        "no_regex": True,
+    }
+
+
+def mtlx_edit(*, mtlx_path: str, out_path: str, edits: "list | None" = None) -> dict:
+    """Apply node/input value edits to a .mtlx and write via the MaterialX API. GATED.
+
+    Existing inputs ONLY -- never calls addInput to create a new one; an
+    edit targeting a non-existent input is rejected. Two-pass
+    resolve-then-write (PASS 1 resolves every edit with NO mutation; PASS 2
+    applies+writes only if every edit resolved cleanly) so an invalid edit
+    anywhere in the list blocks the write of every edit in the call,
+    including otherwise-valid ones. A post-write round-trip re-read
+    (re-resolved by the RECORDED node path, not a name search) confirms
+    each edit's value actually landed before reporting success.
+
+    Returns:
+        On success::
+
+            {
+                "ok": True,
+                "out_path": <expanded out_path>,
+                "edits_applied": <int>,
+                "validate": {"ok": bool, "errors": [str, ...]},
+            }
+
+        On failure (FR-2/FR-5)::
+
+            {"ok": False, "error": "<reason>"}
+
+    Args:
+        mtlx_path: Source .mtlx file path; supports Houdini variable
+            expansions (e.g. "$HIP/source.mtlx").
+        out_path: Output .mtlx file path; supports Houdini variable
+            expansions (e.g. "$HIP/edited.mtlx").
+        edits: A non-empty list of {"node": str, "input": str, "value": str}
+            dicts. "node" may be unqualified (must resolve unambiguously) or
+            qualified as "nodegraph/node". "value" MUST be a string (v1).
+    """
+    try:
+        if not mtlx_path or not mtlx_path.strip():
+            return {"ok": False, "error": "mtlx_path must be a non-empty file path"}
+        if not out_path or not out_path.strip():
+            return {"ok": False, "error": "out_path must be a non-empty file path"}
+
+        shape_ok, shape_error = _validate_edits_shape(edits)
+        if not shape_ok:
+            return {"ok": False, "error": shape_error}
+
+        _require_mtlx()
+
+        expanded_src = hou.text.expandString(mtlx_path)
+        expanded_out = hou.text.expandString(out_path)
+
+        doc = mx.createDocument()
+        mx.readFromXmlFile(doc, expanded_src)  # raises on parse/missing-file -> FR-5
+
+        # PASS 1: resolve ALL edits (no mutation).
+        resolved_targets = []  # list of (rpath, input_name, value, inp)
+        # GREEN-FIX (green-2): dedup key is the CANONICAL (rpath, input_name)
+        # pair, not id(inp). Now that _resolve_node always returns a
+        # canonicalized rpath ("<nodegraph>/<node>" or bare "<node>") that
+        # this function fully controls, two edits resolving to the same
+        # physical target always produce the identical (rpath, input_name)
+        # pair -- a string-keyed dedup is a more defensible, deterministic
+        # contract than binding-object identity (id(inp) depends on
+        # whether the MaterialX Python binding returns a fresh wrapper
+        # object per getInput() call, which is an implementation detail we
+        # do not want to depend on).
+        seen_targets = set()  # {(rpath, input_name)}
+        for e in edits:
+            node, count, rpath = _resolve_node(doc, e["node"])
+            if count == 0:
+                return {
+                    "ok": False,
+                    "error": f"node {e['node']!r} not found in {mtlx_path!r}",
+                }
+            if count > 1:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"node {e['node']!r} is ambiguous (found in {count} "
+                        f'nodegraphs); qualify it as "nodegraph/node"'
+                    ),
+                }
+            inp = node.getInput(e["input"])
+            if inp is None:
+                return {
+                    "ok": False,
+                    "error": f"input {e['input']!r} not found on node {e['node']!r}",
+                }
+
+            target_key = (rpath, e["input"])
+            if target_key in seen_targets:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"duplicate edit target {rpath}.{e['input']} (two edits "
+                        f"resolve to the same input)"
+                    ),
+                }
+            seen_targets.add(target_key)
+            resolved_targets.append((rpath, e["input"], e["value"], inp))
+
+        # PASS 2: apply + write (only reached if every edit resolved cleanly).
+        for _rpath, _input_name, value, inp in resolved_targets:
+            inp.setValueString(value)  # NO regex; value is a str, no coercion
+
+        out_dir = _os.path.dirname(expanded_out)
+        if out_dir:
+            _os.makedirs(out_dir, exist_ok=True)
+
+        mx.writeToXmlFile(doc, expanded_out)
+
+        # Post-write round-trip verify -- re-resolve by the RECORDED rpath
+        # (new-2), never by re-running the (possibly ambiguous) name search.
+        #
+        # GREEN-FIX (green-1): rpath is now a path CANONICALIZED by
+        # _resolve_node itself (never node.getNamePath(), whose
+        # qualification behavior is binding-dependent) -- so this is a
+        # PURE DIRECT LOOKUP with NO search/fallback branch. PASS 1's
+        # uniqueness proof (against `doc`, pre-write) stays valid against
+        # `doc2` (the freshly re-parsed post-write document) because both
+        # sides address nodes via the SAME canonical scheme this function
+        # controls end to end: "<nodegraph>/<node>" for an in-graph node,
+        # bare "<node>" for a top-level node. A nodegraph-wide scan here
+        # would be unsafe -- it could match an unrelated same-named node in
+        # a DIFFERENT nodegraph of doc2 (the exact red-3 decoy scenario),
+        # silently verifying against the wrong node.
+        doc2 = mx.createDocument()
+        mx.readFromXmlFile(doc2, expanded_out)
+        for rpath, input_name, value, _inp in resolved_targets:
+            node2 = None
+            if "/" in rpath:
+                graph_name, node_name = rpath.split("/")
+                ng2 = doc2.getNodeGraph(graph_name)
+                node2 = ng2.getNode(node_name) if ng2 else None
+            else:
+                node2 = doc2.getNode(rpath)
+            inp2 = node2.getInput(input_name) if node2 is not None else None
+            if inp2 is None or inp2.getValueString() != value:
+                got = inp2.getValueString() if inp2 is not None else None
+                return {
+                    "ok": False,
+                    "error": (
+                        f"edit to {rpath}.{input_name} did not round-trip "
+                        f"(expected {value!r}, got {got!r})"
+                    ),
+                }
+
+        valid2, message2 = _mtlx_validate(doc2)
+
+        return {
+            "ok": True,
+            "out_path": expanded_out,
+            "edits_applied": len(edits),
+            "validate": {"ok": bool(valid2), "errors": ([message2] if (not valid2 and message2) else [])},
+        }
+
+    except Exception as exc:
+        _log.warning("mtlx_edit failed for mtlx_path=%r out_path=%r: %s", mtlx_path, out_path, exc)
+        return {"ok": False, "error": str(exc)}
+
+
+register_handler(
+    "mtlx_edit",
+    mtlx_edit,
+    Capability.MUTATING,
+    preview_fn=_preview_mtlx_edit,
+    preview_required=True,
+)

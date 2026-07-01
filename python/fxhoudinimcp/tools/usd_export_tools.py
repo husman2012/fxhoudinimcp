@@ -227,3 +227,91 @@ async def houdini_usd_export_rop(
             "frame_range": frame_range,
         },
     )
+
+
+@mcp.tool(meta={"require_approval": False})
+async def houdini_mtlx_inspect(
+    ctx: Context,
+    mtlx_path_or_doc: str,
+) -> dict:
+    """Parse a .mtlx via the MaterialX Python API and return a structural summary.
+
+    READ-ONLY, UNGATED (require_approval=False) — mirrors
+    houdini_usd_inspect_layer's convention exactly. v1 accepts a FILE PATH
+    only (with Houdini $-var expansion) — an inline MaterialX doc-string is
+    NOT supported, even though the parameter is named ``mtlx_path_or_doc``
+    per spec.md §4.1.
+
+    Returns the MtlxSummary shape on success::
+
+        {
+            "ok": True,
+            "nodegraphs": [str, ...],
+            "surface_nodes": [str, ...],
+            "inputs_with_abs_paths": [str, ...],
+            "validate": {"ok": bool, "errors": [str, ...]},
+        }
+
+    or an FR-2/FR-5 error shape on failure::
+
+        {"ok": False, "error": "<reason>"}
+
+    Args:
+        ctx: MCP lifespan context — injected by FastMCP; hidden from client schema.
+        mtlx_path_or_doc: A .mtlx file path; supports Houdini variable
+            expansions such as ``"$HIP/material.mtlx"``.
+    """
+    # Access _get_bridge through the module reference so that
+    # `patch("fxhoudinimcp.server._get_bridge", ...)` intercepts it correctly
+    # in tests (a local import would cache the original function object).
+    bridge = _fxserver._get_bridge(ctx)
+    return await bridge.execute(
+        "mtlx_inspect",
+        {"mtlx_path_or_doc": mtlx_path_or_doc},
+    )
+
+
+@mcp.tool(meta={"require_approval": True})
+async def houdini_mtlx_edit(
+    ctx: Context,
+    mtlx_path: str,
+    edits: list,
+    out_path: str,
+) -> dict:
+    """Apply node/input value edits to a .mtlx and write via the MaterialX API. GATED.
+
+    Third mutating tool of the usd_export/MaterialX family
+    (require_approval=True, PP12-109 security gate). Existing inputs ONLY —
+    never creates a new input. Edits are applied via the MaterialX API
+    (Input.setValueString) and written with mx.writeToXmlFile — NEVER regex
+    on the XML. Pre-flight resolution (existence/ambiguity per edit) is
+    shown in the gate's preview before approval; a post-write round-trip
+    verify + usd-style validate is embedded in the result.
+
+    A SINGLE bridge.execute call — the wrapper performs no result
+    interpretation and returns bridge.execute's result VERBATIM, including a
+    pending-approval / preview response shape from the 109 gate (that is a
+    normal, valid return value, not an error).
+
+    Args:
+        ctx: MCP lifespan context — injected by FastMCP; hidden from client schema.
+        mtlx_path: Source .mtlx file path; supports Houdini variable
+            expansions (e.g. "$HIP/source.mtlx").
+        edits: A non-empty list of {"node": str, "input": str, "value": str}
+            dicts. "node" may be unqualified (must resolve unambiguously) or
+            qualified as "nodegraph/node". "value" MUST be a string (v1).
+        out_path: Output .mtlx file path; supports Houdini variable
+            expansions (e.g. "$HIP/edited.mtlx").
+    """
+    # Access _get_bridge through the module reference so that
+    # `patch("fxhoudinimcp.server._get_bridge", ...)` intercepts it correctly
+    # in tests (a local import would cache the original function object).
+    bridge = _fxserver._get_bridge(ctx)
+    return await bridge.execute(
+        "mtlx_edit",
+        {
+            "mtlx_path": mtlx_path,
+            "out_path": out_path,
+            "edits": edits,
+        },
+    )
