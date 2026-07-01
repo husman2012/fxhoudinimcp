@@ -1,7 +1,14 @@
-"""MCP wrappers: houdini_cop_onnx_list_models, houdini_cop_onnx_inspect_model.
+"""MCP wrappers: houdini_cop_onnx_list_models, houdini_cop_onnx_inspect_model,
+houdini_cop_onnx_setup_node, houdini_cop_onnx_set_provider.
 
-Both are READ-ONLY, UNGATED (require_approval=False, Capability.READONLY
+houdini_cop_onnx_list_models / houdini_cop_onnx_inspect_model are
+READ-ONLY, UNGATED (require_approval=False, Capability.READONLY
 handler-side) — the Copernicus-ONNX inspection surface (PP12-113 PR-2).
+
+houdini_cop_onnx_setup_node / houdini_cop_onnx_set_provider are GATED
+(require_approval=True, Capability.MUTATING handler-side) — the first two
+mutating tools of the cop_onnx family (PP12-113 PR-3, PP12-109 security
+gate).
 
 houdini_cop_onnx_list_models   — enumerate .onnx files under configured or
                                   given filesystem roots (path/size/mtime).
@@ -15,6 +22,20 @@ houdini_cop_onnx_inspect_model — read a model's input/output tensor
                                   transient node — see the handler
                                   module's docstring for the full mechanism
                                   + the Phase-0 findings that shape it.
+houdini_cop_onnx_setup_node    — create a PERSISTENT cop/onnx node under a
+                                  caller-given COP-network parent, set its
+                                  modelfile, press setupshapes, optionally
+                                  set vertical-flip, and return the bound
+                                  input/output tensor mapping. GATED — the
+                                  node PERSISTS (it is the agent's node,
+                                  not a scratch node).
+houdini_cop_onnx_set_provider  — set the node's Execution Provider parm
+                                  (the platform-filtered lowercase menu —
+                                  read menuItems() at RUNTIME, never
+                                  hardcoded) and report available_providers
+                                  + will_bind. GATED. An unavailable
+                                  request falls back to automatic + a
+                                  warning, does NOT error.
 
 Each wrapper delegates to the correspondingly named handler registered on
 the Houdini side via bridge.execute. No domain logic lives here.
@@ -23,6 +44,7 @@ Contract: imports NO hou, NO pxr, NO onnx — this module must be importable
 off-DCC for the wrapper pytest suite (CL-015).
 
 PP12-113 / pp12-113b (houdini_cop_onnx_list_models, houdini_cop_onnx_inspect_model)
+PP12-113 / pp12-113c (houdini_cop_onnx_setup_node, houdini_cop_onnx_set_provider)
 """
 from __future__ import annotations
 
@@ -106,4 +128,94 @@ async def houdini_cop_onnx_inspect_model(
     return await bridge.execute(
         "cop_onnx_inspect_model",
         {"model_path": model_path, "node_path": node_path},
+    )
+
+
+@mcp.tool(meta={"require_approval": True})
+async def houdini_cop_onnx_setup_node(
+    ctx: Context,
+    parent_path: str,
+    model_path: str,
+    node_name: str = "agent_onnx",
+    setup_shapes: bool = True,
+    flip_input: "bool | None" = None,
+    flip_output: "bool | None" = None,
+) -> dict:
+    """Create a PERSISTENT cop/onnx node under parent_path, configured from model_path. GATED — mutating.
+
+    First mutating tool of the cop_onnx family (require_approval=True,
+    PP12-109 security gate). Unlike houdini_cop_onnx_inspect_model's
+    scratch-node mechanism (always destroyed), the node this tool creates
+    PERSISTS — it is the agent's node, not a transient inspection scratch.
+
+    Sets modelfile, presses setupshapes (NEVER 'reload' — houdini-001),
+    optionally sets the per-instance input_flip{i}/output_flip{i} parms,
+    then returns the bound input/output tensor mapping (name/shape/dtype +
+    cop_input_index / cop_plane).
+
+    A SINGLE bridge.execute call — the wrapper performs no result
+    interpretation and returns bridge.execute's result VERBATIM, including a
+    pending-approval / preview response shape from the 109 gate (that is a
+    normal, valid return value, not an error).
+
+    Args:
+        ctx: MCP lifespan context — injected by FastMCP; hidden from client schema.
+        parent_path: Path to an existing COP network (a copnet, or any node
+            whose childTypeCategory() is Cop) the onnx node is created
+            under.
+        model_path: Path to the .onnx file (Houdini-expandable).
+        node_name: Name for the created node. Defaults to "agent_onnx".
+        setup_shapes: When True (default), press setupshapes after setting
+            modelfile so the tensor mapping is populated.
+        flip_input: When not None, sets every input-instance flip parm
+            input_flip{i} to int(flip_input).
+        flip_output: When not None, sets every output-instance flip parm
+            output_flip{i} to int(flip_output).
+    """
+    # Access _get_bridge through the module reference so that
+    # `patch("fxhoudinimcp.server._get_bridge", ...)` intercepts it correctly
+    # in tests (a local import would cache the original function object).
+    bridge = _fxserver._get_bridge(ctx)
+    return await bridge.execute(
+        "cop_onnx_setup_node",
+        {
+            "parent_path": parent_path,
+            "model_path": model_path,
+            "node_name": node_name,
+            "setup_shapes": setup_shapes,
+            "flip_input": flip_input,
+            "flip_output": flip_output,
+        },
+    )
+
+
+@mcp.tool(meta={"require_approval": True})
+async def houdini_cop_onnx_set_provider(
+    ctx: Context,
+    node_path: str,
+    provider: str,
+) -> dict:
+    """Set the onnx node's Execution Provider parm. GATED — mutating.
+
+    Second mutating tool of the cop_onnx family (require_approval=True,
+    PP12-109 security gate). Reads the RUNTIME, platform-filtered
+    'provider' menu (never hardcoded) and reports available_providers +
+    will_bind. An unavailable request NEVER errors — it falls back to
+    'automatic' (or the first available provider) with a warning.
+
+    A SINGLE bridge.execute call — the wrapper performs no result
+    interpretation and returns bridge.execute's result VERBATIM, including a
+    pending-approval / preview response shape from the 109 gate (that is a
+    normal, valid return value, not an error). The wrapper does NOT
+    validate or pre-filter `provider` — that is the handler's job.
+
+    Args:
+        ctx: MCP lifespan context — injected by FastMCP; hidden from client schema.
+        node_path: Path to an existing onnx node.
+        provider: The requested Execution Provider token (any case).
+    """
+    bridge = _fxserver._get_bridge(ctx)
+    return await bridge.execute(
+        "cop_onnx_set_provider",
+        {"node_path": node_path, "provider": provider},
     )

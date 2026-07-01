@@ -554,3 +554,85 @@ def contract_from_setup_shapes(
         loadable=True,
         error=None,
     )
+
+
+# ---------------------------------------------------------------------------
+# choose_provider — PP12-113 PR-3
+# ---------------------------------------------------------------------------
+
+def choose_provider(requested: str, available: List[str]) -> tuple:
+    """Pure requested/available Execution Provider -> (will_bind, warning) mapping.
+
+    APPENDED for PP12-113 PR-3 (cop_onnx_set_provider). Pure — never touches
+    hou/Qt/pxr. The HANDLER is responsible for reading the onnx node's
+    ``provider`` parm's ``menuItems()`` at RUNTIME (platform-filtered,
+    lowercase) and passing that list in as ``available``; this function only
+    maps a requested token onto the runtime-available set.
+
+    Locked contract (plan pp12-113c lockedFieldContract, PLAN-REVIEW FOLD
+    m2-provider-edge):
+
+    - ``requested`` (case-INSENSITIVE) IS in ``available``
+        -> ``(requested.lower(), None)`` — no warning.
+    - ``requested`` NOT in ``available`` AND ``'automatic'`` IS in ``available``
+        -> ``('automatic', <non-empty warning str>)`` — the safe fallback.
+    - ``requested`` NOT in ``available`` AND ``'automatic'`` NOT in ``available``
+        -> ``(available[0], <non-empty warning str>)`` — first-available fallback.
+    - ``available == []`` (the onnx node exposes NO Execution Provider
+      options at all) -> raises ``ValueError``. This is the ONLY raise case.
+
+    This function NEVER raises merely because ``requested`` is unavailable
+    (FR-4) — raising is reserved exclusively for the ``available == []``
+    case (an onnx node with zero provider menu items to choose from).
+
+    Parameters
+    ----------
+    requested : str
+        The caller-requested provider token (any case; matched
+        case-insensitively against ``available``).
+    available : list[str]
+        The RUNTIME, platform-filtered ``menuItems()`` list read off the
+        onnx node's ``provider`` parm (e.g.
+        ``['automatic', 'cpu', 'cuda', 'directml']`` on Windows — no
+        ``coreml``). Lowercase tokens, per the live Houdini 21 probe.
+
+    Returns
+    -------
+    tuple[str, str | None]
+        ``(will_bind, warning)`` — ``will_bind`` is always a member of
+        ``available`` (never a fabricated token); ``warning`` is ``None``
+        exactly when ``requested`` matched directly, else a non-empty
+        human-readable string.
+
+    Raises
+    ------
+    ValueError
+        When ``available`` is empty — there is nothing to bind to.
+    """
+    if not available:
+        raise ValueError(
+            "choose_provider: `available` is empty — the onnx node exposes "
+            "no Execution Provider options"
+        )
+
+    requested_lower = requested.strip().lower() if requested else ""
+    available_lower = [a.lower() for a in available]
+
+    if requested_lower in available_lower:
+        # Bind the lowercase match exactly as it appears in `available`.
+        matched = available_lower[available_lower.index(requested_lower)]
+        return (matched, None)
+
+    if "automatic" in available_lower:
+        warning = (
+            f"provider {requested!r} not available on this platform "
+            f"(available: {available!r}); fell back to automatic"
+        )
+        return ("automatic", warning)
+
+    fallback = available[0]
+    warning = (
+        f"provider {requested!r} not available on this platform "
+        f"(available: {available!r}); fell back to {fallback!r}"
+    )
+    return (fallback, warning)

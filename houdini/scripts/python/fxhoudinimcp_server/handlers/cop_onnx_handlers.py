@@ -171,7 +171,7 @@ if _PY not in _sys.path:
 
 import hou  # noqa: E402  (hython / Houdini-side interpreter only)
 from fxhoudinimcp_server.dispatcher import Capability, register_handler  # noqa: E402
-from fxhoudinimcp.cop_onnx_model import contract_from_setup_shapes  # noqa: E402
+from fxhoudinimcp.cop_onnx_model import choose_provider, contract_from_setup_shapes  # noqa: E402
 
 _log = _logging.getLogger(__name__)
 
@@ -597,3 +597,462 @@ def cop_onnx_inspect_model(
 
 
 register_handler("cop_onnx_inspect_model", cop_onnx_inspect_model, Capability.READONLY)
+
+
+# ---------------------------------------------------------------------------
+# cop_onnx_setup_node (GATED — Capability.MUTATING) + _preview_setup_node
+# cop_onnx_set_provider (GATED — Capability.MUTATING) + _preview_set_provider
+#
+# PP12-113 PR-3 — the first two GATED (109-approval) tools of the
+# Copernicus-ONNX surface. Grounded on the SHIPPED 112 GATED pattern
+# (usd_export_handlers.py usd_export_rop / _preview_export_rop: keyword-only
+# handler + POSITIONAL _preview_X(params: dict) preview_fn +
+# register_handler(cmd, fn, Capability.MUTATING, preview_fn=_preview_X,
+# preview_required=True)).
+#
+# Phase-0 hython probe (2026-07-01, live Houdini 21.0.729) confirmed:
+#   - After setupshapes, node_inputs == model_inputs and node_outputs ==
+#     model_outputs, 1:1 (confirmed on both identity_dynamic.onnx [1 in/1
+#     out] and multi_input.onnx [2 in/1 out]).
+#   - input_flip{i}/output_flip{i} parms exist per input/output instance;
+#     setting input_flip1 to 1 sticks and round-trips (.eval() == 1).
+#   - Parent validation: a copnet's OWN type().category() is "Object" (the
+#     /obj context) — NOT "Cop". The correct non-mutating check is
+#     parent.childTypeCategory() == hou.copNodeTypeCategory() (confirmed:
+#     True for a copnet, False for /obj itself and for a geo SOP network).
+#     Critically, createNode('onnx') under a NON-cop parent (e.g. a geo SOP
+#     network) can SILENTLY SUCCEED — Houdini resolves the bare name
+#     'onnx' to an UNRELATED Sop/onnx node type under a SOP context. Relying
+#     on createNode() raising as the parent-validation signal is THEREFORE
+#     WRONG; childTypeCategory() is the only reliable non-mutating check.
+#   - provider.set('cuda') (lowercase) accepts and sticks; menuItems() on
+#     this Windows box == ('automatic', 'cpu', 'cuda', 'directml') (no
+#     coreml), menuLabels() == ('Automatic', 'CPU', 'CUDA', 'Direct ML').
+#   - The created node PERSISTS (node.path() resolves to a live node) —
+#     confirmed after the probe script returned without destroying it
+#     until an explicit cleanup step.
+#
+# houdini-001 (catalog): NEVER press 'reload' on a cop/onnx node — only
+# 'setupshapes'. Both handlers below press setupshapes only, matching
+# cop_onnx_inspect_model's already-proven-safe pattern.
+
+
+def _read_bound_tensors(onnx_node: "hou.Node") -> "tuple[list, list]":
+    """Read the bound input/output tensor mapping off a CONFIGURED onnx node.
+
+    NEW additive-only helper (PP12-113 PR-3) — used by cop_onnx_setup_node.
+    Does NOT refactor cop_onnx_inspect_model (PR-2's read path is
+    BYTE-UNCHANGED; this is a separate, purpose-built reader for the
+    setup_node return shape, which needs cop_input_index/cop_plane in
+    addition to name/shape/dtype).
+
+    Grounded on the live Phase-0 probe: after setupshapes, node_inputs ==
+    model_inputs and node_outputs == model_outputs, 1:1. Reads:
+      - input_tensors[i]  : name=model_input_name{i}, shape=normalized
+                             model_input_shape{i}{d}, dtype='float32'
+                             (synthesized — cop/onnx exposes no dtype
+                             field, per cop_onnx_inspect_model's module
+                             docstring), cop_input_index=i (1-based, LIVE
+                             from model_inputs.eval()).
+      - output_tensors[i] : name=model_output_name{i}, shape, dtype,
+                             cop_plane=node_output_name{i} (the LIVE
+                             'n_'-prefixed COP output-plane token read
+                             directly off the node — never fabricated or
+                             hardcoded).
+
+    Args:
+        onnx_node: A cop/onnx node that has ALREADY had setupshapes
+            pressed against a real modelfile (i.e. model_inputs/
+            model_outputs are populated).
+
+    Returns:
+        (input_tensors, output_tensors) — two lists of plain dicts.
+    """
+    n_inputs = onnx_node.parm("model_inputs").eval()
+    n_outputs = onnx_node.parm("model_outputs").eval()
+
+    input_tensors: list = []
+    for i in range(1, n_inputs + 1):
+        name_parm = onnx_node.parm(f"model_input_name{i}")
+        name = name_parm.eval() if name_parm is not None else f"input{i}"
+        shape = _normalize_shape_dims(onnx_node, "input", i)
+        input_tensors.append({
+            "name": name,
+            "shape": shape,
+            "dtype": _SYNTHESIZED_DTYPE,
+            "cop_input_index": i,
+        })
+
+    output_tensors: list = []
+    for i in range(1, n_outputs + 1):
+        name_parm = onnx_node.parm(f"model_output_name{i}")
+        name = name_parm.eval() if name_parm is not None else f"output{i}"
+        shape = _normalize_shape_dims(onnx_node, "output", i)
+        cop_plane_parm = onnx_node.parm(f"node_output_name{i}")
+        cop_plane = cop_plane_parm.eval() if cop_plane_parm is not None else name
+        output_tensors.append({
+            "name": name,
+            "shape": shape,
+            "dtype": _SYNTHESIZED_DTYPE,
+            "cop_plane": cop_plane,
+        })
+
+    return input_tensors, output_tensors
+
+
+def _preview_setup_node(params: dict) -> dict:
+    """Return the 109-gate approval payload for cop_onnx_setup_node WITHOUT creating a node.
+
+    READ-ONLY / NON-MUTATING: validates parent_path resolves to a REAL COP
+    network via ``parent.childTypeCategory() == hou.copNodeTypeCategory()``
+    (Phase-0 probe finding — NEVER probe via createNode(), which can
+    silently succeed under a non-COP parent by resolving an unrelated
+    same-named node type). A raise here causes the gate to DENY the call
+    (preview_required=True) — FOLD M1-preview-DENY: an INVALID target
+    (parent does not resolve, or resolves but is not a COP network) is
+    DENIED at the gate, not merely flagged for the operator to reject.
+
+    Called POSITIONALLY by the gate middleware as ``preview_fn(params)`` —
+    a single ``params: dict`` argument, NOT ``**params`` (matches
+    _preview_export_rop's convention).
+
+    Args:
+        params: dict with keys parent_path, model_path, node_name,
+            setup_shapes, flip_input, flip_output (the same params dict
+            the handler will later receive as kwargs).
+
+    Returns:
+        {
+            "action": "create cop/onnx node",
+            "parent_path": params["parent_path"],
+            "node_name": params.get("node_name", "agent_onnx"),
+            "model_path": <hou.text.expandString(model_path)>,
+            "setup_shapes": params.get("setup_shapes", True),
+            "flip_input": params.get("flip_input"),
+            "flip_output": params.get("flip_output"),
+            "node_will_persist": True,
+            "parent_exists": True,
+            "parent_is_cop_net": True,
+        }
+
+    Raises:
+        hou.OperationFailed: when parent_path does not resolve to a real
+            node, OR resolves but is NOT a COP network (childTypeCategory()
+            != hou.copNodeTypeCategory()) — the gate DENIES the call.
+    """
+    parent_path = params["parent_path"]
+    model_path = params["model_path"]
+
+    parent = hou.node(parent_path)
+    if parent is None:
+        raise hou.OperationFailed(f"Parent node not found: {parent_path}")
+    if parent.childTypeCategory() != hou.copNodeTypeCategory():
+        raise hou.OperationFailed(
+            f"{parent_path} is not a COP network "
+            f"(childTypeCategory={parent.childTypeCategory().name()!r}, "
+            f"expected 'Cop')"
+        )
+
+    expanded = hou.text.expandString(model_path)
+
+    return {
+        "action": "create cop/onnx node",
+        "parent_path": parent_path,
+        "node_name": params.get("node_name", "agent_onnx"),
+        "model_path": expanded,
+        "setup_shapes": params.get("setup_shapes", True),
+        "flip_input": params.get("flip_input"),
+        "flip_output": params.get("flip_output"),
+        "node_will_persist": True,
+        "parent_exists": True,
+        "parent_is_cop_net": True,
+    }
+
+
+def cop_onnx_setup_node(
+    *,
+    parent_path: str,
+    model_path: str,
+    node_name: str = "agent_onnx",
+    setup_shapes: bool = True,
+    flip_input: "bool | None" = None,
+    flip_output: "bool | None" = None,
+) -> dict:
+    """Create a PERSISTENT cop/onnx node under parent_path, configured from model_path. GATED.
+
+    Unlike cop_onnx_inspect_model's scratch-node mechanism (always
+    destroyed), the node this handler creates PERSISTS — it is the agent's
+    node, not a transient inspection scratch. This is precisely why the
+    tool is GATED (Capability.MUTATING, 109 security gate): it mutates the
+    scene by design.
+
+    Sets modelfile, presses setupshapes (NEVER 'reload' — houdini-001:
+    pressing reload before/after setupshapes on a freshly modelfile-set
+    onnx node segfaults Houdini), optionally sets the per-instance
+    input_flip{i}/output_flip{i} parms, then reads back the bound
+    input/output tensor mapping via _read_bound_tensors (a NEW additive
+    helper — cop_onnx_inspect_model's PR-2 read path is untouched).
+
+    Returns:
+        On success::
+
+            {
+                "ok": True,
+                "node_path": <created node's node.path()>,
+                "model_path": <expanded model_path>,
+                "input_tensors": [...],
+                "output_tensors": [...],
+                "warnings": [],
+                "applied": True,
+            }
+
+        On failure (FR-2/FR-5)::
+
+            {"ok": False, "error": "<reason>"}
+
+    Args:
+        parent_path: Path to an existing COP network (a copnet, or any
+            node whose childTypeCategory() is Cop) the onnx node is
+            created under.
+        model_path: Path to the .onnx file (Houdini-expandable).
+        node_name: Name for the created node. Defaults to "agent_onnx".
+        setup_shapes: When True (default), press setupshapes after setting
+            modelfile so the tensor mapping is populated.
+        flip_input: When not None, sets every input-instance flip parm
+            input_flip{i} (i=1..model_inputs) to int(flip_input).
+        flip_output: When not None, sets every output-instance flip parm
+            output_flip{i} (i=1..model_outputs) to int(flip_output).
+    """
+    try:
+        # FR-2: reject empty parent_path/model_path INSIDE the try (mirrors
+        # the usd_export_rop pattern — a non-string truthy arg's .strip()
+        # AttributeError must land in the FR-5 envelope, not leak as an
+        # unhandled exception from a MUTATING handler).
+        if not parent_path or not parent_path.strip():
+            return {"ok": False, "error": "parent_path must be a non-empty node path"}
+        if not model_path or not model_path.strip():
+            return {"ok": False, "error": "model_path must be a non-empty file path"}
+
+        parent = hou.node(parent_path)
+        if parent is None:
+            return {"ok": False, "error": f"Parent node not found: {parent_path}"}
+        if parent.childTypeCategory() != hou.copNodeTypeCategory():
+            return {
+                "ok": False,
+                "error": (
+                    f"{parent_path} is not a COP network "
+                    f"(childTypeCategory={parent.childTypeCategory().name()!r}, "
+                    f"expected 'Cop')"
+                ),
+            }
+
+        expanded = hou.text.expandString(model_path)
+
+        # PERSISTENT — this node is the deliverable, NOT a scratch node.
+        # No try/finally destroy() here (contrast cop_onnx_inspect_model).
+        node = parent.createNode("onnx", node_name)
+
+        with hou.undos.group("cop_onnx_setup_node"):
+            node.parm("modelfile").set(expanded)
+            if setup_shapes:
+                # NOTE: NEVER press "reload" — see module docstring
+                # (houdini-001, segfault, confirmed live). "setupshapes"
+                # alone (re)reads the file at modelfile.
+                node.parm("setupshapes").pressButton()
+
+            if flip_input is not None:
+                n_inputs = node.parm("model_inputs").eval()
+                for i in range(1, n_inputs + 1):
+                    flip_parm = node.parm(f"input_flip{i}")
+                    if flip_parm is not None:
+                        flip_parm.set(int(flip_input))
+
+            if flip_output is not None:
+                n_outputs = node.parm("model_outputs").eval()
+                for i in range(1, n_outputs + 1):
+                    flip_parm = node.parm(f"output_flip{i}")
+                    if flip_parm is not None:
+                        flip_parm.set(int(flip_output))
+
+        if setup_shapes:
+            input_tensors, output_tensors = _read_bound_tensors(node)
+        else:
+            input_tensors, output_tensors = [], []
+
+        return {
+            "ok": True,
+            "node_path": node.path(),
+            "model_path": expanded,
+            "input_tensors": input_tensors,
+            "output_tensors": output_tensors,
+            "warnings": [],
+            "applied": True,
+        }
+
+    except Exception as exc:
+        _log.warning(
+            "cop_onnx_setup_node failed for parent_path=%r model_path=%r: %s",
+            parent_path, model_path, exc,
+        )
+        return {"ok": False, "error": str(exc)}
+
+
+register_handler(
+    "cop_onnx_setup_node",
+    cop_onnx_setup_node,
+    Capability.MUTATING,
+    preview_fn=_preview_setup_node,
+    preview_required=True,
+)
+
+
+def _preview_set_provider(params: dict) -> dict:
+    """Return the 109-gate approval payload for cop_onnx_set_provider WITHOUT setting the parm.
+
+    READ-ONLY / NON-MUTATING: validates node_path resolves to a REAL onnx
+    node. A raise here causes the gate to DENY the call
+    (preview_required=True) — FOLD M1-preview-DENY: an INVALID target
+    (node does not resolve, or resolves but is not type 'onnx') is DENIED
+    at the gate.
+
+    Called POSITIONALLY by the gate middleware as ``preview_fn(params)`` —
+    a single ``params: dict`` argument, NOT ``**params``.
+
+    Args:
+        params: dict with keys node_path, provider (the same params dict
+            the handler will later receive as kwargs).
+
+    Returns:
+        {
+            "action": "set Execution Provider",
+            "node_path": params["node_path"],
+            "requested": params["provider"],
+            "available_providers": [...],
+            "will_bind": <choose_provider(...)[0]>,
+            "node_exists": True,
+            "node_is_onnx": True,
+        }
+
+    Raises:
+        hou.OperationFailed: when node_path does not resolve to a real
+            node, OR resolves but is NOT type 'onnx' — the gate DENIES
+            the call.
+    """
+    node_path = params["node_path"]
+    requested = params["provider"]
+
+    node = hou.node(node_path)
+    if node is None:
+        raise hou.OperationFailed(f"Node not found: {node_path}")
+    if node.type().name() != "onnx":
+        raise hou.OperationFailed(
+            f"Node at {node_path!r} is type {node.type().name()!r}, expected 'onnx'"
+        )
+
+    provider_parm = node.parm("provider")
+    available = list(provider_parm.menuItems()) if provider_parm is not None else []
+    will_bind, _warning = choose_provider(requested, available) if available else (None, None)
+
+    return {
+        "action": "set Execution Provider",
+        "node_path": node_path,
+        "requested": requested,
+        "available_providers": available,
+        "will_bind": will_bind,
+        "node_exists": True,
+        "node_is_onnx": True,
+    }
+
+
+def cop_onnx_set_provider(*, node_path: str, provider: str) -> dict:
+    """Set the onnx node's Execution Provider parm. GATED.
+
+    Reads the RUNTIME, platform-filtered ``provider`` menu
+    (``node.parm('provider').menuItems()`` — e.g. ``('automatic', 'cpu',
+    'cuda', 'directml')`` on Windows, no 'coreml') and delegates the
+    requested/available mapping to the pure ``choose_provider`` helper
+    (cop_onnx_model.py, PP12-113 PR-3). NEVER hardcodes the provider list.
+
+    An unavailable request NEVER errors (FR-4) — it falls back to
+    'automatic' (or, if 'automatic' itself is unavailable, the first
+    available provider) with a non-empty warning. The ONLY error case is
+    when the onnx node exposes NO Execution Provider options at all
+    (``available == []``) — PLAN-REVIEW FOLD m2-provider-edge.
+
+    Returns:
+        On success::
+
+            {
+                "ok": True,
+                "node_path": node_path,
+                "requested": provider,
+                "available_providers": [...],
+                "will_bind": <the bound provider token>,
+                "warnings": [],
+            }
+
+        On failure (FR-2/FR-5, or the empty-menu edge case)::
+
+            {"ok": False, "error": "<reason>"}
+
+    Args:
+        node_path: Path to an existing onnx node.
+        provider: The requested Execution Provider token (any case).
+    """
+    try:
+        # FR-2: reject empty node_path/provider INSIDE the try.
+        if not node_path or not node_path.strip():
+            return {"ok": False, "error": "node_path must be a non-empty node path"}
+        if not provider or not provider.strip():
+            return {"ok": False, "error": "provider must be a non-empty string"}
+
+        node = hou.node(node_path)
+        if node is None:
+            return {"ok": False, "error": f"Node not found: {node_path}"}
+        if node.type().name() != "onnx":
+            return {
+                "ok": False,
+                "error": f"Node at {node_path!r} is type {node.type().name()!r}, expected 'onnx'",
+            }
+
+        provider_parm = node.parm("provider")
+        available = list(provider_parm.menuItems()) if provider_parm is not None else []
+
+        if not available:
+            # PLAN-REVIEW FOLD m2-provider-edge: the ONLY error case — the
+            # node exposes no Execution Provider options at all.
+            return {
+                "ok": False,
+                "error": "onnx node exposes no Execution Provider options",
+            }
+
+        will_bind, warning = choose_provider(provider, available)
+        warnings = [warning] if warning else []
+
+        with hou.undos.group("cop_onnx_set_provider"):
+            provider_parm.set(will_bind)
+
+        return {
+            "ok": True,
+            "node_path": node_path,
+            "requested": provider,
+            "available_providers": available,
+            "will_bind": will_bind,
+            "warnings": warnings,
+        }
+
+    except Exception as exc:
+        _log.warning(
+            "cop_onnx_set_provider failed for node_path=%r provider=%r: %s",
+            node_path, provider, exc,
+        )
+        return {"ok": False, "error": str(exc)}
+
+
+register_handler(
+    "cop_onnx_set_provider",
+    cop_onnx_set_provider,
+    Capability.MUTATING,
+    preview_fn=_preview_set_provider,
+    preview_required=True,
+)

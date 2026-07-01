@@ -1010,3 +1010,148 @@ class TestContractFromSetupShapes:
             raw_outputs=[self._raw_output_basic()],
         )
         json.dumps(result.to_dict())
+
+
+# ===========================================================================
+# Section 11 — choose_provider(requested: str, available: list) -> tuple
+#              (PP12-113 PR-3 — RED, does not exist yet)
+#
+# Locked contract (plan pp12-113c lockedFieldContract, FOLD m2-provider-edge):
+#   NEW pure function APPENDED to cop_onnx_model.py. PR-1/PR-2 symbols
+#   (above) are BYTE-UNCHANGED — this section only ADDS coverage for the
+#   new symbol.
+#
+#   Signature: choose_provider(requested: str, available: list) -> tuple
+#              -> (will_bind: str, warning: str | None)
+#
+#   Behavior (pure — never touches hou/Qt/pxr; the HANDLER is responsible
+#   for reading node.parm('provider').menuItems() at RUNTIME and passing
+#   it in as `available`):
+#     - requested (case-INSENSITIVE) IS in available
+#         -> (requested.lower(), None)                    -- no warning
+#     - requested NOT in available AND 'automatic' IS in available
+#         -> ('automatic', <non-empty warning str>)        -- safe fallback
+#     - requested NOT in available AND 'automatic' NOT in available
+#         -> (available[0], <non-empty warning str>)       -- first-available fallback
+#     - available == [] (no Execution Provider options at all)
+#         -> raises ValueError                              -- the ONLY raise
+#            case; the handler maps this to
+#            {ok: False, error: 'onnx node exposes no Execution Provider options'}
+#     - NEVER raises merely because `requested` is unavailable (FR-4) —
+#       raising is reserved EXCLUSIVELY for the available==[] case.
+#
+#   This is a SYNTHETIC-input pure test: independent of any live Houdini
+#   parm read. The handler (hou-dev, hython-smoke) owns calling
+#   node.parm('provider').menuItems() to build `available` at runtime —
+#   that read is out of scope here.
+# ===========================================================================
+
+class TestChooseProvider:
+    """choose_provider — pure requested/available -> (will_bind, warning) mapping (RED)."""
+
+    # A realistic platform-filtered available list (Windows, per the
+    # Phase-0 live probe): lowercase, no coreml.
+    _WINDOWS_AVAILABLE = ["automatic", "cpu", "cuda", "directml"]
+
+    def test_module_exposes_choose_provider(self):
+        """RED GATE: choose_provider must be importable from cop_onnx_model."""
+        from fxhoudinimcp.cop_onnx_model import choose_provider  # noqa: F401
+        assert callable(choose_provider)
+
+    def test_returns_a_two_tuple(self):
+        from fxhoudinimcp.cop_onnx_model import choose_provider
+
+        result = choose_provider("cuda", self._WINDOWS_AVAILABLE)
+        assert isinstance(result, tuple), f"choose_provider must return a tuple, got {type(result)!r}"
+        assert len(result) == 2, f"choose_provider must return a 2-tuple, got len={len(result)!r}"
+
+    def test_requested_available_no_warning(self):
+        """requested is in available (exact case) -> (requested.lower(), None)."""
+        from fxhoudinimcp.cop_onnx_model import choose_provider
+
+        will_bind, warning = choose_provider("cuda", self._WINDOWS_AVAILABLE)
+        assert will_bind == "cuda"
+        assert warning is None
+
+    def test_requested_available_case_insensitive(self):
+        """requested matching is case-INSENSITIVE — 'CUDA' matches 'cuda' in available."""
+        from fxhoudinimcp.cop_onnx_model import choose_provider
+
+        will_bind, warning = choose_provider("CUDA", self._WINDOWS_AVAILABLE)
+        assert will_bind == "cuda", (
+            f"a case-insensitive match must bind the LOWERCASE available token, got {will_bind!r}"
+        )
+        assert warning is None
+
+    def test_requested_available_mixed_case_variants(self):
+        """Mixed-case requested strings all resolve to the same lowercase match."""
+        from fxhoudinimcp.cop_onnx_model import choose_provider
+
+        for variant in ("DirectML", "directml", "DIRECTML", "DirectMl"):
+            will_bind, warning = choose_provider(variant, self._WINDOWS_AVAILABLE)
+            assert will_bind == "directml", f"variant {variant!r} must resolve to 'directml', got {will_bind!r}"
+            assert warning is None, f"variant {variant!r} must not produce a warning, got {warning!r}"
+
+    def test_requested_unavailable_falls_back_to_automatic_when_present(self):
+        """requested not in available, but 'automatic' IS -> ('automatic', <warning>)."""
+        from fxhoudinimcp.cop_onnx_model import choose_provider
+
+        will_bind, warning = choose_provider("tensorrt", self._WINDOWS_AVAILABLE)
+        assert will_bind == "automatic"
+        assert isinstance(warning, str) and warning, (
+            f"a non-empty warning string is required on fallback, got {warning!r}"
+        )
+
+    def test_requested_unavailable_falls_back_to_first_available_when_no_automatic(self):
+        """requested not in available AND 'automatic' NOT in available
+        -> (available[0], <warning>)."""
+        from fxhoudinimcp.cop_onnx_model import choose_provider
+
+        available_no_automatic = ["cpu", "cuda", "directml"]
+        will_bind, warning = choose_provider("tensorrt", available_no_automatic)
+        assert will_bind == "cpu", (
+            f"must fall back to available[0] ('cpu') when 'automatic' is not present, got {will_bind!r}"
+        )
+        assert isinstance(warning, str) and warning, (
+            f"a non-empty warning string is required on fallback, got {warning!r}"
+        )
+
+    def test_requested_unavailable_never_raises(self):
+        """FR-4: choose_provider must NEVER raise merely because `requested`
+        is unavailable — raising is reserved exclusively for available==[]."""
+        from fxhoudinimcp.cop_onnx_model import choose_provider
+
+        # Should not raise for any of these unavailable-but-non-empty cases.
+        choose_provider("tensorrt", self._WINDOWS_AVAILABLE)
+        choose_provider("coreml", ["cpu", "cuda"])
+        choose_provider("nonexistent_provider_xyz", ["automatic"])
+
+    def test_empty_available_raises_value_error(self):
+        """available == [] (no Execution Provider options at all) -> raises
+        ValueError. This is the ONLY raise case."""
+        from fxhoudinimcp.cop_onnx_model import choose_provider
+
+        with pytest.raises(ValueError):
+            choose_provider("cuda", [])
+
+    def test_automatic_requested_directly(self):
+        """Requesting 'automatic' directly (already in available) resolves
+        cleanly with no warning — not treated as a fallback case."""
+        from fxhoudinimcp.cop_onnx_model import choose_provider
+
+        will_bind, warning = choose_provider("automatic", self._WINDOWS_AVAILABLE)
+        assert will_bind == "automatic"
+        assert warning is None
+
+    def test_single_option_available_list(self):
+        """A single-entry available list (edge case, non-empty) still works
+        without raising."""
+        from fxhoudinimcp.cop_onnx_model import choose_provider
+
+        will_bind, warning = choose_provider("cpu", ["cpu"])
+        assert will_bind == "cpu"
+        assert warning is None
+
+        will_bind, warning = choose_provider("cuda", ["cpu"])
+        assert will_bind == "cpu"
+        assert isinstance(warning, str) and warning
