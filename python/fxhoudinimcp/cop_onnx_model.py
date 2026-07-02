@@ -690,3 +690,202 @@ def normalize_plane_dtype(storage_type) -> str:
         The plain lowercase dtype token, e.g. ``"float32"``.
     """
     return str(storage_type).rsplit(".", 1)[-1].lower()
+
+
+# ---------------------------------------------------------------------------
+# compute_histogram + deinterleave_channels + bounded_page_coords +
+# bounded_sample_coords — PP12-113 PR-5 (cop_onnx_read_pixels)
+# ---------------------------------------------------------------------------
+
+def compute_histogram(
+    values: List[float],
+    bins: int,
+    lo: Optional[float],
+    hi: Optional[float],
+) -> list:
+    """Equal-width per-bin counts over [lo, hi]. Pure; NaN/Inf-EXCLUDED.
+
+    APPENDED for PP12-113 PR-5 (cop_onnx_read_pixels's summary-mode
+    histogram). Pure — never touches hou/Qt/pxr/numpy. NaN/Inf values in
+    ``values`` are EXCLUDED from the bin counts entirely — they are
+    already counted separately by ``count_nan_inf``; including them here
+    would double-count non-finite samples into a bin.
+
+    Bin convention: `bins` equal-width half-open bins covering
+    [lo, lo + width), [lo + width, lo + 2*width), ..., except the LAST
+    bin, which is closed on both ends (inclusive of `hi`) so a value
+    exactly equal to `hi` always lands somewhere rather than overflowing
+    past the bin array.
+
+    Degenerate/guard cases (locked contract):
+      - ``bins <= 0`` -> ``[]`` (no bins to fill).
+      - ``lo is None or hi is None`` -> ``[0] * bins`` (an all-non-finite
+        channel's min/max sentinel from ``count_nan_inf`` — nothing
+        meaningful to bin against).
+      - ``lo == hi`` -> every finite value lands in bin 0 (there is no
+        meaningful bin-width to distribute a single point across).
+
+    Parameters
+    ----------
+    values : list[float]
+        The (possibly NaN/Inf-containing) sample values to bin.
+    bins : int
+        Number of equal-width bins. ``bins <= 0`` -> ``[]``.
+    lo, hi : float | None
+        The histogram range. Either being ``None`` -> ``[0] * bins``.
+
+    Returns
+    -------
+    list[int]
+        Per-bin finite-value counts, length == `bins` (or `[]` when
+        `bins <= 0`).
+    """
+    if bins <= 0:
+        return []
+    if lo is None or hi is None:
+        return [0] * bins
+
+    counts = [0] * bins
+
+    if lo == hi:
+        # Degenerate: no meaningful bin-width — every finite value lands
+        # in bin 0.
+        for v in values:
+            if math.isnan(v) or math.isinf(v):
+                continue
+            counts[0] += 1
+        return counts
+
+    width = (hi - lo) / bins
+    # A tiny epsilon nudge guards against float division landing a value
+    # just BELOW its true bin boundary (e.g. 0.6 / 0.2 == 2.9999999999999996
+    # in binary floating point, which would truncate into bin 2 instead of
+    # the mathematically-correct bin 3) without disturbing the pinned
+    # exact-boundary semantics (0.0 -> bin 0, 0.25 -> bin 1, 1.0 -> the
+    # last bin).
+    _eps = 1e-9
+    for v in values:
+        if math.isnan(v) or math.isinf(v):
+            continue
+        idx = int((v - lo) / width + _eps)
+        if idx < 0:
+            idx = 0
+        elif idx >= bins:
+            # The last bin is inclusive of hi (and any value that rounds
+            # up to/ beyond the last edge due to float error).
+            idx = bins - 1
+        counts[idx] += 1
+
+    return counts
+
+
+def deinterleave_channels(flat: List[float], channels: int) -> list:
+    """Split a channel-interleaved flat list into `channels` per-channel lists.
+
+    APPENDED for PP12-113 PR-5 (cop_onnx_read_pixels's summary-mode
+    per-channel stats). Pure — never touches hou/Qt/pxr/numpy. Splits a
+    pixel-major, channel-interleaved flat buffer (``[p0c0, p0c1, ..., p0cN,
+    p1c0, p1c1, ..., p1cN, ...]``) into `channels` separate per-channel
+    lists via ``flat[c::channels]``.
+
+    Called ONLY over a BOUNDED sample (<= budget) by the handler, never
+    the full plane — but this pure function itself has no knowledge of
+    that; it simply deinterleaves whatever flat list it is given.
+
+    Parameters
+    ----------
+    flat : list[float]
+        Channel-interleaved, pixel-major flat buffer.
+    channels : int
+        Number of channels per pixel. ``channels <= 0`` -> ``[]`` guard.
+
+    Returns
+    -------
+    list[list[float]]
+        `channels` per-channel lists (empty per-channel lists when `flat`
+        is empty).
+    """
+    if channels <= 0:
+        return []
+    return [list(flat[c::channels]) for c in range(channels)]
+
+
+def bounded_page_coords(
+    x0: int, y0: int, box_w: int, box_h: int, start: int, end: int
+) -> list:
+    """The LAZY [start, end) slice of a box_w x box_h box offset at (x0, y0).
+
+    APPENDED for PP12-113 PR-5 (cop_onnx_read_pixels's roi-mode pagination).
+    Pure — never touches hou/Qt/pxr/numpy. Row-major
+    (x = x0 + i % box_w, y = y0 + i // box_w). Returns ONLY the flattened
+    [start, end) pixels of the box — NEVER materializes the whole box
+    first and slices after the fact (folds codex Blocker-2): the returned
+    length always equals `end - start`, regardless of how large
+    `box_w * box_h` is.
+
+    Parameters
+    ----------
+    x0, y0 : int
+        The box's offset (top-left corner) in plane coordinates.
+    box_w, box_h : int
+        The box's width/height in pixels.
+    start, end : int
+        The [start, end) slice of the box's flattened row-major pixel
+        index range to return coordinates for.
+
+    Returns
+    -------
+    list[tuple[int, int]]
+        The `(x, y)` coordinates for indices [start, end), row-major.
+        Empty when `start == end`.
+    """
+    return [
+        (x0 + i % box_w, y0 + i // box_w)
+        for i in range(start, end)
+    ]
+
+
+def bounded_sample_coords(
+    w: int, h: int, stride: int, start: int, end: int
+) -> list:
+    """The LAZY [start, end) slice of the strided sample grid over a w x h plane.
+
+    APPENDED for PP12-113 PR-5 (cop_onnx_read_pixels's sample-mode
+    pagination). Pure — never touches hou/Qt/pxr/numpy. The full strided
+    grid (never materialized) is::
+
+        [(x * stride, y * stride)
+         for y in range(ceil(h / stride))
+         for x in range(ceil(w / stride))]
+
+    (row-major). Returns ONLY the flattened [start, end) slice of that
+    grid — NEVER materializes the whole grid first and slices after the
+    fact (folds codex Blocker-2): the returned length always equals
+    `end - start`, regardless of how large the full strided grid would be.
+
+    Parameters
+    ----------
+    w, h : int
+        The plane's resolution.
+    stride : int
+        The sampling stride (>= 1 expected; a stride larger than either
+        dimension still yields exactly one grid point at (0, 0) via
+        ceil-division).
+    start, end : int
+        The [start, end) slice of the strided grid's flattened row-major
+        index range to return coordinates for.
+
+    Returns
+    -------
+    list[tuple[int, int]]
+        The `(x, y)` coordinates for grid indices [start, end), row-major.
+        Empty when `start == end`. Every coordinate is within
+        `[0, w) x [0, h)`.
+    """
+    cols = math.ceil(w / stride)
+    result = []
+    for i in range(start, end):
+        gx = i % cols
+        gy = i // cols
+        result.append((gx * stride, gy * stride))
+    return result

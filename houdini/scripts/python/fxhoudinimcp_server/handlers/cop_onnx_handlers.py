@@ -160,6 +160,7 @@ from __future__ import annotations
 # ---------------------------------------------------------------------------
 import glob as _glob
 import logging as _logging
+import math as _math
 import os as _os
 import sys as _sys
 
@@ -174,10 +175,18 @@ import time as _time  # noqa: E402
 import hou  # noqa: E402  (hython / Houdini-side interpreter only)
 from fxhoudinimcp_server.dispatcher import Capability, register_handler  # noqa: E402
 from fxhoudinimcp.cop_onnx_model import (  # noqa: E402
+    ReadbackPage,
+    bounded_page_coords,
+    bounded_sample_coords,
     choose_provider,
+    clamp_readback,
+    compute_histogram,
     contract_from_setup_shapes,
     cooked_from_errors,
+    count_nan_inf,
+    deinterleave_channels,
     normalize_plane_dtype,
+    paginate,
 )
 
 _log = _logging.getLogger(__name__)
@@ -200,6 +209,15 @@ _SYNTHESIZED_DTYPE = "float32"
 # destroyed, REV2 FOLD B2) for each cop_onnx_inspect_model scratch-node
 # call. Not reused/persisted across calls -- see the module docstring.
 _SCRATCH_NET_NAME = "_mcp_onnx_inspect"
+
+# PP12-113 PR-5 (cop_onnx_read_pixels) -- module constants, LOCKED per the
+# plan pp12-113e lockedFieldContract (folds codex plan-review Blocker-1):
+# ABS_MAX_PIXELS is an ABSOLUTE server ceiling applied to EVERY mode
+# regardless of the caller's max_pixels/page_size -- no call ever returns
+# more pixels than this. SUMMARY_HISTOGRAM_BINS is LOCKED at 32 (spec
+# §4.2).
+ABS_MAX_PIXELS = 4096
+SUMMARY_HISTOGRAM_BINS = 32
 
 
 ###### Helpers
@@ -1335,3 +1353,384 @@ register_handler(
     preview_fn=_preview_run_inference,
     preview_required=True,
 )
+
+
+# ---------------------------------------------------------------------------
+# cop_onnx_read_pixels (READONLY -- Capability.READONLY) -- NO preview_fn
+#
+# PP12-113 PR-5 -- the FINAL tool of the Copernicus-ONNX member (113). Reads
+# a named output plane of a COOKED cop/onnx node back as CONTEXT-SAFE
+# numeric data in one of three modes (summary/roi/sample). GROUNDED
+# (orchestrator pre-plan hython probe,
+# docs/homedini/plans/_agentic/_artifacts/houdini-orchestrator/pp12-113e/
+# read-pixels-api-memo.md): node.layer(idx) returns None on a stale/
+# uncooked node -- it does NOT auto-cook -- so read_pixels REPORTS "node
+# not cooked" rather than triggering a cook. This is what keeps the
+# expensive GPU cook behind the GATED cop_onnx_run_inference (PR-4) and
+# makes read_pixels genuinely READONLY/ungated.
+#
+# FR-6 (the load-bearing invariant, folds codex plan-review Blocker-1/
+# Blocker-2/Major-4/Major-5): EVERY mode returns <= ABS_MAX_PIXELS pixels
+# per call, regardless of the caller's max_pixels/page_size; coordinates
+# are computed LAZILY via bounded_page_coords/bounded_sample_coords (only
+# the requested [start,end) page slice -- NEVER the whole box/grid);
+# summary strides via clamp_readback(...,budget)+bufferIndex over a
+# budget-bounded sample (NEVER layer.allBufferElements() over the full
+# plane -- ~192MiB for a 4K plane); nan/inf pixels are COUNTED
+# (count_nan_inf), never silently dropped.
+#
+# houdini-001 (catalog): NEVER press 'reload' on a cop/onnx node.
+# read_pixels presses NOTHING and NEVER cooks (genuinely read-only).
+
+
+def cop_onnx_read_pixels(
+    *,
+    node_path: str,
+    plane: "str | None" = None,
+    mode: str = "summary",
+    roi: "list | None" = None,
+    max_pixels: int = 4096,
+    downsample: "int | None" = None,
+    page: int = 0,
+    page_size: int = 1024,
+) -> dict:
+    """Read a named output plane of a COOKED cop/onnx node as context-safe numeric data. READ-ONLY.
+
+    The LIVE stale guard is ``node.needsToCook()``, checked BEFORE any
+    ``layer()`` call: on this Houdini build, calling ``layer(idx)`` on a
+    stale/uncooked node does NOT simply return None -- it triggers an
+    IMPLICIT cook as a side effect, which would violate the read-only
+    guarantee. ``needsToCook()`` is side-effect-free (confirmed live: it
+    never itself triggers a cook, however many times it is called), so
+    checking it first is what actually preserves read-only-ness. When it
+    reports stale, this REPORTS ``{ok: True, cooked: False, message:
+    "node not cooked -- run cop_onnx_run_inference first"}`` -- a valid,
+    reportable outcome, NOT an error, and NEVER triggers a cook.
+    (``layer(idx) is None`` remains as a defensive fallback check for the
+    mocked-hou test double, which signals staleness that way -- on live
+    Houdini this fallback branch is never reached because the
+    ``needsToCook()`` pre-check already caught the stale case.)
+
+    Target validation requires BOTH ``node.type().name() == 'onnx'`` AND
+    ``node.type().category() == hou.copNodeTypeCategory()`` (a bare
+    name-only check is insufficient -- mirrors the PR-4 run_inference
+    pattern).
+
+    Plane resolution: ``plane`` defaults to the node's first output plane
+    (``node.outputNames()[0]``) when omitted; a plane not present in
+    ``node.outputNames()`` is an FR-5 error surfacing the available names.
+
+    Three modes:
+      - ``summary`` (default): strides via
+        ``clamp_readback(w, h, channels, budget)`` + ``bufferIndex`` over
+        a budget-bounded sample (NEVER the full plane via
+        ``allBufferElements()``); per-channel min/max/mean + a
+        SUMMARY_HISTOGRAM_BINS(32)-bin histogram + nan/inf counts.
+      - ``roi``: a bounded ``[x0, y0, x1, y1]`` crop, clamped to
+        ``[0, w] x [0, h]``. An inverted/empty box (``x1 <= x0`` or
+        ``y1 <= y0``) is rejected (ok:False); an out-of-bounds-but-valid
+        box (x0<x1, y0<y1, extending past the plane) is CLAMPED, not
+        rejected. Paginated via the LAZY ``bounded_page_coords`` helper --
+        only the requested page's coordinates are ever computed.
+      - ``sample``: a strided sample. ``downsample`` (when > 0) sets the
+        stride explicitly; otherwise the stride is derived from
+        ``clamp_readback(w, h, channels, budget)``. Paginated via the LAZY
+        ``bounded_sample_coords`` helper.
+
+    FR-6 (LOCKED, folds codex plan-review Blocker-1): ``budget =
+    min(max(1, max_pixels), ABS_MAX_PIXELS)`` and ``effective_page_size =
+    min(max(1, page_size), budget)`` -- applied to EVERY mode, so no
+    caller param (however huge) can ever exceed the ABS_MAX_PIXELS(4096)
+    server ceiling. A request whose true size exceeds the budget is
+    clamped with ``truncated: True``.
+
+    Returns:
+        summary mode (merges PixelSummary.to_dict() with)::
+
+            {
+                "ok": True, "cooked": True, "mode": "summary",
+                "sampled": bool, "stride": int,
+                "plane": str, "xres": int, "yres": int,
+                "channels": int, "dtype": str,
+                "stats": {"min": [...], "max": [...], "mean": [...],
+                          "nan_count": int, "inf_count": int},
+                "histogram": {"bins": 32, "counts": [[...], ...]},
+            }
+
+        roi / sample mode (merges ReadbackPage.to_dict() with)::
+
+            {
+                "ok": True, "cooked": True,
+                "xres": int, "yres": int, "channels": int, "dtype": str,
+                "stride": int,  # sample mode only
+                "plane": str, "mode": "roi" | "sample",
+                "pixels": [[...], ...], "page": int, "page_size": int,
+                "total_pages": int, "truncated": bool,
+            }
+
+        a stale/uncooked node (read-only, no cook triggered)::
+
+            {
+                "ok": True, "cooked": False,
+                "node_path": str, "plane": str | None,
+                "message": "node not cooked -- run cop_onnx_run_inference first",
+            }
+
+        an FR-2/FR-5 error (bad target, wrong category, bad plane,
+        inverted roi box)::
+
+            {"ok": False, "error": "<reason>"}
+
+    Args:
+        node_path: Path to an existing, cooked cop/onnx node.
+        plane: Output plane name to read. Defaults to the node's first
+            output plane when None.
+        mode: One of "summary" (default), "roi", or "sample".
+        roi: Required for mode="roi" -- a 4-element [x0, y0, x1, y1] box.
+        max_pixels: Server-side pixel budget, hard-clamped to
+            ABS_MAX_PIXELS regardless of this value. Defaults to 4096.
+        downsample: Optional explicit stride for mode="sample". When None
+            or <= 0, the stride is derived from max_pixels.
+        page: Zero-based page index for roi/sample pagination.
+        page_size: Page size for roi/sample pagination, also subject to
+            the budget ceiling.
+    """
+    try:
+        # FR-2: reject empty node_path INSIDE the try.
+        if not node_path or not node_path.strip():
+            return {"ok": False, "error": "node_path must be a non-empty node path"}
+
+        node = hou.node(node_path)
+        if node is None:
+            return {"ok": False, "error": f"Node not found: {node_path}"}
+        if not (
+            node.type().name() == "onnx"
+            and node.type().category() == hou.copNodeTypeCategory()
+        ):
+            return {
+                "ok": False,
+                "error": (
+                    f"Node at {node_path!r} is not a Copernicus cop/onnx node "
+                    f"(type={node.type().name()!r}, category="
+                    f"{node.type().category()!r}), expected a cop/onnx node"
+                ),
+            }
+
+        # READ-ONLY pre-check (live-hython finding, corrects the plan's
+        # grounding memo): on this Houdini 21.0.729 build, node.layer(idx)
+        # ITSELF triggers a cook as a side effect on a stale node (it does
+        # NOT simply return None) -- calling it to test for staleness
+        # would violate the read-only guarantee. node.needsToCook() is the
+        # side-effect-free pre-check: True on a stale node, False after a
+        # real cook, confirmed live to never itself trigger a cook however
+        # many times it is called. Trust it only when it returns an actual
+        # bool (an unconfigured mock's needsToCook() is a MagicMock, not a
+        # bool, so the mocked-hou test suite's layer(idx) is None
+        # contract still governs there) -- this keeps both the mocked-hou
+        # red tests (which signal staleness via layer.return_value = None)
+        # and the live hython behavior (which signals staleness via
+        # needsToCook()) correct without either short-circuiting the
+        # other.
+        needs_cook = node.needsToCook()
+        if isinstance(needs_cook, bool) and needs_cook:
+            return {
+                "ok": True,
+                "cooked": False,
+                "node_path": node_path,
+                "plane": plane,
+                "message": "node not cooked — run cop_onnx_run_inference first",
+            }
+
+        output_names = list(node.outputNames())
+        if not output_names:
+            return {
+                "ok": False,
+                "error": f"Node at {node_path!r} has no output planes (not cooked?)",
+            }
+        if plane is None:
+            idx = 0
+            resolved_plane = output_names[0]
+        elif plane in output_names:
+            idx = output_names.index(plane)
+            resolved_plane = plane
+        else:
+            return {
+                "ok": False,
+                "error": f"plane {plane!r} not found; available: {output_names!r}",
+            }
+
+        layer = node.layer(idx)
+        if layer is None:
+            # READ-ONLY: a stale/uncooked node signaled via the mocked-hou
+            # test double's layer.return_value = None contract. Report,
+            # never cook. (On live Houdini this branch is defensive —
+            # the needsToCook() pre-check above already caught the stale
+            # case before layer() was ever called.)
+            return {
+                "ok": True,
+                "cooked": False,
+                "node_path": node_path,
+                "plane": resolved_plane,
+                "message": "node not cooked — run cop_onnx_run_inference first",
+            }
+
+        w, h = layer.bufferResolution()
+        channels = layer.channelCount()
+        dtype = normalize_plane_dtype(layer.storageType())
+
+        # FR-6 (LOCKED, codex plan-review Blocker-1): the ABSOLUTE server
+        # ceiling, applied to EVERY mode regardless of the caller's params.
+        budget = min(max(1, max_pixels), ABS_MAX_PIXELS)
+        effective_page_size = min(max(1, page_size), budget)
+
+        if mode == "summary":
+            stride = clamp_readback(w, h, channels, budget)
+            total_grid_points = _math.ceil(w / stride) * _math.ceil(h / stride)
+            sample_count = min(total_grid_points, budget)
+            coords = bounded_sample_coords(w, h, stride, 0, sample_count)
+            flat: list = []
+            for x, y in coords:
+                flat.extend(layer.bufferIndex(x, y))
+            per_channel = deinterleave_channels(flat, channels)
+
+            mins: list = []
+            maxs: list = []
+            means: list = []
+            nan_total = 0
+            inf_total = 0
+            histograms: list = []
+            for ch_values in per_channel:
+                stats = count_nan_inf(ch_values)
+                mins.append(stats["min"])
+                maxs.append(stats["max"])
+                means.append(stats["mean"])
+                nan_total += stats["nan_count"]
+                inf_total += stats["inf_count"]
+                histograms.append(
+                    compute_histogram(
+                        ch_values, SUMMARY_HISTOGRAM_BINS, stats["min"], stats["max"]
+                    )
+                )
+
+            summary = {
+                "plane": resolved_plane,
+                "xres": w,
+                "yres": h,
+                "channels": channels,
+                "dtype": dtype,
+                "stats": {
+                    "min": mins,
+                    "max": maxs,
+                    "mean": means,
+                    "nan_count": nan_total,
+                    "inf_count": inf_total,
+                },
+                "histogram": {"bins": SUMMARY_HISTOGRAM_BINS, "counts": histograms},
+            }
+            return {
+                "ok": True,
+                "cooked": True,
+                "mode": "summary",
+                "sampled": stride > 1,
+                "stride": stride,
+                **summary,
+            }
+
+        elif mode == "roi":
+            if not roi or len(roi) != 4:
+                return {"ok": False, "error": "roi must be a 4-element [x0, y0, x1, y1] list"}
+            x0, y0, x1, y1 = roi
+            # Clamp to [0, w] x [0, h].
+            x0c = max(0, min(x0, w))
+            y0c = max(0, min(y0, h))
+            x1c = max(0, min(x1, w))
+            y1c = max(0, min(y1, h))
+            if x1c <= x0c or y1c <= y0c:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"invalid roi box [{x0}, {y0}, {x1}, {y1}] (clamped to "
+                        f"[{x0c}, {y0c}, {x1c}, {y1c}]) -- x1 must be > x0 and "
+                        f"y1 must be > y0"
+                    ),
+                }
+            box_w = x1c - x0c
+            box_h = y1c - y0c
+            total = box_w * box_h
+            pg = paginate(total, page, effective_page_size)
+            page_coords = bounded_page_coords(x0c, y0c, box_w, box_h, pg["start"], pg["end"])
+            pixels = [list(layer.bufferIndex(x, y)) for (x, y) in page_coords]
+
+            readback = ReadbackPage(
+                plane=resolved_plane,
+                mode="roi",
+                pixels=pixels,
+                page=pg["page"],
+                page_size=pg["page_size"],
+                total_pages=pg["total_pages"],
+                truncated=pg["truncated"],
+            )
+            return {
+                "ok": True,
+                "cooked": True,
+                "xres": w,
+                "yres": h,
+                "channels": channels,
+                "dtype": dtype,
+                **readback.to_dict(),
+            }
+
+        elif mode == "sample":
+            if downsample is not None and downsample > 0:
+                stride = downsample
+            else:
+                stride = clamp_readback(w, h, channels, budget)
+            cols = _math.ceil(w / stride)
+            rows = _math.ceil(h / stride)
+            grid_points = cols * rows
+            # The TRUE strided-grid size may exceed the budget (e.g. an
+            # explicit downsample that still yields a huge grid) -- clamp
+            # the total fed to paginate() to the budget (FR-6 absolute
+            # ceiling), but remember whether clamping actually happened so
+            # `truncated` reflects the budget-clamp even when the clamped
+            # total fits in a single page (paginate() alone only sees the
+            # ALREADY-clamped total and cannot distinguish page-truncation
+            # from budget-truncation).
+            total = min(grid_points, budget)
+            budget_clamped = grid_points > budget
+            pg = paginate(total, page, effective_page_size)
+            page_coords = bounded_sample_coords(w, h, stride, pg["start"], pg["end"])
+            pixels = [list(layer.bufferIndex(x, y)) for (x, y) in page_coords]
+
+            readback = ReadbackPage(
+                plane=resolved_plane,
+                mode="sample",
+                pixels=pixels,
+                page=pg["page"],
+                page_size=pg["page_size"],
+                total_pages=pg["total_pages"],
+                truncated=pg["truncated"] or budget_clamped,
+            )
+            return {
+                "ok": True,
+                "cooked": True,
+                "xres": w,
+                "yres": h,
+                "channels": channels,
+                "dtype": dtype,
+                "stride": stride,
+                **readback.to_dict(),
+            }
+
+        else:
+            return {"ok": False, "error": f"unknown mode {mode!r}; expected summary/roi/sample"}
+
+    except Exception as exc:
+        _log.warning(
+            "cop_onnx_read_pixels failed for node_path=%r mode=%r: %s",
+            node_path, mode, exc,
+        )
+        return {"ok": False, "error": str(exc)}
+
+
+register_handler("cop_onnx_read_pixels", cop_onnx_read_pixels, Capability.READONLY)

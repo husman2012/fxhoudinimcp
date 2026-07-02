@@ -44,6 +44,16 @@ houdini_cop_onnx_run_inference — cook an ALREADY-CONFIGURED cop/onnx node
                                   no-silent-success: a failed cook is
                                   ok:True + cooked:False + errors surfaced
                                   verbatim (reported, not raised).
+houdini_cop_onnx_read_pixels  — READ-ONLY, UNGATED (require_approval=False,
+                                  Capability.READONLY handler-side) — read a
+                                  named output plane of a COOKED cop/onnx
+                                  node back as context-safe numeric data in
+                                  one of three modes (summary/roi/sample).
+                                  A stale/uncooked node is REPORTED
+                                  cooked:False ("not cooked"), never cooked
+                                  by this tool. FR-6: the server HARD-CLAMPS
+                                  max_pixels to <= ABS_MAX_PIXELS on every
+                                  mode — never a full-frame dump.
 
 Each wrapper delegates to the correspondingly named handler registered on
 the Houdini side via bridge.execute. No domain logic lives here.
@@ -54,6 +64,7 @@ off-DCC for the wrapper pytest suite (CL-015).
 PP12-113 / pp12-113b (houdini_cop_onnx_list_models, houdini_cop_onnx_inspect_model)
 PP12-113 / pp12-113c (houdini_cop_onnx_setup_node, houdini_cop_onnx_set_provider)
 PP12-113 / pp12-113d (houdini_cop_onnx_run_inference)
+PP12-113 / pp12-113e (houdini_cop_onnx_read_pixels — the FINAL tool of member 113)
 """
 from __future__ import annotations
 
@@ -268,4 +279,82 @@ async def houdini_cop_onnx_run_inference(
     return await bridge.execute(
         "cop_onnx_run_inference",
         {"node_path": node_path, "frame": frame},
+    )
+
+
+@mcp.tool(meta={"require_approval": False})
+async def houdini_cop_onnx_read_pixels(
+    ctx: Context,
+    node_path: str,
+    plane: "str | None" = None,
+    mode: str = "summary",
+    roi: "list | None" = None,
+    max_pixels: int = 4096,
+    downsample: "int | None" = None,
+    page: int = 0,
+    page_size: int = 1024,
+) -> dict:
+    """Read a named output plane of a COOKED cop/onnx node as context-safe numeric data. READ-ONLY — ungated.
+
+    Final tool of the Copernicus-ONNX family (PP12-113 PR-5). READ-ONLY /
+    UNGATED (require_approval=False, Capability.READONLY handler-side) —
+    genuinely read-only: the handler checks ``node.needsToCook()`` BEFORE
+    ever calling ``layer()`` (on this Houdini build, calling ``layer(idx)``
+    on a stale node does NOT simply return None — it triggers an implicit
+    cook as a side effect, so ``needsToCook()`` is what actually preserves
+    read-only-ness). A stale node is REPORTED ``cooked:False`` ("not
+    cooked — run cop_onnx_run_inference first"), never mutated or cooked
+    by this tool. This keeps the expensive GPU cook behind the GATED
+    ``houdini_cop_onnx_run_inference``.
+
+    Three modes:
+      - ``summary`` (default): per-channel min/max/mean + a 32-bin
+        histogram + nan/inf counts. ~1-2KB regardless of plane resolution
+        (a budget-bounded strided sample, never a full-plane read).
+      - ``roi``: a bounded ``[x0, y0, x1, y1]`` crop, paginated. An
+        out-of-bounds-but-valid box is CLAMPED to the plane; an
+        inverted/empty box (x1<=x0 or y1<=y0) is rejected.
+      - ``sample``: a strided sample, server-clamped to `max_pixels`.
+
+    FR-6 context-safety (the load-bearing invariant): the server
+    HARD-CLAMPS `max_pixels` to an absolute ceiling on EVERY mode —
+    regardless of the caller's `max_pixels`/`page_size`, a call NEVER
+    returns more than the server's absolute pixel ceiling; a full-frame
+    request is clamped with `truncated:True`. NaN/Inf pixels are COUNTED,
+    never silently dropped.
+
+    A SINGLE bridge.execute call — the wrapper performs no result
+    interpretation and returns bridge.execute's result VERBATIM, including
+    the read-only "not cooked" shape (ok:True, cooked:False — a normal,
+    valid outcome, not an error) or an FR-5 error shape (a bad plane name,
+    wrong-category node, or inverted roi box).
+
+    Args:
+        ctx: MCP lifespan context — injected by FastMCP; hidden from client schema.
+        node_path: Path to an existing, cooked cop/onnx node.
+        plane: Output plane name to read. Defaults to the node's first
+            output plane when None.
+        mode: One of "summary" (default), "roi", or "sample".
+        roi: Required for mode="roi" — a 4-element [x0, y0, x1, y1] box.
+        max_pixels: Server-side pixel budget, hard-clamped to an absolute
+            ceiling regardless of this value. Defaults to 4096.
+        downsample: Optional explicit stride for mode="sample". When None,
+            the server derives a stride from `max_pixels`.
+        page: Zero-based page index for roi/sample pagination. Defaults to 0.
+        page_size: Page size for roi/sample pagination, also subject to the
+            server's absolute pixel ceiling. Defaults to 1024.
+    """
+    bridge = _fxserver._get_bridge(ctx)
+    return await bridge.execute(
+        "cop_onnx_read_pixels",
+        {
+            "node_path": node_path,
+            "plane": plane,
+            "mode": mode,
+            "roi": roi,
+            "max_pixels": max_pixels,
+            "downsample": downsample,
+            "page": page,
+            "page_size": page_size,
+        },
     )
