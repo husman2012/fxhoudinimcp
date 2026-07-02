@@ -169,9 +169,16 @@ _PY = _os.path.abspath(
 if _PY not in _sys.path:
     _sys.path.insert(0, _PY)
 
+import time as _time  # noqa: E402
+
 import hou  # noqa: E402  (hython / Houdini-side interpreter only)
 from fxhoudinimcp_server.dispatcher import Capability, register_handler  # noqa: E402
-from fxhoudinimcp.cop_onnx_model import choose_provider, contract_from_setup_shapes  # noqa: E402
+from fxhoudinimcp.cop_onnx_model import (  # noqa: E402
+    choose_provider,
+    contract_from_setup_shapes,
+    cooked_from_errors,
+    normalize_plane_dtype,
+)
 
 _log = _logging.getLogger(__name__)
 
@@ -1054,5 +1061,277 @@ register_handler(
     cop_onnx_set_provider,
     Capability.MUTATING,
     preview_fn=_preview_set_provider,
+    preview_required=True,
+)
+
+
+# ---------------------------------------------------------------------------
+# cop_onnx_run_inference (GATED — Capability.MUTATING) + _preview_run_inference
+#
+# PP12-113 PR-4 — cook an ALREADY-CONFIGURED cop/onnx node (created by
+# PR-3's cop_onnx_setup_node) at a frame and return {cooked, bound_provider,
+# cook_ms, output_planes[], errors[], warnings[]}. Mirrors the SHIPPED PR-3
+# GATED pattern (keyword-only handler + POSITIONAL _preview_X(params: dict)
+# preview_fn that RAISES on an invalid target -> gate DENY +
+# register_handler(cmd, fn, Capability.MUTATING, preview_fn=_preview_X,
+# preview_required=True)).
+#
+# Grounded live (orchestrator pre-red hython probe, H21.0.729; see
+# docs/homedini/plans/_agentic/_artifacts/houdini-orchestrator/pp12-113d/
+# run-inference-api-memo.md):
+#   - Target validation (folds codex Blocker-1): node.type().name()=='onnx'
+#     AND node.type().category()==hou.copNodeTypeCategory() — a bare
+#     'onnx' name can resolve to an unrelated Sop/onnx under a SOP context
+#     (per the PR-3 setup_node docstring); a name-only check is
+#     insufficient. PR-3 stays byte-unchanged; only PR-4 is strengthened.
+#   - node.cook(force=True) RAISES hou.OperationFailed AND populates
+#     node.errors() on a cook error (both, together); a clean cook -> no
+#     raise, errors()==[].
+#   - LOCKED handler algorithm order (folds codex Major-3 footgun): capture
+#     cook_exc; read errors AFTER cook (whether or not it raised); if
+#     cook_exc is not None and not errors: fold str(cook_exc) into errors;
+#     THEN cooked=cooked_from_errors(errors). A raised cook is therefore
+#     NEVER reported cooked:true.
+#   - bound_provider = node.parm('provider').evalAsString() (the token,
+#     e.g. 'automatic') — NOT .eval() (returns the menu INDEX, wrong).
+#   - Output-plane manifest (the load-bearing Phase-0 unknown, GROUNDED):
+#     node.outputNames() -> ('output1',); node.layer(INT_index) ->
+#     hou.ImageLayer with .bufferResolution() -> (xres, yres),
+#     .channelCount() -> int, .storageType() -> a
+#     hou.imageLayerStorageType enum, normalized via normalize_plane_dtype.
+#     layer(i) requires an INT index (a string arg raises TypeError). The
+#     classic COP2 xRes()/yRes()/planes()/stage() API is ABSENT on the new
+#     Copernicus CopNode (AttributeError) — do NOT use it here. The
+#     manifest-assembly loop is guarded behind `if cooked:` — output_planes
+#     is DETERMINISTICALLY [] on a failed cook (GREEN-REVIEW fix 2, codex
+#     threadId 019f2059), never whatever outputNames()/layer(i) happen to
+#     still expose post-failure.
+#   - frame=None -> hou.frame() (default 1.0); an explicit frame is honored
+#     by cooking with frame_range=(frame_to_cook, frame_to_cook) — VERIFIED
+#     live: hou.CopNode.cook accepts a frame_range 2/3-int tuple
+#     (GREEN-REVIEW fix 1, codex threadId 019f2059: frame_to_cook was
+#     computed but never passed to node.cook(), making `frame` dead / a
+#     silent wrong-frame cook).
+#
+# houdini-001 (catalog): NEVER press 'reload' on a cop/onnx node
+# (segfault). run_inference presses NOTHING — it only cook()s an
+# already-configured node; it never presses 'reload' OR 'setupshapes'
+# (setupshapes is PR-3's job; pressing it here would be scope creep + a
+# re-run risk).
+
+
+def _preview_run_inference(params: dict) -> dict:
+    """Return the 109-gate approval payload for cop_onnx_run_inference WITHOUT cooking.
+
+    READ-ONLY / NON-MUTATING: validates node_path resolves to a REAL
+    Copernicus cop/onnx node via BOTH node.type().name()=='onnx' AND
+    node.type().category()==hou.copNodeTypeCategory() (folds codex
+    Blocker-1 — a bare name-only check would let an unrelated Sop/onnx
+    node through). A raise here causes the gate to DENY the call
+    (preview_required=True). The preview MUST NOT cook — cooking in the
+    preview would perform the exact mutation the 109 gate exists to gate.
+
+    Called POSITIONALLY by the gate middleware as ``preview_fn(params)`` —
+    a single ``params: dict`` argument, NOT ``**params`` (matches
+    _preview_set_provider's convention).
+
+    Args:
+        params: dict with keys node_path, frame (the same params dict the
+            handler will later receive as kwargs).
+
+    Returns:
+        {
+            "action": "run ONNX inference (cook)",
+            "node_path": params["node_path"],
+            "frame": params.get("frame"),
+            "bound_provider": <node.parm('provider').evalAsString() or None>,
+            "model_configured": <bool(modelfile parm non-empty)>,
+            "node_exists": True,
+            "node_is_onnx": True,
+        }
+
+    Raises:
+        hou.OperationFailed: when node_path does not resolve to a real
+            node, OR resolves but is NOT a Copernicus cop/onnx node (name
+            and/or category mismatch) — the gate DENIES the call.
+    """
+    node_path = params["node_path"]
+
+    node = hou.node(node_path)
+    if node is None:
+        raise hou.OperationFailed(f"Node not found: {node_path}")
+    if not (
+        node.type().name() == "onnx"
+        and node.type().category() == hou.copNodeTypeCategory()
+    ):
+        raise hou.OperationFailed(
+            f"Node at {node_path!r} is not a Copernicus cop/onnx node "
+            f"(type={node.type().name()!r}, category="
+            f"{node.type().category()!r}), expected a cop/onnx node"
+        )
+
+    provider_parm = node.parm("provider")
+    bound_provider = provider_parm.evalAsString() if provider_parm is not None else None
+
+    modelfile_parm = node.parm("modelfile")
+    modelfile_value = modelfile_parm.eval() if modelfile_parm is not None else ""
+    model_configured = bool(modelfile_value and modelfile_value.strip())
+
+    return {
+        "action": "run ONNX inference (cook)",
+        "node_path": node_path,
+        "frame": params.get("frame"),
+        "bound_provider": bound_provider,
+        "model_configured": model_configured,
+        "node_exists": True,
+        "node_is_onnx": True,
+    }
+
+
+def cop_onnx_run_inference(*, node_path: str, frame: "int | float | None" = None) -> dict:
+    """Cook an ALREADY-CONFIGURED cop/onnx node at a frame. GATED.
+
+    Cooks a node created by PR-3's cop_onnx_setup_node (or any equivalent
+    already-configured cop/onnx node) and returns the cook outcome plus a
+    freshly-read output-plane manifest. GATED (Capability.MUTATING) because
+    a cook burns GPU/CPU and can touch disk.
+
+    FR-5 no-silent-success: a shape-mismatched / mis-wired / unconfigured
+    cook surfaces cooked:false + the cook error(s) verbatim — NEVER a
+    silent cooked:true, NEVER an unhandled raise from this MUTATING
+    handler. The LOCKED ok/cooked split: a failed COOK is
+    ok:True+cooked:False+errors (reported, not raised); only a bad TARGET
+    (node not found / not a cop/onnx node) or an unexpected non-cook
+    exception is ok:False.
+
+    NEVER presses 'reload' (houdini-001 — segfault) or 'setupshapes'
+    (PR-3's job) — this handler only cook()s an already-configured node.
+
+    Returns:
+        On success (cook attempted, whether it succeeded or failed)::
+
+            {
+                "ok": True,
+                "cooked": bool,
+                "node_path": str,
+                "bound_provider": str | None,
+                "cook_ms": float,
+                "output_planes": [
+                    {"name": str, "xres": int, "yres": int,
+                     "channels": int, "dtype": str},
+                    ...
+                ],
+                "errors": [str, ...],
+                "warnings": [str, ...],
+            }
+
+        On a bad TARGET / unexpected failure (FR-5)::
+
+            {"ok": False, "error": "<reason>"}
+
+    Args:
+        node_path: Path to an existing, already-configured cop/onnx node.
+        frame: Frame to cook at. Defaults to the current hou.frame() when
+            None.
+    """
+    try:
+        # FR-2: reject empty node_path INSIDE the try.
+        if not node_path or not node_path.strip():
+            return {"ok": False, "error": "node_path must be a non-empty node path"}
+
+        node = hou.node(node_path)
+        if node is None:
+            return {"ok": False, "error": f"Node not found: {node_path}"}
+        if not (
+            node.type().name() == "onnx"
+            and node.type().category() == hou.copNodeTypeCategory()
+        ):
+            return {
+                "ok": False,
+                "error": (
+                    f"Node at {node_path!r} is not a Copernicus cop/onnx node "
+                    f"(type={node.type().name()!r}, category="
+                    f"{node.type().category()!r}), expected a cop/onnx node"
+                ),
+            }
+
+        frame_to_cook = hou.frame() if frame is None else frame
+
+        # LOCKED cook algorithm order (folds codex Major-3 footgun): capture
+        # cook_exc; read errors AFTER cook (whether or not it raised); fold
+        # str(cook_exc) into errors when errors() came back empty; THEN
+        # compute cooked via the pure predicate. A raised cook is therefore
+        # NEVER reported cooked:true.
+        t0 = _time.monotonic()
+        cook_exc = None
+        try:
+            node.cook(force=True, frame_range=(frame_to_cook, frame_to_cook))
+        except hou.OperationFailed as exc:
+            cook_exc = exc
+        cook_ms = (_time.monotonic() - t0) * 1000.0
+
+        errors = list(node.errors())
+        warnings = list(node.warnings())
+        if cook_exc is not None and not errors:
+            errors = [str(cook_exc)]
+
+        cooked = cooked_from_errors(errors)
+
+        provider_parm = node.parm("provider")
+        bound_provider = provider_parm.evalAsString() if provider_parm is not None else None
+
+        # output_planes is DETERMINISTICALLY [] on a failed cook -- the
+        # manifest-assembly loop only runs when cooked is True. This keeps
+        # a failed cook from exposing whatever stale/partial planes
+        # outputNames()/layer(i) might still report post-failure.
+        output_planes: list = []
+        if cooked:
+            for i, name in enumerate(node.outputNames()):
+                try:
+                    layer = node.layer(i)
+                    xres, yres = layer.bufferResolution()
+                    channels = layer.channelCount()
+                    dtype = normalize_plane_dtype(layer.storageType())
+                    output_planes.append({
+                        "name": name,
+                        "xres": xres,
+                        "yres": yres,
+                        "channels": channels,
+                        "dtype": dtype,
+                    })
+                except Exception as exc:
+                    # Degrade a single bad plane to a name-only entry
+                    # rather than failing the whole call.
+                    _log.warning(
+                        "cop_onnx_run_inference: failed to read output plane "
+                        "%r on node %r: %s",
+                        name, node_path, exc,
+                    )
+                    output_planes.append({"name": name})
+
+        return {
+            "ok": True,
+            "cooked": cooked,
+            "node_path": node_path,
+            "bound_provider": bound_provider,
+            "cook_ms": cook_ms,
+            "output_planes": output_planes,
+            "errors": errors,
+            "warnings": warnings,
+        }
+
+    except Exception as exc:
+        _log.warning(
+            "cop_onnx_run_inference failed for node_path=%r frame=%r: %s",
+            node_path, frame, exc,
+        )
+        return {"ok": False, "error": str(exc)}
+
+
+register_handler(
+    "cop_onnx_run_inference",
+    cop_onnx_run_inference,
+    Capability.MUTATING,
+    preview_fn=_preview_run_inference,
     preview_required=True,
 )

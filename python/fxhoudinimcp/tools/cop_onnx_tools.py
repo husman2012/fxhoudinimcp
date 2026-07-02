@@ -1,14 +1,15 @@
 """MCP wrappers: houdini_cop_onnx_list_models, houdini_cop_onnx_inspect_model,
-houdini_cop_onnx_setup_node, houdini_cop_onnx_set_provider.
+houdini_cop_onnx_setup_node, houdini_cop_onnx_set_provider,
+houdini_cop_onnx_run_inference.
 
 houdini_cop_onnx_list_models / houdini_cop_onnx_inspect_model are
 READ-ONLY, UNGATED (require_approval=False, Capability.READONLY
 handler-side) — the Copernicus-ONNX inspection surface (PP12-113 PR-2).
 
-houdini_cop_onnx_setup_node / houdini_cop_onnx_set_provider are GATED
-(require_approval=True, Capability.MUTATING handler-side) — the first two
-mutating tools of the cop_onnx family (PP12-113 PR-3, PP12-109 security
-gate).
+houdini_cop_onnx_setup_node / houdini_cop_onnx_set_provider /
+houdini_cop_onnx_run_inference are GATED (require_approval=True,
+Capability.MUTATING handler-side) — the mutating tools of the cop_onnx
+family (PP12-113 PR-3 / PR-4, PP12-109 security gate).
 
 houdini_cop_onnx_list_models   — enumerate .onnx files under configured or
                                   given filesystem roots (path/size/mtime).
@@ -36,6 +37,13 @@ houdini_cop_onnx_set_provider  — set the node's Execution Provider parm
                                   + will_bind. GATED. An unavailable
                                   request falls back to automatic + a
                                   warning, does NOT error.
+houdini_cop_onnx_run_inference — cook an ALREADY-CONFIGURED cop/onnx node
+                                  at a frame and return {cooked,
+                                  bound_provider, cook_ms, output_planes[],
+                                  errors[], warnings[]}. GATED. FR-5
+                                  no-silent-success: a failed cook is
+                                  ok:True + cooked:False + errors surfaced
+                                  verbatim (reported, not raised).
 
 Each wrapper delegates to the correspondingly named handler registered on
 the Houdini side via bridge.execute. No domain logic lives here.
@@ -45,6 +53,7 @@ off-DCC for the wrapper pytest suite (CL-015).
 
 PP12-113 / pp12-113b (houdini_cop_onnx_list_models, houdini_cop_onnx_inspect_model)
 PP12-113 / pp12-113c (houdini_cop_onnx_setup_node, houdini_cop_onnx_set_provider)
+PP12-113 / pp12-113d (houdini_cop_onnx_run_inference)
 """
 from __future__ import annotations
 
@@ -218,4 +227,45 @@ async def houdini_cop_onnx_set_provider(
     return await bridge.execute(
         "cop_onnx_set_provider",
         {"node_path": node_path, "provider": provider},
+    )
+
+
+@mcp.tool(meta={"require_approval": True})
+async def houdini_cop_onnx_run_inference(
+    ctx: Context,
+    node_path: str,
+    frame: "int | float | None" = None,
+) -> dict:
+    """Cook an ALREADY-CONFIGURED cop/onnx node at a frame. GATED — mutating.
+
+    Third mutating tool of the cop_onnx family (require_approval=True,
+    PP12-109 security gate). Cooks a node created by
+    houdini_cop_onnx_setup_node (or any equivalent already-configured
+    cop/onnx node) and returns the cook outcome plus a freshly-read
+    output-plane manifest.
+
+    FR-5 no-silent-success: a shape-mismatched / mis-wired / unconfigured
+    cook returns cooked:false + the cook error(s) surfaced verbatim (a
+    normal, valid return value — ok:True, cooked:False), never a silent
+    cooked:true and never an unhandled raise.
+
+    A SINGLE bridge.execute call — the wrapper performs no result
+    interpretation and returns bridge.execute's result VERBATIM, including
+    a failed-cook shape (ok:True, cooked:False, errors:[...]) or a
+    pending-approval / preview response shape from the 109 gate (both are
+    normal, valid return values, not errors).
+
+    Args:
+        ctx: MCP lifespan context — injected by FastMCP; hidden from client schema.
+        node_path: Path to an existing, already-configured cop/onnx node.
+        frame: Frame to cook at. Defaults to the current Houdini frame
+            (handler-side hou.frame()) when None.
+    """
+    # Access _get_bridge through the module reference so that
+    # `patch("fxhoudinimcp.server._get_bridge", ...)` intercepts it correctly
+    # in tests (a local import would cache the original function object).
+    bridge = _fxserver._get_bridge(ctx)
+    return await bridge.execute(
+        "cop_onnx_run_inference",
+        {"node_path": node_path, "frame": frame},
     )

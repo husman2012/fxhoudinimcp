@@ -636,3 +636,57 @@ def choose_provider(requested: str, available: List[str]) -> tuple:
         f"(available: {available!r}); fell back to {fallback!r}"
     )
     return (fallback, warning)
+
+
+# ---------------------------------------------------------------------------
+# cooked_from_errors + normalize_plane_dtype — PP12-113 PR-4
+# ---------------------------------------------------------------------------
+
+def cooked_from_errors(errors: list) -> bool:
+    """Pure FR-5 no-silent-success predicate: cooked iff zero cook errors.
+
+    APPENDED for PP12-113 PR-4 (cop_onnx_run_inference). Pure — never
+    touches hou/Qt/pxr. The raised-but-empty-errors edge (a cook that
+    RAISES hou.OperationFailed but leaves node.errors() empty) is folded
+    into a non-empty `errors` list by the HANDLER before this predicate is
+    called — this function only ever sees the already-folded list.
+
+    Parameters
+    ----------
+    errors : list
+        The cook's errors list (already folded by the handler when the
+        cook raised but node.errors() was empty).
+
+    Returns
+    -------
+    bool
+        True iff `errors` is empty (a clean cook); False otherwise.
+    """
+    return not errors
+
+
+def normalize_plane_dtype(storage_type) -> str:
+    """Map a hou.imageLayerStorageType enum (or its str form) to a plain
+    lowercase dtype token.
+
+    APPENDED for PP12-113 PR-4 (cop_onnx_run_inference's output-plane
+    manifest). Pure — never touches hou/Qt/pxr. Accepts either a plain
+    string already in the enum-qualified form (e.g.
+    ``"imageLayerStorageType.Float32"``), an unqualified plain string
+    (e.g. ``"Float32"``), or any object whose ``str()`` produces one of
+    those forms (e.g. the real ``hou.imageLayerStorageType`` enum member)
+    — ``str()`` is applied first, per the locked contract.
+
+    Parameters
+    ----------
+    storage_type
+        A ``hou.imageLayerStorageType`` enum member, or a str already in
+        either the qualified (``"imageLayerStorageType.Float32"``) or
+        unqualified (``"Float32"``) form.
+
+    Returns
+    -------
+    str
+        The plain lowercase dtype token, e.g. ``"float32"``.
+    """
+    return str(storage_type).rsplit(".", 1)[-1].lower()
