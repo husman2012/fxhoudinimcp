@@ -14,7 +14,7 @@ from typing import Any
 import hou
 
 # Internal
-from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.dispatcher import Capability, register_handler
 
 
 ###### Helpers
@@ -157,7 +157,7 @@ def _get_parameter(node_path: str, parm_name: str, **_: Any) -> dict[str, Any]:
     return result
 
 
-register_handler("parameters.get_parameter", _get_parameter)
+register_handler("parameters.get_parameter", _get_parameter, Capability.READONLY)
 
 
 ###### Handler: parameters.set_parameter
@@ -303,7 +303,7 @@ def _get_parameter_schema(
     }
 
 
-register_handler("parameters.get_parameter_schema", _get_parameter_schema)
+register_handler("parameters.get_parameter_schema", _get_parameter_schema, Capability.READONLY)
 
 
 ###### Handler: parameters.set_expression
@@ -334,7 +334,7 @@ def _set_expression(
     }
 
 
-register_handler("parameters.set_expression", _set_expression)
+register_handler("parameters.set_expression", _set_expression, Capability.CODE_EXEC)  # setExpression executes on every parm eval
 
 
 ###### Handler: parameters.get_expression
@@ -359,7 +359,7 @@ def _get_expression(node_path: str, parm_name: str, **_: Any) -> dict[str, Any]:
     }
 
 
-register_handler("parameters.get_expression", _get_expression)
+register_handler("parameters.get_expression", _get_expression, Capability.READONLY)
 
 
 ###### Handler: parameters.revert_parameter
@@ -409,7 +409,7 @@ def _link_parameters(
     }
 
 
-register_handler("parameters.link_parameters", _link_parameters)
+register_handler("parameters.link_parameters", _link_parameters, Capability.CODE_EXEC)  # setExpression channel ref — executes on every parm eval
 
 
 ###### Handler: parameters.lock_parameter

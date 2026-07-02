@@ -24,6 +24,7 @@ _HANDLER_MODULES = [
     "code_handlers",
     "dop_handlers",
     "animation_handlers",
+    "character_handlers",
     "rendering_handlers",
     "viewport_handlers",
     "geometry_handlers",
@@ -38,6 +39,10 @@ _HANDLER_MODULES = [
     "chop_handlers",
     "cache_handlers",
     "take_handlers",
+    "export_handlers",
+    "render_readback_handlers",
+    "usd_export_handlers",
+    "cop_onnx_handlers",
 ]
 
 _loaded = []

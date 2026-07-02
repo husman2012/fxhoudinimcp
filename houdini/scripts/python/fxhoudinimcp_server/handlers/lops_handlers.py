@@ -14,7 +14,7 @@ import hou
 
 # Internal
 from fxhoudinimcp_server.config import layout_if_enabled
-from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.dispatcher import Capability, register_handler
 
 # USD modules -- may not be available in all Houdini configurations
 try:
@@ -196,7 +196,7 @@ def _get_stage_info(*, node_path: str) -> dict[str, Any]:
         "layers": layers[:50],  # Cap to avoid huge responses
     }
 
-register_handler("lops.get_stage_info", _get_stage_info)
+register_handler("lops.get_stage_info", _get_stage_info, Capability.READONLY)
 
 
 ###### lops.get_usd_prim
@@ -219,7 +219,7 @@ def _get_usd_prim(
         "prim": _prim_to_dict(prim, include_attrs=True),
     }
 
-register_handler("lops.get_usd_prim", _get_usd_prim)
+register_handler("lops.get_usd_prim", _get_usd_prim, Capability.READONLY)
 
 
 ###### lops.list_usd_prims
@@ -286,7 +286,7 @@ def _list_usd_prims(
         "prims": results,
     }
 
-register_handler("lops.list_usd_prims", _list_usd_prims)
+register_handler("lops.list_usd_prims", _list_usd_prims, Capability.READONLY)
 
 
 ###### lops.get_usd_attribute
@@ -324,7 +324,7 @@ def _get_usd_attribute(
         "value": _usd_value_to_python(value),
     }
 
-register_handler("lops.get_usd_attribute", _get_usd_attribute)
+register_handler("lops.get_usd_attribute", _get_usd_attribute, Capability.READONLY)
 
 
 ###### lops.get_usd_layers
@@ -351,7 +351,7 @@ def _get_usd_layers(*, node_path: str) -> dict[str, Any]:
         "layers": layers,
     }
 
-register_handler("lops.get_usd_layers", _get_usd_layers)
+register_handler("lops.get_usd_layers", _get_usd_layers, Capability.READONLY)
 
 
 ###### lops.get_usd_prim_stats
@@ -385,7 +385,7 @@ def _get_usd_prim_stats(
         "type_counts": dict(sorted_types),
     }
 
-register_handler("lops.get_usd_prim_stats", _get_usd_prim_stats)
+register_handler("lops.get_usd_prim_stats", _get_usd_prim_stats, Capability.READONLY)
 
 
 ###### lops.get_last_modified_prims
@@ -439,7 +439,7 @@ def _get_last_modified_prims(*, node_path: str) -> dict[str, Any]:
         "note": "Fallback: showing all prims authored in the edit target layer",
     }
 
-register_handler("lops.get_last_modified_prims", _get_last_modified_prims)
+register_handler("lops.get_last_modified_prims", _get_last_modified_prims, Capability.READONLY)
 
 
 ###### lops.create_lop_node
@@ -537,7 +537,7 @@ else:
         "success": True,
     }
 
-register_handler("lops.set_usd_attribute", _set_usd_attribute)
+register_handler("lops.set_usd_attribute", _set_usd_attribute, Capability.CODE_EXEC)  # injects Python snippet into a LOP node and cook(force=True)
 
 
 ###### lops.get_usd_materials
@@ -594,7 +594,7 @@ def _get_usd_materials(*, node_path: str) -> dict[str, Any]:
         "materials": materials,
     }
 
-register_handler("lops.get_usd_materials", _get_usd_materials)
+register_handler("lops.get_usd_materials", _get_usd_materials, Capability.READONLY)
 
 
 ###### lops.find_usd_prims
@@ -624,7 +624,7 @@ def _find_usd_prims(
         "prims": results,
     }
 
-register_handler("lops.find_usd_prims", _find_usd_prims)
+register_handler("lops.find_usd_prims", _find_usd_prims, Capability.READONLY)
 
 
 ###### lops.get_usd_composition
@@ -701,7 +701,7 @@ def _get_usd_composition(
         "specializes": specializes,
     }
 
-register_handler("lops.get_usd_composition", _get_usd_composition)
+register_handler("lops.get_usd_composition", _get_usd_composition, Capability.READONLY)
 
 
 ###### lops.get_usd_variants
@@ -736,7 +736,7 @@ def _get_usd_variants(
         "variant_sets": variant_sets,
     }
 
-register_handler("lops.get_usd_variants", _get_usd_variants)
+register_handler("lops.get_usd_variants", _get_usd_variants, Capability.READONLY)
 
 
 ###### lops.inspect_usd_layer
@@ -790,7 +790,7 @@ def _inspect_usd_layer(
         "documentation": layer.documentation if hasattr(layer, "documentation") else None,
     }
 
-register_handler("lops.inspect_usd_layer", _inspect_usd_layer)
+register_handler("lops.inspect_usd_layer", _inspect_usd_layer, Capability.READONLY)
 
 
 ###### lops.create_light
@@ -940,7 +940,7 @@ def _list_lights(*, node_path: str, **_: Any) -> dict[str, Any]:
         "lights": lights,
     }
 
-register_handler("lops.list_lights", _list_lights)
+register_handler("lops.list_lights", _list_lights, Capability.READONLY)
 
 
 ###### lops.set_light_properties
@@ -1025,7 +1025,7 @@ def _set_light_properties(
         "updated_properties": updated_properties,
     }
 
-register_handler("lops.set_light_properties", _set_light_properties)
+register_handler("lops.set_light_properties", _set_light_properties, Capability.CODE_EXEC)  # injects Python snippet into pythonscript LOP and cook(force=True)
 
 
 ###### lops.create_light_rig

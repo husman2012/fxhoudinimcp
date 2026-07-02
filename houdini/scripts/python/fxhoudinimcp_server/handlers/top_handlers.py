@@ -13,7 +13,7 @@ import logging
 import hou
 
 # Internal
-from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.dispatcher import Capability, register_handler
 
 logger = logging.getLogger(__name__)
 
@@ -629,13 +629,13 @@ def _build_scheduler_info(sched_node: hou.Node) -> dict:
 
 ###### Registration
 
-register_handler("tops.get_top_network_info", get_top_network_info)
+register_handler("tops.get_top_network_info", get_top_network_info, Capability.READONLY)
 register_handler("tops.cook_top_node", cook_top_node)
 register_handler("tops.cancel_top_cook", cancel_top_cook)
 register_handler("tops.pause_top_cook", pause_top_cook)
 register_handler("tops.dirty_work_items", dirty_work_items)
-register_handler("tops.get_work_item_states", get_work_item_states)
-register_handler("tops.get_work_item_info", get_work_item_info)
-register_handler("tops.get_pdg_graph", get_pdg_graph)
+register_handler("tops.get_work_item_states", get_work_item_states, Capability.READONLY)
+register_handler("tops.get_work_item_info", get_work_item_info, Capability.READONLY)
+register_handler("tops.get_pdg_graph", get_pdg_graph, Capability.READONLY)
 register_handler("tops.generate_static_items", generate_static_items)
-register_handler("tops.get_top_scheduler_info", get_top_scheduler_info)
+register_handler("tops.get_top_scheduler_info", get_top_scheduler_info, Capability.READONLY)

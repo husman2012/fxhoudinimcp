@@ -13,7 +13,7 @@ import os
 import hou
 
 # Internal
-from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.dispatcher import Capability, register_handler
 
 
 ###### Helpers
@@ -520,13 +520,13 @@ def set_hda_section_content(
 
 ###### Registration
 
-register_handler("hda.list_installed_hdas", list_installed_hdas)
-register_handler("hda.get_hda_info", get_hda_info)
+register_handler("hda.list_installed_hdas", list_installed_hdas, Capability.READONLY)
+register_handler("hda.get_hda_info", get_hda_info, Capability.READONLY)
 register_handler("hda.install_hda", install_hda)
 register_handler("hda.uninstall_hda", uninstall_hda)
 register_handler("hda.reload_hda", reload_hda)
 register_handler("hda.create_hda", create_hda)
 register_handler("hda.update_hda", update_hda)
-register_handler("hda.get_hda_sections", get_hda_sections)
-register_handler("hda.get_hda_section_content", get_hda_section_content)
+register_handler("hda.get_hda_sections", get_hda_sections, Capability.READONLY)
+register_handler("hda.get_hda_section_content", get_hda_section_content, Capability.READONLY)
 register_handler("hda.set_hda_section_content", set_hda_section_content)

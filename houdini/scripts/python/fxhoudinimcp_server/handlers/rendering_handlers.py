@@ -15,7 +15,7 @@ import os
 import hou
 
 # Internal
-from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.dispatcher import Capability, register_handler
 
 logger = logging.getLogger(__name__)
 
@@ -610,10 +610,10 @@ def get_render_progress(node_path: str) -> dict:
 
 register_handler("rendering.render_viewport", render_viewport)
 register_handler("rendering.render_quad_view", render_quad_view)
-register_handler("rendering.list_render_nodes", list_render_nodes)
-register_handler("rendering.get_render_settings", get_render_settings)
+register_handler("rendering.list_render_nodes", list_render_nodes, Capability.READONLY)
+register_handler("rendering.get_render_settings", get_render_settings, Capability.READONLY)
 register_handler("rendering.set_render_settings", set_render_settings)
 register_handler("rendering.create_render_node", create_render_node)
 register_handler("rendering.start_render", start_render)
 register_handler("rendering.render_node_network", render_node_network)
-register_handler("rendering.get_render_progress", get_render_progress)
+register_handler("rendering.get_render_progress", get_render_progress, Capability.READONLY)

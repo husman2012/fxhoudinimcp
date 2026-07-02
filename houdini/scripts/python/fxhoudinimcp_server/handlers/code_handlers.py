@@ -16,7 +16,7 @@ from typing import Any
 import hou
 
 # Internal
-from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.dispatcher import Capability, register_handler
 
 
 ###### Constants
@@ -126,7 +126,7 @@ def _execute_python(
     return response
 
 
-register_handler("code.execute_python", _execute_python)
+register_handler("code.execute_python", _execute_python, Capability.CODE_EXEC)
 
 
 ###### Handler: code.execute_hscript
@@ -142,7 +142,7 @@ def _execute_hscript(command: str, **_: Any) -> dict[str, Any]:
     }
 
 
-register_handler("code.execute_hscript", _execute_hscript)
+register_handler("code.execute_hscript", _execute_hscript, Capability.CODE_EXEC)
 
 
 ###### Handler: code.evaluate_expression
@@ -169,7 +169,7 @@ def _evaluate_expression(
     }
 
 
-register_handler("code.evaluate_expression", _evaluate_expression)
+register_handler("code.evaluate_expression", _evaluate_expression, Capability.CODE_EXEC)
 
 
 ###### Handler: code.get_env_variable
@@ -186,4 +186,4 @@ def _get_env_variable(var_name: str, **_: Any) -> dict[str, Any]:
     }
 
 
-register_handler("code.get_env_variable", _get_env_variable)
+register_handler("code.get_env_variable", _get_env_variable, Capability.READONLY)

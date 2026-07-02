@@ -42,15 +42,27 @@ def execute(request, command="", params=None, request_id=""):
 
 @hwebserver.apiFunction(namespace="mcp")
 def health(request):
-    """Health check endpoint. Returns Houdini version and session info."""
+    """Health check endpoint. Returns Houdini version, session info, and gate status."""
     import hou
 
-    return {
+    result = {
         "status": "ok",
         "houdini_version": hou.applicationVersionString(),
         "hip_file": hou.hipFile.name(),
         "pid": os.getpid(),
     }
+
+    # Additive gate fields — present when gate is installed, omitted otherwise.
+    # Failure here must not break the health endpoint (fail-open for health only).
+    try:
+        gate_attr = getattr(hou.session, "_fxhoudinimcp_gate", None)
+        if gate_attr is not None:
+            result["gate_mode"] = gate_attr.config.mode.value
+            result["pending_count"] = len(gate_attr.queue.list())  # FIX-4: public TTL-purging API
+    except Exception:  # noqa: BLE001
+        pass  # health endpoint is fail-open — gate status is advisory
+
+    return result
 
 
 @hwebserver.apiFunction(namespace="mcp")

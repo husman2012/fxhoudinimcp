@@ -20,7 +20,7 @@ from typing import Any
 import hou
 
 # Internal
-from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.dispatcher import Capability, register_handler
 
 ###### Corpus access
 
@@ -162,7 +162,7 @@ def search_help(
     }
 
 
-register_handler("help.search_help", search_help)
+register_handler("help.search_help", search_help, Capability.READONLY)
 
 
 ###### help.get_help_page
@@ -211,4 +211,4 @@ def get_help_page(path: str, **_: Any) -> dict:
     }
 
 
-register_handler("help.get_help_page", get_help_page)
+register_handler("help.get_help_page", get_help_page, Capability.READONLY)

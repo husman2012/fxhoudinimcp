@@ -15,7 +15,7 @@ from typing import Any
 import hou
 
 # Internal
-from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.dispatcher import Capability, register_handler
 
 
 def _menu_index_by_label(parm: hou.Parm, label_substring: str) -> int | None:
@@ -147,7 +147,7 @@ def _list_caches(*, root_path: str = "/", **_: Any) -> dict[str, Any]:
         "caches": caches,
     }
 
-register_handler("cache.list_caches", _list_caches)
+register_handler("cache.list_caches", _list_caches, Capability.READONLY)
 
 
 ###### cache.get_cache_status
@@ -209,7 +209,7 @@ def _get_cache_status(*, node_path: str, **_: Any) -> dict[str, Any]:
         "is_valid": is_valid,
     }
 
-register_handler("cache.get_cache_status", _get_cache_status)
+register_handler("cache.get_cache_status", _get_cache_status, Capability.READONLY)
 
 
 ###### cache.clear_cache

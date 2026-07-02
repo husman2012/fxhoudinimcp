@@ -14,7 +14,7 @@ import hou
 
 # Internal
 from fxhoudinimcp_server.config import layout_if_enabled
-from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.dispatcher import Capability, register_handler
 
 
 ###### Helpers
@@ -128,7 +128,7 @@ def _get_chop_data(
 
     return result
 
-register_handler("chops.get_chop_data", _get_chop_data)
+register_handler("chops.get_chop_data", _get_chop_data, Capability.READONLY)
 
 
 ###### chops.create_chop_node
@@ -208,7 +208,7 @@ def _list_chop_channels(*, node_path: str, **_: Any) -> dict[str, Any]:
         "channels": channels,
     }
 
-register_handler("chops.list_chop_channels", _list_chop_channels)
+register_handler("chops.list_chop_channels", _list_chop_channels, Capability.READONLY)
 
 
 ###### chops.export_chop_to_parm
@@ -257,4 +257,4 @@ def _export_chop_to_parm(
         "target_parm": f"{target_node_path}/{target_parm_name}",
     }
 
-register_handler("chops.export_chop_to_parm", _export_chop_to_parm)
+register_handler("chops.export_chop_to_parm", _export_chop_to_parm, Capability.CODE_EXEC)  # setExpression (chop() ref) executes on every parm eval
