@@ -62,6 +62,29 @@ def _query_health(port: int, timeout: float = 0.5) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _pick_free_port(base, probe, max_tries=16, my_pid=None):
+    """Return the first free hwebserver port at/after `base`.
+
+    `probe(port)` returns the mcp.health dict (with a 'pid' key) when a server
+    answers on that port, or None when nothing answers. A port is FREE when
+    probe returns None; a port already owned by THIS process (probe -> pid == my_pid)
+    is treated as ours and returned (idempotent restart). A port owned by another
+    pid is skipped. Raises RuntimeError when no free port exists in the range.
+    """
+    if my_pid is None:
+        my_pid = os.getpid()
+    for port in range(base, base + max_tries):
+        health = probe(port)
+        if health is None:
+            return port                       # free
+        if isinstance(health, dict) and health.get("pid") == my_pid:
+            return port                       # already ours
+        # else: owned by another pid -> try the next port
+    raise RuntimeError(
+        "no free hwebserver port in [{}, {})".format(base, base + max_tries)
+    )
+
+
 def _wait_for_current_process_health(
     port: int,
     timeout_seconds: float = 15.0,
@@ -137,7 +160,8 @@ def start(port: int | None = None) -> None:
         print("[fxhoudinimcp] Server already running")
         return
 
-    _port = port or int(os.environ.get("FXHOUDINIMCP_PORT", "8100"))
+    base = port or int(os.environ.get("FXHOUDINIMCP_PORT", "8100"))
+    _port = _pick_free_port(base, _query_health, my_pid=os.getpid())
 
     # Import handlers to trigger registration via register_handler() calls
     from fxhoudinimcp_server import handlers  # noqa: F401
