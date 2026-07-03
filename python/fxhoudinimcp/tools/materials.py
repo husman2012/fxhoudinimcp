@@ -124,6 +124,41 @@ async def create_mtlx_material(
 
 
 @mcp.tool()
+async def bind_usd_material(
+    ctx: Context,
+    input_lop: str,
+    geo_pattern: str,
+    material_prim: str,
+    name: str = "bind_material",
+) -> dict:
+    """Bind a USD Material prim to geometry prims on a stage, by primitive pattern.
+
+    The LOP/Solaris counterpart of ``assign_material`` (the SOP material node) — creates an
+    ``assignmaterial`` LOP after ``input_lop`` and authors a USD ``material:binding`` on every
+    prim matching ``geo_pattern``. Fails loud if the material prim is missing or the pattern
+    matches nothing (a binding that authors nothing would otherwise report success).
+
+    Args:
+        ctx: MCP context.
+        input_lop: LOP node whose stage carries the geometry + material prims.
+        geo_pattern: USD primitive pattern for the prims to bind (e.g. ``/asset/geo/*`` or a
+            collection like ``/table.collections:donuts``).
+        material_prim: Path of the USD Material prim to bind (e.g. ``/materials/redmat``).
+        name: Name for the created ``assignmaterial`` LOP.
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute(
+        "materials.bind_usd_material",
+        {
+            "input_lop": input_lop,
+            "geo_pattern": geo_pattern,
+            "material_prim": material_prim,
+            "name": name,
+        },
+    )
+
+
+@mcp.tool()
 async def list_material_types(
     ctx: Context,
     filter: Optional[str] = None,
