@@ -132,6 +132,122 @@ def _get_geometry_info(*, node_path: str) -> dict[str, Any]:
 register_handler("geometry.get_geometry_info", _get_geometry_info, Capability.READONLY)
 
 
+###### geometry.get_heightfield_layer_stats
+
+# Voxel-count cap for an EXACT (bulk allVoxels) mean/histogram. Above it, a memory-bounded
+# strided sample is used. Module-level so tests can lower it to exercise the sampling path.
+_HF_VOXEL_CAP = 4_000_000
+
+
+def _get_heightfield_layer_stats(
+    *,
+    node_path: str,
+    layer: str = "height",
+    histogram_bins: int = 0,
+) -> dict[str, Any]:
+    """Per-layer voxel statistics (min/max/mean, optional histogram) for a heightfield layer.
+
+    A heightfield layer is a ``Volume`` primitive named after the layer (``height``, ``mask``,
+    ``debris``, ...). ``get_geometry_info``/``get_attrib_values`` read attributes, not voxels, so
+    the numeric content of a layer was previously unreadable over the MCP — this is the
+    anti-fabrication read for terrain evals (assert on real erosion/mask ranges, not existence).
+
+    ``min``/``max`` are always EXACT (from the volume intrinsics, no read). ``mean`` and the
+    optional ``histogram`` are exact for fields up to ~4M voxels (a full ``allVoxels`` read); for
+    larger fields they are computed from a memory-bounded strided grid of ~4M indexed voxel reads
+    (the full buffer is never materialized) — ``sampled`` is then True and ``sample_count`` is the
+    number of voxels actually read. The histogram counts are over that sample (scale by
+    ``voxel_count / sample_count`` to approximate full-volume counts).
+
+    Args:
+        node_path: SOP node whose geometry carries the heightfield layers.
+        layer: layer (Volume prim) name to read (default ``height``).
+        histogram_bins: if > 0, also return a ``histogram`` of that many equal-width bins over
+            [min, max] plus ``bin_edges``. 0 (default) omits it.
+
+    Returns:
+        ``{node_path, layer, resolution, voxel_count, min, max, mean, sampled, sample_count,
+        [histogram, bin_edges]}``.
+    """
+    geo = _get_sop_geo(node_path)
+    name_attr = geo.findPrimAttrib("name")
+
+    target = None
+    available: list[str] = []
+    for prim in geo.prims():
+        if prim.type() != hou.primType.Volume:
+            continue
+        nm = prim.attribValue("name") if name_attr else ""
+        available.append(nm)
+        if nm == layer:
+            target = prim
+    if target is None:
+        raise ValueError(
+            f"heightfield layer {layer!r} not found on {node_path} — available Volume layers: "
+            f"{available or '(none — not a heightfield?)'}")
+
+    res = target.resolution()
+    rx, ry, rz = int(res[0]), int(res[1]), int(res[2])
+    voxel_count = rx * ry * rz
+    vmin = float(target.intrinsicValue("volumeminvalue"))
+    vmax = float(target.intrinsicValue("volumemaxvalue"))
+
+    # mean (+ histogram) from the voxels. Exact up to the cap via a bulk allVoxels read; above it,
+    # a memory-bounded strided grid of indexed voxel() reads (the full buffer is never built). The
+    # stride is isotropic over the NON-unit axes only, so a 2D heightfield (rz==1) reduces over 2
+    # axes (sqrt) and a 3D volume over 3 (cube root) — keeping sample_count within ~the cap either way.
+    if voxel_count <= _HF_VOXEL_CAP:
+        sample = list(target.allVoxels())
+        sampled = False
+    else:
+        nz_axes = sum(1 for r in (rx, ry, rz) if r > 1) or 1
+        stride = max(1, math.ceil((voxel_count / _HF_VOXEL_CAP) ** (1.0 / nz_axes)))
+        stepx = stride if rx > 1 else 1
+        stepy = stride if ry > 1 else 1
+        stepz = stride if rz > 1 else 1
+        sample = [target.voxel((x, y, z))
+                  for x in range(0, rx, stepx)
+                  for y in range(0, ry, stepy)
+                  for z in range(0, rz, stepz)]
+        sampled = True
+    sample_count = len(sample)
+    mean = (sum(sample) / sample_count) if sample_count else 0.0
+
+    result: dict[str, Any] = {
+        "node_path": node_path,
+        "layer": layer,
+        "resolution": [rx, ry, rz],
+        "voxel_count": voxel_count,
+        "min": vmin,
+        "max": vmax,
+        "mean": mean,
+        "sampled": sampled,
+        "sample_count": sample_count,
+    }
+
+    if histogram_bins > 0:
+        edges = [vmin + (vmax - vmin) * i / histogram_bins for i in range(histogram_bins + 1)]
+        counts = [0] * histogram_bins
+        span = vmax - vmin
+        if span > 0:
+            for v in sample:
+                idx = int((v - vmin) / span * histogram_bins)
+                if idx >= histogram_bins:
+                    idx = histogram_bins - 1
+                elif idx < 0:
+                    idx = 0
+                counts[idx] += 1
+        else:
+            # flat field (min == max): every sampled voxel falls in bin 0.
+            counts[0] = sample_count
+        result["histogram"] = counts  # counts are over `sample` (see sample_count)
+        result["bin_edges"] = edges
+
+    return result
+
+register_handler("geometry.get_heightfield_layer_stats", _get_heightfield_layer_stats, Capability.READONLY)
+
+
 ###### geometry.get_points
 
 def _get_points(
