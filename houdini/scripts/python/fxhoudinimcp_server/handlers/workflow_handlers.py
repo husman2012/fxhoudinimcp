@@ -507,14 +507,16 @@ def _setup_flip_sim(
     name: str = "flip_sim",
     **_: Any,
 ) -> dict:
-    """Build a complete FLIP fluid simulation network.
+    """Build a complete, EMITTING FLIP fluid simulation network.
 
-    Creates a geometry node with a DOP Network, FLIP solver, FLIP source,
-    FLIP domain/tank, Object Merge for source, and a File Cache.
+    Creates a geometry node with an Object Merge for the source, a DOP Network
+    holding a FLIP Object (sourced from the source geometry via its `soppath` parm)
+    and a FLIP Solver, a DOP Import, and a File Cache. The FLIP Object generates the
+    fluid particles from the source SOP — there is no separate FLIP-source/tank node.
 
     Args:
-        source_geo: Path to the source geometry SOP.
-        domain: Domain type hint (reserved for future use).
+        source_geo: Path to the source geometry SOP (becomes the initial fluid).
+        domain: Domain type hint (currently unused; the FLIP object's implicit grid is used).
         particle_sep: Particle separation distance for the FLIP sim.
         name: Name for the top-level geometry node.
     """
@@ -552,47 +554,25 @@ def _setup_flip_sim(
         flipsolver = dopnet.createNode("flipsolver::2.0", "flipsolver1")
     all_nodes.append(flipsolver.path())
 
-    # -- Step 5: Create FLIP Object
-    print("[workflow] Creating FLIP Object DOP")
+    # -- Step 5: Create FLIP Object, SOURCED from the source geometry via its `soppath` parm.
+    # A flipobject has NO inputs — it generates fluid particles from the SOP named in `soppath`.
+    # Setting soppath to the source is THE fix for the previously-degraded factory: without it the
+    # object had no fluid and the sim emitted 0 particles (object_count stayed 0). The old code
+    # also created a `flipsource`/`fluidtank` that do not exist in the DOP context (H21) and were
+    # never wired into anything — removed. Live-proven 2026-07-03: sourced flipobject -> 1268
+    # particles / object_count 1 after stepping.
+    print("[workflow] Creating FLIP Object DOP (sourced from the source geometry via soppath)")
+    flipobj = dopnet.createNode("flipobject", "flipobject1")
+    all_nodes.append(flipobj.path())
+    _set_parm_safe(flipobj, "particlesep", particle_sep)
+    _set_parm_safe(flipobj, "soppath", objmerge.path())
+    flipsolver.setInput(0, flipobj, 0)
+    # The solver is the dopnet's sim output — make it the display node so a headless
+    # dop.cook() (and the dopimport) actually pull the simulation.
     try:
-        flipobj = dopnet.createNode("flipobject", "flipobject1")
-        all_nodes.append(flipobj.path())
-        _set_parm_safe(flipobj, "particlesep", particle_sep)
-        flipsolver.setInput(0, flipobj, 0)
-    except hou.OperationFailed:
-        print("[workflow] Warning: flipobject not available")
-        flipobj = None
-
-    # -- Step 6: Create FLIP Source
-    print("[workflow] Creating FLIP Source DOP")
-    try:
-        flipsource = dopnet.createNode("flipsource", "flipsource1")
-        all_nodes.append(flipsource.path())
-    except hou.OperationFailed:
-        print("[workflow] Warning: flipsource not available, trying volume source")
-        try:
-            flipsource = dopnet.createNode("sourcevolume", "flipsource1")
-            all_nodes.append(flipsource.path())
-        except hou.OperationFailed:
-            print("[workflow] Warning: source volume not available")
-            flipsource = None
-
-    # -- Step 7: Create FLIP Tank / Domain
-    print("[workflow] Creating FLIP Tank / Domain")
-    try:
-        fliptank = geo.createNode("fluidtank", "flip_tank1")
-        all_nodes.append(fliptank.path())
-    except hou.OperationFailed:
-        print("[workflow] Warning: fluidtank not available, creating box domain")
-        try:
-            fliptank = geo.createNode("box", "flip_domain1")
-            _set_parm_safe(fliptank, "sizex", 4.0)
-            _set_parm_safe(fliptank, "sizey", 4.0)
-            _set_parm_safe(fliptank, "sizez", 4.0)
-            all_nodes.append(fliptank.path())
-        except Exception as e:
-            print(f"[workflow] Warning: could not create domain: {e}")
-            fliptank = None
+        flipsolver.setDisplayFlag(True)
+    except Exception:
+        pass
 
     # -- Step 8: DOP Import
     print("[workflow] Creating DOP Import SOP")
