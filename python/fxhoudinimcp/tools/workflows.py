@@ -148,6 +148,42 @@ async def setup_vellum_sim(
 
 
 @mcp.tool()
+async def setup_constraint_network(
+    ctx: Context,
+    geo_path: str = "/obj/geo1",
+    constraint_type: str = "glue",
+    strength: float = 10000.0,
+    ground: bool = True,
+    name: str = "constraint_sim",
+) -> dict:
+    """Build a fractured-RBD simulation with a CONSTRAINT NETWORK (glue/soft/hard) in one call.
+
+    Preferred over hand-wiring — fractures the source (rbdmaterialfracture), sets the constraint
+    type + strength on its constraint output (rbdconstraintproperties), and feeds geometry +
+    constraints into the SOP Bullet solver. The strength is also a per-piece attribute (glue
+    'strength' / soft 'stiffness') so a downstream weak-zone can vary it for a break pattern.
+
+    Args:
+        geo_path: Source geometry object path (fractured into pieces).
+        constraint_type: "glue" (rigid until broken), "soft" (springy), or "hard".
+        strength: Glue strength (default 10000) or, for soft, the stiffness.
+        ground: Add a ground plane to the solver.
+        name: Top-level geo node name.
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute(
+        "workflow.setup_constraint_network",
+        {
+            "geo_path": geo_path,
+            "constraint_type": constraint_type,
+            "strength": strength,
+            "ground": ground,
+            "name": name,
+        },
+    )
+
+
+@mcp.tool()
 async def create_material(
     ctx: Context,
     name: str = "material1",

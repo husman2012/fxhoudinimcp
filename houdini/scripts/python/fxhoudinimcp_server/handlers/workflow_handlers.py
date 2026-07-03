@@ -754,6 +754,114 @@ def _setup_vellum_sim(
     }
 
 
+###### workflow.setup_constraint_network
+
+_CONSTRAINT_TYPES = ("glue", "soft", "hard")
+
+
+def _setup_constraint_network(
+    geo_path: str = "/obj/geo1",
+    constraint_type: str = "glue",
+    strength: float = 10000.0,
+    ground: bool = True,
+    name: str = "constraint_sim",
+    **_: Any,
+) -> dict:
+    """Build a complete fractured-RBD sim with a CONSTRAINT NETWORK (glue/soft/hard).
+
+    Fractures the source (rbdmaterialfracture, whose output 1 is the constraint geometry),
+    sets the constraint TYPE + STRENGTH on it (rbdconstraintproperties), and feeds geometry +
+    constraints into the SOP Bullet solver — the multi-node build agents otherwise hand-assemble
+    every time. The constraint strength is also exposed as a per-piece attribute (glue
+    'strength' / soft 'stiffness') so a downstream weak-zone can vary it for a break pattern.
+
+    Args:
+        geo_path: Source geometry object path (fractured into pieces).
+        constraint_type: "glue" (rigid until strength exceeded), "soft" (springy), or "hard".
+        strength: Glue strength (default 10000) or, for soft, the stiffness.
+        ground: Add a ground plane to the solver.
+        name: Top-level geo node name.
+    """
+    if constraint_type not in _CONSTRAINT_TYPES:
+        raise ValueError(
+            f"constraint_type must be one of {_CONSTRAINT_TYPES}, got {constraint_type!r}")
+
+    obj = _ensure_obj_context()
+    all_nodes: list[str] = []
+
+    print(f"[workflow] Creating geo node '{name}' under /obj")
+    geo = obj.createNode("geo", name)
+    for child in geo.children():
+        child.destroy()
+    all_nodes.append(geo.path())
+
+    print(f"[workflow] Creating Object Merge for source: {geo_path}")
+    objmerge = geo.createNode("object_merge", "source_geo")
+    _set_parm_safe(objmerge, "objpath1", geo_path)
+    all_nodes.append(objmerge.path())
+
+    # Fracture: rbdmaterialfracture output 0 = geometry, 1 = constraints, 2 = proxy.
+    # It is REQUIRED here (unlike setup_rbd_sim's optional fracture) because the constraint
+    # network IS its constraints output — a scatter+voronoifracture fallback produces none.
+    print("[workflow] Creating RBD Material Fracture SOP (source of the constraint network)")
+    fracture = geo.createNode("rbdmaterialfracture", "fracture1")
+    fracture.setInput(0, objmerge, 0)
+    all_nodes.append(fracture.path())
+
+    # Constraint properties on the constraints output: set type + strength (+ the strength
+    # attribute the solver reads per-piece, so a weak zone can override it downstream).
+    print(f"[workflow] Creating RBD Constraint Properties ({constraint_type}, strength={strength})")
+    conprops = geo.createNode("rbdconstraintproperties", "constraint_props1")
+    conprops.setInput(0, fracture, 1)
+    _set_parm_safe(conprops, "constrainttype", constraint_type)
+    if constraint_type == "glue":
+        _set_parm_safe(conprops, "doglue_strength", 1)
+        _set_parm_safe(conprops, "glue_strength", strength)
+    elif constraint_type == "soft":
+        _set_parm_safe(conprops, "dosoft_stiffness", 1)
+        _set_parm_safe(conprops, "soft_stiffness", strength)
+    all_nodes.append(conprops.path())
+
+    # SOP Bullet solver: input 0 = geometry, 1 = constraints (with properties), 2 = proxy.
+    print("[workflow] Creating SOP-level RBD Bullet Solver with constraints")
+    solver = geo.createNode("rbdbulletsolver", "rbd_solver1")
+    solver.setInput(0, fracture, 0)
+    solver.setInput(1, conprops, 0)
+    solver.setInput(2, fracture, 2)
+    _set_parm_safe(solver, "useground", 1 if ground else 0)
+    all_nodes.append(solver.path())
+
+    print("[workflow] Creating File Cache SOP")
+    try:
+        filecache = geo.createNode("filecache", "file_cache1")
+    except hou.OperationFailed:
+        filecache = geo.createNode("filecache::2.0", "file_cache1")
+    filecache.setInput(0, solver, 0)
+    all_nodes.append(filecache.path())
+    try:
+        filecache.setDisplayFlag(True)
+        filecache.setRenderFlag(True)
+    except Exception:
+        pass
+
+    print("[workflow] Laying out nodes")
+    layout_if_enabled(geo)
+    _focus_network_editor(filecache)
+
+    print(f"[workflow] Constraint-network RBD simulation '{name}' setup complete")
+
+    return {
+        "success": True,
+        "geo_path": geo.path(),
+        "fracture_path": fracture.path(),
+        "constraint_props_path": conprops.path(),
+        "solver_path": solver.path(),
+        "cache_path": filecache.path(),
+        "constraint_type": constraint_type,
+        "all_nodes": all_nodes,
+    }
+
+
 ###### workflow.create_material
 
 def _create_material(
@@ -1131,6 +1239,7 @@ register_handler("workflow.setup_pyro_sim", _setup_pyro_sim)
 register_handler("workflow.setup_rbd_sim", _setup_rbd_sim)
 register_handler("workflow.setup_flip_sim", _setup_flip_sim)
 register_handler("workflow.setup_vellum_sim", _setup_vellum_sim)
+register_handler("workflow.setup_constraint_network", _setup_constraint_network)
 register_handler("workflow.create_material", _create_material)
 register_handler("workflow.assign_material", _assign_material)
 register_handler("workflow.build_sop_chain", _build_sop_chain)
