@@ -184,6 +184,40 @@ async def setup_constraint_network(
 
 
 @mcp.tool()
+async def setup_whitewater(
+    ctx: Context,
+    source_geo: str = "/obj/geo1",
+    particle_sep: float = 0.2,
+    name: str = "whitewater_sim",
+    foam_amount: float = 1.0,
+) -> dict:
+    """Build a complete SOP whitewater (foam/spray/bubble) simulation in one call.
+
+    Preferred over hand-wiring the two-solver pipeline — builds a FLIP liquid
+    (flipcontainer -> flipsolver, a self-sourcing waterline tank with a stream velocity),
+    compresses it (fluidcompress), and drives a whitewatersource (emission volume) +
+    whitewatersolver (the foam/spray/bubble particles). The source object is added into the
+    FLIP as extra fluid. Whitewater emission is activated via the source's splash detection.
+
+    Args:
+        source_geo: Source geometry object path (added as fluid).
+        particle_sep: FLIP particle separation / resolution (> 0).
+        name: Top-level geo node name.
+        foam_amount: Whitewater emission amount (>= 0).
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute(
+        "workflow.setup_whitewater",
+        {
+            "source_geo": source_geo,
+            "particle_sep": particle_sep,
+            "name": name,
+            "foam_amount": foam_amount,
+        },
+    )
+
+
+@mcp.tool()
 async def create_material(
     ctx: Context,
     name: str = "material1",

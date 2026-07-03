@@ -842,6 +842,163 @@ def _setup_constraint_network(
     }
 
 
+###### workflow.setup_whitewater
+
+def _set_tuple_safe(node: hou.Node, parm_name: str, value: tuple) -> bool:
+    """Set a parmTuple value if it exists. Returns True on success."""
+    pt = node.parmTuple(parm_name)
+    if pt is not None:
+        try:
+            pt.set(value)
+            return True
+        except Exception as e:
+            print(f"[workflow] Could not set tuple {parm_name}: {e}")
+    return False
+
+
+def _setup_whitewater(
+    source_geo: str = "/obj/geo1",
+    particle_sep: float = 0.2,
+    name: str = "whitewater_sim",
+    foam_amount: float = 1.0,
+    **_: Any,
+) -> dict:
+    """Build a complete SOP whitewater (foam/spray/bubble) simulation in one call.
+
+    Builds the full two-solver SOP pipeline the multi-node build otherwise hand-assembles:
+    a FLIP liquid (flipcontainer -> flipsolver) feeds a fluidcompress, whose surface+velocity
+    fields drive a whitewatersource (emission volume) and a whitewatersolver (the whitewater
+    particles). The FLIP is a self-sourcing waterline tank with a stream velocity, so it
+    reliably produces the surface turbulence whitewater emits from; the source object is
+    added into the sim as extra fluid.
+
+    Wiring facts (live-grounded, H21 21.0.729 — see forkF2 record):
+      * flipcontainer has 3 outputs that feed the flipsolver's 3 inputs (0->0, 1->1, 2->2);
+        output 1 (Container) carries the gridscale/particlesep DETAIL attrs the solver requires.
+      * fluidcompress(solver 0/1/2) produces the compressed surface+vel / container / collisions.
+      * whitewatersource needs enablesplash=on to activate emission from a drifting tank
+        (pure speed-based emission yields an empty emit field); speedrange is lowered to match.
+
+    Args:
+        source_geo: Source geometry object path (added as fluid via a flipsource).
+        particle_sep: FLIP particle separation (controls resolution) — must be > 0.
+        name: Top-level geo node name.
+        foam_amount: Whitewater emission amount (whitewatersource emissionamount) — must be >= 0.
+    """
+    if particle_sep <= 0:
+        raise ValueError(f"particle_sep must be > 0, got {particle_sep}")
+    if foam_amount < 0:
+        raise ValueError(f"foam_amount must be >= 0, got {foam_amount}")
+    if hou.node(source_geo) is None:
+        raise ValueError(f"source_geo not found: {source_geo}")
+
+    obj = _ensure_obj_context()
+    all_nodes: list[str] = []
+
+    print(f"[workflow] Creating geo node '{name}' under /obj")
+    geo = obj.createNode("geo", name)
+    for child in geo.children():
+        child.destroy()
+    all_nodes.append(geo.path())
+
+    print(f"[workflow] Creating Object Merge for source: {source_geo}")
+    objmerge = geo.createNode("object_merge", "source_geo")
+    _set_parm_safe(objmerge, "objpath1", source_geo)
+    all_nodes.append(objmerge.path())
+
+    # Source object -> flipsource (becomes fluid particles fed into the sim).
+    print("[workflow] Creating FLIP Source from the object")
+    flipsource = geo.createNode("flipsource", "flip_source")
+    flipsource.setInput(0, objmerge, 0)
+    all_nodes.append(flipsource.path())
+
+    # FLIP domain. particlesep controls resolution; output 1 carries the container field.
+    print(f"[workflow] Creating FLIP Container (particlesep={particle_sep})")
+    container = geo.createNode("flipcontainer", "flip_container")
+    _set_parm_safe(container, "particlesep", particle_sep)
+    _set_tuple_safe(container, "size", (5.0, 3.0, 5.0))
+    all_nodes.append(container.path())
+
+    # Sources input = container's initial fluid (out 0) merged with the object's flipsource.
+    src_merge = geo.createNode("merge", "sources")
+    src_merge.setInput(0, container, 0)
+    src_merge.setInput(1, flipsource, 0)
+    all_nodes.append(src_merge.path())
+
+    # FLIP solver: all 3 container outputs feed the 3 solver inputs. dowaterline self-sources a
+    # pool + a stream velocity gives the surface turbulence whitewater needs.
+    print("[workflow] Creating FLIP Solver (waterline tank + stream)")
+    flip_solver = geo.createNode("flipsolver", "flip_solver")
+    _set_parm_safe(flip_solver, "dowaterline", 1)
+    _set_parm_safe(flip_solver, "waterline", 0.5)
+    _set_parm_safe(flip_solver, "water_velocityx", 6.0)
+    flip_solver.setInput(0, src_merge, 0)
+    flip_solver.setInput(1, container, 1)
+    flip_solver.setInput(2, container, 2)
+    all_nodes.append(flip_solver.path())
+
+    # Fluid Compress: produces the compressed surface+vel (0), container (1), collisions (2)
+    # that the whitewater source consumes.
+    print("[workflow] Creating Fluid Compress")
+    compress = geo.createNode("fluidcompress", "fluid_compress")
+    _set_parm_safe(compress, "particlesep", particle_sep)
+    compress.setInput(0, flip_solver, 0)
+    compress.setInput(1, flip_solver, 1)
+    compress.setInput(2, flip_solver, 2)
+    all_nodes.append(compress.path())
+
+    # Whitewater Source: emission volume from the liquid's surface+vel. enablesplash is what
+    # activates emission for a drifting tank (curvature/vorticity broaden it); foam_amount scales.
+    print(f"[workflow] Creating Whitewater Source (foam_amount={foam_amount})")
+    wwsource = geo.createNode("whitewatersource", "whitewater_source")
+    wwsource.setInput(0, compress, 0)
+    wwsource.setInput(1, compress, 1)
+    wwsource.setInput(2, compress, 2)
+    _set_parm_safe(wwsource, "enablesplash", 1)
+    _set_parm_safe(wwsource, "enablecurvature", 1)
+    _set_parm_safe(wwsource, "enablevorticity", 1)
+    _set_tuple_safe(wwsource, "speedrange", (0.1, 0.5))
+    _set_parm_safe(wwsource, "emissionamount", foam_amount)
+    all_nodes.append(wwsource.path())
+
+    # Whitewater Solver: its 3 inputs come from the whitewater source's 3 outputs.
+    print("[workflow] Creating Whitewater Solver")
+    wwsolver = geo.createNode("whitewatersolver", "whitewater_solver")
+    wwsolver.setInput(0, wwsource, 0)
+    wwsolver.setInput(1, wwsource, 1)
+    wwsolver.setInput(2, wwsource, 2)
+    all_nodes.append(wwsolver.path())
+
+    print("[workflow] Creating File Cache SOP")
+    try:
+        filecache = geo.createNode("filecache", "whitewater_cache")
+    except hou.OperationFailed:
+        filecache = geo.createNode("filecache::2.0", "whitewater_cache")
+    filecache.setInput(0, wwsolver, 0)
+    all_nodes.append(filecache.path())
+    try:
+        filecache.setDisplayFlag(True)
+        filecache.setRenderFlag(True)
+    except Exception:
+        pass
+
+    print("[workflow] Laying out nodes")
+    layout_if_enabled(geo)
+    _focus_network_editor(filecache)
+
+    print(f"[workflow] Whitewater simulation '{name}' setup complete")
+
+    return {
+        "success": True,
+        "geo_path": geo.path(),
+        "flip_solver_path": flip_solver.path(),
+        "source_path": wwsource.path(),
+        "solver_path": wwsolver.path(),
+        "cache_path": filecache.path(),
+        "all_nodes": all_nodes,
+    }
+
+
 ###### workflow.create_material
 
 def _create_material(
@@ -1220,6 +1377,7 @@ register_handler("workflow.setup_rbd_sim", _setup_rbd_sim)
 register_handler("workflow.setup_flip_sim", _setup_flip_sim)
 register_handler("workflow.setup_vellum_sim", _setup_vellum_sim)
 register_handler("workflow.setup_constraint_network", _setup_constraint_network)
+register_handler("workflow.setup_whitewater", _setup_whitewater)
 register_handler("workflow.create_material", _create_material)
 register_handler("workflow.assign_material", _assign_material)
 register_handler("workflow.build_sop_chain", _build_sop_chain)
