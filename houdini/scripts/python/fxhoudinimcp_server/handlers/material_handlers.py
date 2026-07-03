@@ -225,6 +225,116 @@ def _create_material_network(
 register_handler("materials.create_material_network", _create_material_network)
 
 
+###### materials.create_mtlx_material
+
+def _create_mtlx_material(
+    *,
+    name: str,
+    parent_path: str = "/stage",
+    base_color: list[float] | None = None,
+    metalness: float | None = None,
+    roughness: float | None = None,
+    textures: dict[str, str] | None = None,
+    normal_map: str | None = None,
+    **_: Any,
+) -> dict[str, Any]:
+    """Create a COMPLETE Solaris MaterialX material and publish it as a USD Material prim.
+
+    Unlike ``create_material_network`` (which makes a bare VOP node in ``/mat``), this builds a
+    ``materiallibrary`` LOP containing an ``mtlxstandard_surface`` (+ optional textures and a
+    normal map). The ``materiallibrary`` AUTO-PUBLISHES that surface as a USD ``Material`` prim at
+    ``<matpathprefix>/<name>`` on the stage (default ``/materials/<name>``) — a ready-to-bind
+    material in one call. Live-confirmed publishing mechanism (Houdini 21.0.729): no extra
+    surface-output wiring is required; the materiallibrary collects the mtlx surface by name.
+
+    Args:
+        name: material name; the published ``Material`` prim is ``<matpathprefix>/<name>``.
+        parent_path: LOP parent to build the ``materiallibrary`` under (default ``/stage``).
+        base_color: ``[r, g, b]`` diffuse color (mtlxstandard_surface ``base_color``).
+        metalness: 0..1 metalness.
+        roughness: 0..1 (sets ``specular_roughness``).
+        textures: ``{surface_input_name: file_path}`` — one ``mtlxUsdUVTexture`` per entry, wired
+            to the named surface input (e.g. ``{"base_color": "$HIP/tex/albedo.<UDIM>.exr"}``).
+        normal_map: a file path → ``mtlxUsdUVTexture`` → ``mtlxnormalmap`` → the surface ``normal``.
+
+    Returns:
+        ``{materiallibrary_path, surface_path, material_prim_path}``.
+    """
+    parent = _get_node(parent_path)
+
+    # The materiallibrary LOP is the publish container; the mtlx surface created inside it is
+    # auto-collected into a Material prim (Phase-0 hython-probed, 21.0.729).
+    try:
+        matlib = parent.createNode("materiallibrary", node_name=f"{name}_matlib")
+        surf = matlib.createNode("mtlxstandard_surface", node_name=name)
+    except hou.OperationFailed as e:
+        raise ValueError(f"Failed to build materiallibrary/mtlx surface under {parent_path}: {e}")
+
+    # Base surface parms — only those explicitly provided. FAIL-LOUD if an explicitly
+    # requested parm is missing (a version mismatch / renamed parm): a silent no-op would
+    # report success while ignoring the caller's material value (fail-loud-discipline).
+    if base_color is not None:
+        pt = surf.parmTuple("base_color")
+        if pt is None:
+            raise ValueError("mtlxstandard_surface has no 'base_color' parm tuple "
+                             "(version mismatch?) — cannot honor the requested base_color")
+        pt.set(base_color)
+    if metalness is not None:
+        p = surf.parm("metalness")
+        if p is None:
+            raise ValueError("mtlxstandard_surface has no 'metalness' parm (version mismatch?)")
+        p.set(metalness)
+    if roughness is not None:
+        p = surf.parm("specular_roughness")
+        if p is None:
+            raise ValueError("mtlxstandard_surface has no 'specular_roughness' parm "
+                             "(version mismatch?) — cannot honor the requested roughness")
+        p.set(roughness)
+
+    # Optional textures: one mtlxUsdUVTexture per surface input, wired by name (setNamedInput
+    # raises on an unknown input name — fail-loud). A missing `file` parm also fails loud: a
+    # wired texture node with no file path is a silent no-op that would report success.
+    for input_name, file_path in (textures or {}).items():
+        tex = matlib.createNode("mtlxUsdUVTexture", node_name=f"{name}_{input_name}")
+        fp = tex.parm("file")
+        if fp is None:
+            raise ValueError(f"mtlxUsdUVTexture has no 'file' parm (version mismatch?) — "
+                             f"cannot set the texture for input {input_name!r}")
+        fp.set(file_path)
+        surf.setNamedInput(input_name, tex, 0)
+
+    # Optional normal map: texture -> mtlxnormalmap (input 0) -> surface 'normal'.
+    if normal_map:
+        ntex = matlib.createNode("mtlxUsdUVTexture", node_name=f"{name}_normal_tex")
+        fp = ntex.parm("file")
+        if fp is None:
+            raise ValueError("mtlxUsdUVTexture has no 'file' parm (version mismatch?) — "
+                             "cannot set the normal-map texture")
+        fp.set(normal_map)
+        nmap = matlib.createNode("mtlxnormalmap", node_name=f"{name}_normalmap")
+        nmap.setInput(0, ntex)
+        surf.setNamedInput("normal", nmap, 0)
+
+    matlib.layoutChildren()
+    matlib.setDisplayFlag(True)
+    _focus_network_editor(matlib)
+
+    # Material prim path = matpathprefix + surface node name (live-confirmed: /materials/<name>).
+    prefix = "/materials/"
+    mpp = matlib.parm("matpathprefix")
+    if mpp is not None and mpp.eval():
+        prefix = mpp.eval()
+    material_prim_path = prefix.rstrip("/") + "/" + name
+
+    return {
+        "materiallibrary_path": matlib.path(),
+        "surface_path": surf.path(),
+        "material_prim_path": material_prim_path,
+    }
+
+register_handler("materials.create_mtlx_material", _create_mtlx_material)
+
+
 ###### materials.assign_material
 
 def _assign_material(
