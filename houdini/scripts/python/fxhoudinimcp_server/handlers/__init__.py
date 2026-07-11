@@ -44,6 +44,7 @@ _HANDLER_MODULES = [
     "usd_export_handlers",
     "cop_onnx_handlers",
     "spatial_reasoning_handlers",
+    "temporal_reasoning_handlers",
 ]
 
 _loaded = []

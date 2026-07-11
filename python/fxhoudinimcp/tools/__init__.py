@@ -65,4 +65,5 @@ from fxhoudinimcp.tools import render_readback_tools  # noqa: F401
 from fxhoudinimcp.tools import usd_export_tools  # noqa: F401
 from fxhoudinimcp.tools import cop_onnx_tools  # noqa: F401
 from fxhoudinimcp.tools import spatial_reasoning_tools  # noqa: F401
+from fxhoudinimcp.tools import temporal_reasoning_tools  # noqa: F401
 from fxhoudinimcp.tools import sessions  # noqa: F401
