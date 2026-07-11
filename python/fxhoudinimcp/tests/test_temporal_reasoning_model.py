@@ -1201,3 +1201,510 @@ class TestModulePurity:
                 f"temporal_reasoning_model.py must not contain {token!r} "
                 f"(CL-015 extended / PR-1 scope guard)"
             )
+
+
+# ===========================================================================
+# Section 13 — compile_plan(events, network=None) -> dict
+#              (PP12-117 PR-3, the AUTHORING-half pure translation,
+#              NARROWED SCOPE per plan pp12-117c lockedFieldContract
+#              REVISION 2)
+#
+# TDD phase: RED — compile_plan does NOT exist yet on
+# temporal_reasoning_model.py. Every test below imports compile_plan
+# LOCALLY (via _get_compile_plan(), never added to the module-level import
+# block at the top of this file) so the ImportError is scoped to THESE
+# new tests only — the PR-1/PR-2 tests above (Sections 1-12) must stay
+# green throughout this red phase.
+#
+# NARROWED SCOPE (rev-2, per the adversarial fold): compile_plan compiles
+# ONLY two grounded event shapes into compiled.keyframes — (1) a bare
+# keyframe event, (2) an activation event (emit/fracture/ignite/tear) that
+# carries an EXPLICIT params.parm + EXPLICIT params.frames. Everything
+# else (type-inferred activation, any threshold-trigger event, a
+# causally-impossible frame edge) routes to unresolved[] — NEVER raised,
+# NEVER invented. chop_triggers/dop_parms stay [] always (their content is
+# a later, DEFERRED PR). A malformed event (bad type, cyclic/dangling
+# causes) still raises ValueError — reusing PR-1's EventGraph validation
+# unchanged.
+#
+# Cross-references:
+#   - Plan pp12-117c lockedFieldContract (BINDING, revision 2)
+#   - docs/portfolio_projects/PP12_houdini_mcp_agentic_bridge/
+#     117_mcp_temporal_sim_reasoning_surface/spec.md Section 4.1
+#   - tdd-with-agents.md Sec.4/Sec.2: hou-test writes red (public-contract
+#     assertions only, never a mirror test on impl internals)
+#   - CL-015 (extended): compile_plan is pure — no hou/Qt/pxr/MCP call
+# ===========================================================================
+
+def _get_compile_plan():
+    """Local (not top-of-file) import of compile_plan — scopes the RED
+    ImportError to only the tests in this section, keeping the PR-1/PR-2
+    suite above green while this PR-3 addition is red."""
+    from fxhoudinimcp.temporal_reasoning_model import compile_plan
+    return compile_plan
+
+
+class TestCompilePlanKeyframeEvent:
+    """A bare keyframe event compiles DIRECTLY into compiled.keyframes —
+    the SPEC 4.1 {compiled:{keyframes,chop_triggers,dop_parms},
+    event_graph, unresolved} shape, exactly."""
+
+    def test_keyframe_event_compiles_to_exact_shape(self):
+        compile_plan = _get_compile_plan()
+        events = [{
+            "id": "kf1", "type": "keyframe", "target": "/obj/rbd_sim",
+            "params": {"parm": "tx", "frames": [[1, 0], [10, 5]]},
+        }]
+        result = compile_plan(events)
+        assert result["compiled"]["keyframes"] == [
+            {"node": "/obj/rbd_sim", "parm": "tx", "frames": [[1, 0], [10, 5]]},
+        ], f"expected a single compiled keyframe entry, got {result['compiled']!r}"
+        assert result["compiled"]["chop_triggers"] == [], (
+            f"chop_triggers must ALWAYS be [] in PR-3 (deferred), got "
+            f"{result['compiled']['chop_triggers']!r}"
+        )
+        assert result["compiled"]["dop_parms"] == [], (
+            f"dop_parms must ALWAYS be [] in PR-3 (deferred), got "
+            f"{result['compiled']['dop_parms']!r}"
+        )
+        assert result["event_graph"] == {"nodes": 1, "edges": 0}
+        assert result["unresolved"] == []
+
+    def test_top_level_result_has_exact_keys(self):
+        compile_plan = _get_compile_plan()
+        events = [{"id": "kf1", "type": "keyframe", "target": "/obj/x",
+                   "params": {"parm": "tx", "frames": [[1, 0.0]]}}]
+        result = compile_plan(events)
+        assert set(result.keys()) == {"compiled", "event_graph", "unresolved"}, (
+            f"compile_plan must return exactly {{compiled, event_graph, unresolved}}, "
+            f"got {set(result.keys())!r}"
+        )
+        assert set(result["compiled"].keys()) == {"keyframes", "chop_triggers", "dop_parms"}, (
+            f"compiled must have exactly {{keyframes, chop_triggers, dop_parms}}, "
+            f"got {set(result['compiled'].keys())!r}"
+        )
+
+    def test_multiple_independent_keyframe_events_all_compile(self):
+        compile_plan = _get_compile_plan()
+        events = [
+            {"id": "kf1", "type": "keyframe", "target": "/obj/a",
+             "params": {"parm": "tx", "frames": [[1, 0]]}},
+            {"id": "kf2", "type": "keyframe", "target": "/obj/b",
+             "params": {"parm": "ty", "frames": [[5, 2]]}},
+        ]
+        result = compile_plan(events)
+        assert len(result["compiled"]["keyframes"]) == 2
+        nodes = {kf["node"] for kf in result["compiled"]["keyframes"]}
+        assert nodes == {"/obj/a", "/obj/b"}
+        assert result["unresolved"] == []
+
+    def test_compile_plan_accepts_optional_network_argument(self):
+        """compile_plan is PURE translation — it does NOT verify nodes/
+        parms exist or check network-scope (that is the handler's
+        apply-time job), so passing `network` must not change the
+        compiled output."""
+        compile_plan = _get_compile_plan()
+        events = [{"id": "kf1", "type": "keyframe", "target": "/obj/x",
+                   "params": {"parm": "tx", "frames": [[1, 0.0]]}}]
+        result_no_network = compile_plan(events)
+        result_with_network = compile_plan(events, network="/obj/rbd_sim")
+        assert result_no_network["compiled"] == result_with_network["compiled"]
+        assert result_no_network["unresolved"] == result_with_network["unresolved"]
+
+
+class TestCompilePlanExplicitParmActivation:
+    """An EXPLICIT-parm-EXPLICIT-frames activation event (emit/fracture/
+    ignite/tear) compiles to a compiled.keyframes entry EXACTLY like a
+    keyframe event — the agent authored the exact parm + explicit frames
+    (e.g. an on/off pair) and compile_plan does NOT synthesize on/off
+    defaults (Major-5)."""
+
+    @pytest.mark.parametrize("event_type", ["emit", "fracture", "ignite", "tear"])
+    def test_explicit_parm_activation_compiles_to_keyframe_entry(self, event_type):
+        compile_plan = _get_compile_plan()
+        events = [{
+            "id": "act1", "type": event_type, "target": "/obj/rbd_sim/wall",
+            "params": {"parm": "activation", "frames": [[4, 0], [5, 1]]},
+        }]
+        result = compile_plan(events)
+        assert result["compiled"]["keyframes"] == [
+            {"node": "/obj/rbd_sim/wall", "parm": "activation", "frames": [[4, 0], [5, 1]]},
+        ], (
+            f"expected the explicit-parm activation ({event_type!r}) to compile "
+            f"directly into a keyframe entry, got {result['compiled']!r}"
+        )
+        assert result["unresolved"] == []
+
+
+class TestCompilePlanActivationWithoutExplicitParmDeferred:
+    """DEFERRED (Blocker-2): an activation event WITHOUT an explicit
+    params.parm — type-inference is out of scope for PR-3 — routes to
+    unresolved. Likewise a params.parm present but params.frames absent
+    or empty."""
+
+    def test_activation_missing_parm_is_unresolved(self):
+        compile_plan = _get_compile_plan()
+        events = [{"id": "e1", "type": "emit", "target": "/obj/x",
+                   "params": {"rate": 500.0}}]  # no 'parm' — type-inference deferred
+        result = compile_plan(events)
+        assert result["compiled"]["keyframes"] == []
+        assert result["unresolved"] == ["e1"]
+
+    def test_activation_with_parm_but_no_frames_key_is_unresolved(self):
+        compile_plan = _get_compile_plan()
+        events = [{"id": "e1", "type": "ignite", "target": "/obj/x",
+                   "params": {"parm": "activation"}}]  # no 'frames' key at all
+        result = compile_plan(events)
+        assert result["compiled"]["keyframes"] == []
+        assert result["unresolved"] == ["e1"]
+
+    def test_activation_with_empty_frames_list_is_unresolved(self):
+        compile_plan = _get_compile_plan()
+        events = [{"id": "e1", "type": "tear", "target": "/obj/cloth",
+                   "params": {"parm": "threshold", "frames": []}}]
+        result = compile_plan(events)
+        assert result["compiled"]["keyframes"] == []
+        assert result["unresolved"] == ["e1"]
+
+    def test_activation_with_non_string_parm_is_unresolved(self):
+        """params.parm must be a non-empty str — a non-str value is not a
+        valid explicit parm name, so this must degrade to unresolved
+        (never raise — the event is well-formed EventSpec-wise, just
+        unmappable)."""
+        compile_plan = _get_compile_plan()
+        events = [{"id": "e1", "type": "emit", "target": "/obj/x",
+                   "params": {"parm": 123, "frames": [[1, 0]]}}]
+        result = compile_plan(events)
+        assert result["unresolved"] == ["e1"]
+
+
+class TestCompilePlanThresholdTriggerDeferred:
+    """DEFERRED: ANY event whose trigger.kind is in {stress_gt, field_gt,
+    collision_with} routes to unresolved — NEVER raised, NEVER compiled —
+    and chop_triggers stays [] (their compilation is a later PR)."""
+
+    @pytest.mark.parametrize("kind", ["stress_gt", "field_gt", "collision_with"])
+    def test_threshold_trigger_is_unresolved_not_raised(self, kind):
+        compile_plan = _get_compile_plan()
+        events = [{
+            "id": "e1", "type": "fracture", "target": "/obj/wall",
+            "trigger": {"kind": kind, "value": 1200},
+        }]
+        result = compile_plan(events)  # must NOT raise
+        assert result["compiled"]["keyframes"] == []
+        assert result["compiled"]["chop_triggers"] == []
+        assert result["unresolved"] == ["e1"]
+
+    def test_threshold_trigger_is_unresolved_even_with_explicit_parm_and_frames(self):
+        """A stress_gt/field_gt/collision_with trigger ALWAYS routes to
+        unresolved, even when the event ALSO carries an explicit
+        params.parm + params.frames — only frame_eq gets the at_frame-
+        keyframe treatment when explicit parm+frames are present."""
+        compile_plan = _get_compile_plan()
+        events = [{
+            "id": "e1", "type": "emit", "target": "/obj/wall",
+            "params": {"parm": "activation", "frames": [[4, 0], [5, 1]]},
+            "trigger": {"kind": "stress_gt", "value": 1200},
+        }]
+        result = compile_plan(events)
+        assert result["compiled"]["keyframes"] == []
+        assert result["unresolved"] == ["e1"]
+
+    def test_frame_eq_trigger_without_explicit_parm_is_unresolved(self):
+        """frame_eq is treated as an at_frame keyframe ONLY IF it carries
+        explicit parm+frames; here they are absent, so it is unresolved
+        too (not a raise)."""
+        compile_plan = _get_compile_plan()
+        events = [{
+            "id": "e1", "type": "fracture", "target": "/obj/wall",
+            "trigger": {"kind": "frame_eq"},
+        }]
+        result = compile_plan(events)
+        assert result["unresolved"] == ["e1"]
+
+    def test_frame_eq_trigger_with_explicit_parm_and_frames_compiles(self):
+        """frame_eq WITH explicit parm+frames IS treated as an at_frame
+        keyframe -- it compiles (distinct from the other three threshold
+        kinds, which NEVER compile regardless of explicit parm+frames)."""
+        compile_plan = _get_compile_plan()
+        events = [{
+            "id": "e1", "type": "fracture", "target": "/obj/wall",
+            "trigger": {"kind": "frame_eq"},
+            "params": {"parm": "activation", "frames": [[10, 1]]},
+        }]
+        result = compile_plan(events)
+        assert result["compiled"]["keyframes"] == [
+            {"node": "/obj/wall", "parm": "activation", "frames": [[10, 1]]},
+        ]
+        assert result["unresolved"] == []
+
+
+class TestCompilePlanMalformedFramesAndNoTargetAreUnresolved:
+    """FIX-PASS (codex-reviewer Major-4): compile_plan must NOT emit a
+    malformed/no-target compiled.keyframes entry. `_translate_event` must
+    validate BOTH (a) a non-empty `target`, AND (b) that EVERY item in
+    `frames` is a genuine [frame, value] pair -- not merely 'frames is a
+    non-empty list'. A malformed/no-target event must route to
+    unresolved, contributing NOTHING to compiled.keyframes."""
+
+    def test_malformed_frame_shape_and_no_target_is_unresolved(self):
+        """The EXACT codex-reviewer repro: no target + a frames list whose
+        sole item is not an [f,v] pair at all."""
+        compile_plan = _get_compile_plan()
+        events = [{
+            "id": "bad", "type": "keyframe",
+            "params": {"parm": "tx", "frames": ["not-a-pair"]},
+        }]
+        result = compile_plan(events)
+        assert "bad" in result["unresolved"], (
+            f"a malformed/no-target keyframe event must be routed to unresolved, "
+            f"got unresolved={result['unresolved']!r}"
+        )
+        assert result["compiled"]["keyframes"] == [], (
+            f"compile_plan must NOT emit a malformed compiled.keyframes entry "
+            f"(e.g. {{node:'', frames:['not-a-pair']}}), got "
+            f"{result['compiled']['keyframes']!r}"
+        )
+
+    def test_no_target_with_well_formed_frames_is_unresolved(self):
+        """A well-formed frames payload but NO target (target defaults to
+        '') must ALSO be unresolved -- an empty node path is never a
+        valid keyframe-apply target."""
+        compile_plan = _get_compile_plan()
+        events = [{
+            "id": "e1", "type": "keyframe",
+            "params": {"parm": "tx", "frames": [[1, 0.0]]},
+        }]  # no 'target' key at all -> EventSpec.target defaults to ""
+        result = compile_plan(events)
+        assert result["unresolved"] == ["e1"], (
+            f"an event with no target must be unresolved even with well-formed "
+            f"frames, got unresolved={result['unresolved']!r}"
+        )
+        assert result["compiled"]["keyframes"] == []
+
+    def test_valid_target_but_malformed_frame_item_is_unresolved(self):
+        """A non-empty `target` but a frames list containing a non-pair
+        item must also route to unresolved -- frames must be validated
+        item-by-item, not merely checked for non-empty-list-ness."""
+        compile_plan = _get_compile_plan()
+        events = [{
+            "id": "e1", "type": "keyframe", "target": "/obj/x",
+            "params": {"parm": "tx", "frames": ["not-a-pair"]},
+        }]
+        result = compile_plan(events)
+        assert result["unresolved"] == ["e1"], (
+            f"a malformed frame item must route the event to unresolved, got "
+            f"unresolved={result['unresolved']!r}"
+        )
+        assert result["compiled"]["keyframes"] == []
+
+
+class TestCompilePlanCausalTimeOrder:
+    """Major-10: for a `causes` edge between two events that BOTH carry a
+    frame (keyframe-frame or at_frame), the caused event's frame must be
+    >= the causing event's frame; a violation routes the CAUSED event to
+    unresolved (NOT a raise) — a threshold/deferred side skips the check."""
+
+    def test_causally_impossible_edge_routes_caused_event_to_unresolved(self):
+        """cause@40 causes effect@20 — backward in time — effect is
+        routed to unresolved; the cause itself still compiles."""
+        compile_plan = _get_compile_plan()
+        events = [
+            {"id": "cause", "type": "keyframe", "target": "/obj/a", "at_frame": 40,
+             "params": {"parm": "tx", "frames": [[40, 1]]}, "causes": ["effect"]},
+            {"id": "effect", "type": "keyframe", "target": "/obj/b", "at_frame": 20,
+             "params": {"parm": "tx", "frames": [[20, 1]]}},
+        ]
+        result = compile_plan(events)
+        assert "effect" in result["unresolved"], (
+            f"a caused event at an EARLIER frame than its cause must be routed to "
+            f"unresolved, got unresolved={result['unresolved']!r}"
+        )
+        compiled_nodes = {kf["node"] for kf in result["compiled"]["keyframes"]}
+        assert "/obj/a" in compiled_nodes, "the CAUSE event must still compile"
+        assert "/obj/b" not in compiled_nodes, (
+            "the causally-impossible CAUSED event must NOT appear in compiled.keyframes"
+        )
+
+    def test_causally_consistent_edge_both_compile(self):
+        """cause@20 causes effect@40 — forward in time — BOTH compile."""
+        compile_plan = _get_compile_plan()
+        events = [
+            {"id": "cause", "type": "keyframe", "target": "/obj/a", "at_frame": 20,
+             "params": {"parm": "tx", "frames": [[20, 1]]}, "causes": ["effect"]},
+            {"id": "effect", "type": "keyframe", "target": "/obj/b", "at_frame": 40,
+             "params": {"parm": "tx", "frames": [[40, 1]]}},
+        ]
+        result = compile_plan(events)
+        assert result["unresolved"] == []
+        compiled_nodes = {kf["node"] for kf in result["compiled"]["keyframes"]}
+        assert compiled_nodes == {"/obj/a", "/obj/b"}
+
+    def test_equal_frames_are_allowed(self):
+        """caused-frame >= cause-frame — EQUAL frames must be ALLOWED
+        (not a violation)."""
+        compile_plan = _get_compile_plan()
+        events = [
+            {"id": "cause", "type": "keyframe", "target": "/obj/a", "at_frame": 30,
+             "params": {"parm": "tx", "frames": [[30, 1]]}, "causes": ["effect"]},
+            {"id": "effect", "type": "keyframe", "target": "/obj/b", "at_frame": 30,
+             "params": {"parm": "tx", "frames": [[30, 1]]}},
+        ]
+        result = compile_plan(events)
+        assert result["unresolved"] == []
+
+    def test_threshold_trigger_side_skips_time_check(self):
+        """A threshold/deferred side skips the causal-time check
+        entirely: the caused (keyframe) event must still compile despite
+        its causing event's at_frame being LATER than its own — because
+        the causing event is itself unresolved on threshold-trigger
+        grounds, not on causal-time grounds, and that deferred status must
+        not ALSO push the other side into unresolved via the time check."""
+        compile_plan = _get_compile_plan()
+        events = [
+            {"id": "trigger_event", "type": "fracture", "target": "/obj/wall",
+             "at_frame": 100, "trigger": {"kind": "stress_gt", "value": 1200},
+             "causes": ["effect"]},
+            {"id": "effect", "type": "keyframe", "target": "/obj/b", "at_frame": 20,
+             "params": {"parm": "tx", "frames": [[20, 1]]}},
+        ]
+        result = compile_plan(events)
+        assert "trigger_event" in result["unresolved"], (
+            "the threshold-trigger event itself is unresolved on its own deferred-"
+            "trigger grounds"
+        )
+        compiled_nodes = {kf["node"] for kf in result["compiled"]["keyframes"]}
+        assert "/obj/b" in compiled_nodes, (
+            "the causal-time check must be SKIPPED on a threshold/deferred side -- "
+            "'effect' must still compile despite its causing event's at_frame (100) "
+            "being later than its own (20)"
+        )
+
+
+class TestCompilePlanCausalTimeOrderUsesExplicitFramesWhenAtFrameAbsent:
+    """FIX-PASS (codex-reviewer Major-5): the causal time-order check must
+    derive each side's causal timestamp from its EXPLICIT keyframe frames
+    when `at_frame` is ABSENT (EventSpec.at_frame defaults to 0) -- it
+    must NOT silently compare two defaulted-to-0 at_frame values, which
+    would miss a real causally-impossible edge whenever neither event
+    sets at_frame explicitly."""
+
+    def test_causally_impossible_edge_via_explicit_frames_no_at_frame(self):
+        """cause's OWN explicit frame is 40; effect's OWN explicit frame is
+        20 -- backward in time -- despite NEITHER event setting at_frame
+        (both default to 0, so a naive at_frame-only comparison sees
+        0 < 0, a false negative). effect must be routed to unresolved."""
+        compile_plan = _get_compile_plan()
+        events = [
+            {"id": "cause", "type": "keyframe", "target": "/obj/a",
+             "params": {"parm": "tx", "frames": [[40, 1]]}, "causes": ["effect"]},
+            {"id": "effect", "type": "keyframe", "target": "/obj/b",
+             "params": {"parm": "tx", "frames": [[20, 1]]}},
+        ]
+        result = compile_plan(events)
+        assert "effect" in result["unresolved"], (
+            f"a caused event whose EXPLICIT frames (20) are earlier than its "
+            f"cause's EXPLICIT frames (40) must be routed to unresolved, even "
+            f"when neither event sets at_frame explicitly -- got "
+            f"unresolved={result['unresolved']!r}"
+        )
+        compiled_nodes = {kf["node"] for kf in result["compiled"]["keyframes"]}
+        assert "/obj/a" in compiled_nodes, "the CAUSE event must still compile"
+        assert "/obj/b" not in compiled_nodes, (
+            "the causally-impossible CAUSED event must NOT appear in "
+            "compiled.keyframes"
+        )
+
+
+class TestCompilePlanTopLevelFieldNormalization:
+    """Major-9: a raw event with parm/frames given at TOP LEVEL (sibling
+    to id/type/target), not nested under params, is NORMALIZED into
+    params BEFORE EventSpec construction — it compiles exactly as if the
+    caller had nested them under params (mirrors PR-2's
+    expect-normalization pattern)."""
+
+    def test_top_level_parm_and_frames_normalized_into_params(self):
+        compile_plan = _get_compile_plan()
+        events = [{
+            "id": "e1", "type": "keyframe", "target": "/obj/x",
+            "parm": "tx", "frames": [[1, 0], [10, 5]],  # TOP LEVEL, not under params
+        }]
+        result = compile_plan(events)
+        assert result["compiled"]["keyframes"] == [
+            {"node": "/obj/x", "parm": "tx", "frames": [[1, 0], [10, 5]]},
+        ], (
+            f"a top-level parm/frames pair must be normalized into params and compile "
+            f"exactly as the nested-params form, got {result['compiled']!r}"
+        )
+        assert result["unresolved"] == []
+
+    def test_top_level_activation_fields_normalized_into_params(self):
+        compile_plan = _get_compile_plan()
+        events = [{
+            "id": "e1", "type": "emit", "target": "/obj/wall",
+            "parm": "activation", "frames": [[4, 0], [5, 1]],
+        }]
+        result = compile_plan(events)
+        assert result["compiled"]["keyframes"] == [
+            {"node": "/obj/wall", "parm": "activation", "frames": [[4, 0], [5, 1]]},
+        ]
+        assert result["unresolved"] == []
+
+
+class TestCompilePlanGraphValidationErrors:
+    """A cyclic or dangling causes graph, a duplicate event id, or an
+    unknown event type RAISES ValueError (reusing PR-1's EventGraph/
+    EventSpec construction-time validation unchanged) — a construction/
+    validation error, NEVER an unresolved-routing case."""
+
+    def test_cyclic_causes_raises_value_error(self):
+        compile_plan = _get_compile_plan()
+        events = [
+            {"id": "e1", "type": "fracture", "causes": ["e2"]},
+            {"id": "e2", "type": "emit", "causes": ["e1"]},
+        ]
+        with pytest.raises(ValueError):
+            compile_plan(events)
+
+    def test_dangling_causes_edge_raises_value_error(self):
+        compile_plan = _get_compile_plan()
+        events = [{"id": "e1", "type": "fracture", "causes": ["ghost"]}]
+        with pytest.raises(ValueError):
+            compile_plan(events)
+
+    def test_duplicate_event_id_raises_value_error(self):
+        compile_plan = _get_compile_plan()
+        events = [
+            {"id": "dup", "type": "fracture"},
+            {"id": "dup", "type": "emit"},
+        ]
+        with pytest.raises(ValueError):
+            compile_plan(events)
+
+    def test_unknown_event_type_raises_value_error(self):
+        compile_plan = _get_compile_plan()
+        events = [{"id": "e1", "type": "not_a_real_event"}]
+        with pytest.raises(ValueError):
+            compile_plan(events)
+
+
+class TestCompilePlanDoesNotRegressPriorSurface:
+    """PR-3 is ADDITIVE — the PR-1/PR-2 public surface (EventSpec,
+    EventGraph, describe_sim_events, aggregate_assertion,
+    evaluate_assertions) must remain importable and behave unchanged."""
+
+    def test_prior_public_surface_still_importable_and_callable(self):
+        from fxhoudinimcp.temporal_reasoning_model import (
+            EventSpec, EventGraph, describe_sim_events,
+            aggregate_assertion, evaluate_assertions,
+        )
+        assert describe_sim_events()["assertions"] == [
+            "piece_count", "constraint_count", "point_count", "velocity_bounds",
+            "bbox_over_time", "field_stats", "mass_conservation",
+        ]
+        e = EventSpec(id="e1", type="fracture")
+        assert e.type == "fracture"
+        g = EventGraph(events=[e])
+        assert g.topo_order() == ["e1"]
+        assert evaluate_assertions([]) == {"results": [], "pass": True}
+        assert aggregate_assertion([[1, 1.0], [2, 2.0]], {"max": 100.0})["pass"] is True

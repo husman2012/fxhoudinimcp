@@ -1356,3 +1356,1301 @@ class TestAssertSimulationHythonSmoke:
             geo_obj.destroy()
             hou.setFrame(saved_frame)
             assert hou.frame() == saved_frame, "the pre-test frame must be restored"
+
+
+# =============================================================================
+# compile_timeline / _preview_compile_timeline — PP12-117 PR-3, the FIRST
+# MUTATING/109-gated handler of the Temporal/Sim-Reasoning MCP member
+# (NARROWED SCOPE per plan pp12-117c lockedFieldContract, REVISION 2).
+#
+# TDD phase: RED — compile_timeline and _preview_compile_timeline do NOT
+# exist yet on temporal_reasoning_handlers.py. Every test below calls
+# _import_handler_module() (already defined above), which raises
+# ModuleNotFoundError/AttributeError until hou-dev lands the green impl —
+# scoped to THESE new tests only; the PR-2 suite above stays green.
+#
+# Grounded LAYER-FOR-LAYER on test_spatial_reasoning_handlers.py's
+# TestSolveLayout* classes (THE shipped MUTATING/109-gated exemplar):
+# Capability.MUTATING + preview_fn + preview_required registration
+# (asserted via dispatcher._preview_registry_fallback, the mock-safe
+# pattern — dispatcher.preview_of() auto-vivifies a MagicMock attribute
+# under mock_hou and is NOT mock-safe); apply=false -> zero mutation;
+# preflight-validate-then-atomic-apply; a raise inside the preview ->
+# DENY; a model ValueError PROPAGATES (never folded into ok:false/
+# unresolved).
+#
+# Locked field contract (plan pp12-117c lockedFieldContract, REVISION 2):
+#     compile_timeline(*, network, events, frame_range, apply=True) -> dict
+#         (1) resolve network via hou.node(network) -> unresolvable ->
+#             {ok:false,error}
+#         (2) temporal_reasoning_model.compile_plan(events, network) ->
+#             the plan (a model ValueError PROPAGATES)
+#         (3) PREFLIGHT-VALIDATE every compiled.keyframes entry: target
+#             exists AND is `network` OR under `network + '/'` AND the
+#             parm exists on it AND the frames payload is well-formed --
+#             a failing entry moves to unresolved (its source event id)
+#             and is DROPPED, BEFORE any write
+#         (4) apply=True -> ATOMICALLY apply ONLY the fully-validated set
+#             via the SHIPPED animation_handlers._set_keyframes, frames
+#             [[f,v]...] CONVERTED to [{frame,value}...] (Blocker-1)
+#         (5) return {compiled, event_graph, applied, unresolved}
+#             (unresolved = compile_plan's unresolved UNION any
+#             preflight-dropped ids)
+#     apply=False returns the SAME plan with ZERO _set_keyframes calls.
+#     GATED: register_handler('compile_timeline', compile_timeline,
+#         Capability.MUTATING, preview_fn=_preview_compile_timeline,
+#         preview_required=True)
+#
+#     _preview_compile_timeline(params: dict) -> dict (POSITIONAL) runs
+#     the SAME read-only preflight validation apply does (Major-6), so
+#     its would-apply/unresolved split matches EXACTLY what apply would
+#     do -- NO writes. A raise inside the preview -> the 109 gate DENIES.
+# =============================================================================
+
+def _make_node_with_parm(mock_hou, path, parm_names):
+    """A node exposing .path() and .parm(name) -> a truthy stand-in when
+    name is in parm_names, else None (mirrors hou.Node.parm's real
+    contract: returns None for a non-existent parm name). Sufficient for
+    the preflight-validation surface compile_timeline needs (node
+    existence + parm existence + path-based network-scope check) --
+    deliberately NOT a full SopNode/ObjNode stand-in (the write path is
+    exercised entirely through the mocked _set_keyframes fixture below,
+    never through this node's own attributes)."""
+    node = MagicMock(name=f"fake_node_{path}")
+    node.path.return_value = path
+
+    def _parm(name):
+        return MagicMock(name=f"parm_{name}") if name in parm_names else None
+
+    node.parm.side_effect = _parm
+    return node
+
+
+@pytest.fixture()
+def mock_set_keyframes(monkeypatch, mock_hou):
+    """Patch the SHIPPED `_set_keyframes` (animation_handlers.py,
+    Major-8 direct-import) so compile_timeline's apply-time calls can be
+    asserted without a real Houdini parm write.
+
+    Imports animation_handlers FIRST (mock_hou is already installed, so
+    its own top-level `import hou` succeeds off-DCC), patches ITS
+    `_set_keyframes` attribute, then POPS any already-imported
+    temporal_reasoning_handlers module out of sys.modules so the NEXT
+    _import_handler_module() call performs a genuinely FRESH import that
+    re-executes temporal_reasoning_handlers' own top-level direct-import
+    of _set_keyframes against the now-patched attribute -- correct
+    regardless of whether hou-dev writes
+    `from fxhoudinimcp_server.handlers.animation_handlers import
+    _set_keyframes` (name copied at import time) or
+    `from fxhoudinimcp_server.handlers import animation_handlers` +
+    `animation_handlers._set_keyframes(...)` (attribute looked up at call
+    time) -- both styles resolve through THIS patched object.
+
+    Returns the MagicMock so tests can assert call_count / call_args.
+    """
+    import fxhoudinimcp_server.handlers.animation_handlers as _anim
+
+    fake_set_keyframes = MagicMock(name="_set_keyframes", return_value={
+        "node_path": "unused", "parm_name": "unused",
+        "keyframes_set": 0, "status": "keyframes_set",
+    })
+    monkeypatch.setattr(_anim, "_set_keyframes", fake_set_keyframes)
+    sys.modules.pop("fxhoudinimcp_server.handlers.temporal_reasoning_handlers", None)
+    return fake_set_keyframes
+
+
+# ---------------------------------------------------------------------------
+# PRIMARY RED GATE — compile_timeline / _preview_compile_timeline must exist
+# ---------------------------------------------------------------------------
+
+class TestCompileTimelineHandlerImport:
+    def test_compile_timeline_handler_importable(self, mock_hou):
+        handlers = _import_handler_module()
+        assert hasattr(handlers, "compile_timeline"), (
+            "temporal_reasoning_handlers.py must expose compile_timeline (PP12-117 PR-3)."
+        )
+        assert callable(handlers.compile_timeline)
+
+    def test_preview_compile_timeline_importable(self, mock_hou):
+        handlers = _import_handler_module()
+        assert hasattr(handlers, "_preview_compile_timeline"), (
+            "temporal_reasoning_handlers.py must expose _preview_compile_timeline "
+            "(the positional gate preview_fn, PP12-117 PR-3)."
+        )
+        assert callable(handlers._preview_compile_timeline)
+
+
+# ---------------------------------------------------------------------------
+# Capability.MUTATING + preview registration
+# ---------------------------------------------------------------------------
+
+class TestCompileTimelineCapabilityAndPreviewRegistration:
+    """Mirrors test_spatial_reasoning_handlers.py's
+    TestSolveLayoutCapabilityAndPreviewRegistration -- the proven
+    registration-assertion pattern for a MUTATING+preview_fn+
+    preview_required tool, via the mock-safe
+    dispatcher._preview_registry_fallback store (dispatcher.preview_of()
+    reads hou.session._fxhoudinimcp_preview_registry, which
+    auto-vivifies into a MagicMock attribute under mock_hou and is NOT
+    mock-safe)."""
+
+    def test_compile_timeline_capability_mutating(self, mock_hou):
+        _import_handler_module()
+        from fxhoudinimcp_server import dispatcher
+        assert dispatcher.capability_of("compile_timeline") == dispatcher.Capability.MUTATING, (
+            f"compile_timeline must be registered Capability.MUTATING (GATED), "
+            f"got {dispatcher.capability_of('compile_timeline')!r}."
+        )
+
+    def test_compile_timeline_preview_registered_and_required(self, mock_hou):
+        handlers = _import_handler_module()
+        from fxhoudinimcp_server import dispatcher
+        record = dispatcher._preview_registry_fallback["compile_timeline"]
+        assert record["preview_fn"] is handlers._preview_compile_timeline, (
+            f"compile_timeline must register preview_fn=_preview_compile_timeline, "
+            f"got {record!r}."
+        )
+        assert record["preview_required"] is True, (
+            f"compile_timeline must register preview_required=True (fail-safe "
+            f"DENY-on-raise), got {record!r}."
+        )
+
+
+# ---------------------------------------------------------------------------
+# apply=false -> ZERO _set_keyframes calls, plan returned unmutated
+# ---------------------------------------------------------------------------
+
+class TestCompileTimelineApplyFalseNoMutation:
+    """apply=false must return the SAME compiled plan (post-preflight-
+    validation) but make ZERO _set_keyframes calls."""
+
+    def test_apply_false_returns_plan_and_calls_nothing(self, mock_hou, mock_set_keyframes):
+        node = _make_node_with_parm(mock_hou, "/obj/rbd_sim", {"tx"})
+        mock_hou.node.side_effect = _node_lookup({"/obj/rbd_sim": node})
+
+        events = [{
+            "id": "kf1", "type": "keyframe", "target": "/obj/rbd_sim",
+            "params": {"parm": "tx", "frames": [[1, 0], [10, 5]]},
+        }]
+
+        result = _dispatch("compile_timeline", {
+            "network": "/obj/rbd_sim", "events": events,
+            "frame_range": [1, 10], "apply": False,
+        })
+        assert result["status"] == "success", f"compile_timeline must not raise, got {result!r}"
+        data = result["data"]
+        assert data["applied"] is False
+        assert data["compiled"]["keyframes"] == [
+            {"node": "/obj/rbd_sim", "parm": "tx", "frames": [[1, 0], [10, 5]]},
+        ]
+        assert data["unresolved"] == []
+        assert mock_set_keyframes.call_count == 0, (
+            f"apply=false must make ZERO _set_keyframes calls, got "
+            f"{mock_set_keyframes.call_count}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# apply=true -> _set_keyframes called with CONVERTED [{frame,value}]
+# ---------------------------------------------------------------------------
+
+class TestCompileTimelineApplyTrueSetsKeyframes:
+    """apply=true must call the SHIPPED _set_keyframes ONCE per validated
+    compiled.keyframes entry, converting frames [[f,v]...] ->
+    [{frame,value}...] (Blocker-1)."""
+
+    def test_apply_true_calls_set_keyframes_with_converted_frames(self, mock_hou, mock_set_keyframes):
+        node = _make_node_with_parm(mock_hou, "/obj/rbd_sim", {"tx"})
+        mock_hou.node.side_effect = _node_lookup({"/obj/rbd_sim": node})
+
+        events = [{
+            "id": "kf1", "type": "keyframe", "target": "/obj/rbd_sim",
+            "params": {"parm": "tx", "frames": [[1, 0], [10, 5]]},
+        }]
+
+        result = _dispatch("compile_timeline", {
+            "network": "/obj/rbd_sim", "events": events,
+            "frame_range": [1, 10], "apply": True,
+        })
+        assert result["status"] == "success", f"compile_timeline must not raise, got {result!r}"
+        data = result["data"]
+        assert data["applied"] is True
+        assert data["unresolved"] == []
+
+        assert mock_set_keyframes.call_count == 1, (
+            f"expected exactly ONE _set_keyframes call for the single validated "
+            f"keyframe entry, got {mock_set_keyframes.call_count}"
+        )
+        call = mock_set_keyframes.call_args
+        args = call.args
+        kwargs = call.kwargs
+        node_arg = args[0] if len(args) > 0 else kwargs.get("node_path")
+        parm_arg = args[1] if len(args) > 1 else kwargs.get("parm_name")
+        keyframes_arg = args[2] if len(args) > 2 else kwargs.get("keyframes")
+
+        assert node_arg == "/obj/rbd_sim", (
+            f"expected _set_keyframes to be called with node_path='/obj/rbd_sim', "
+            f"got {node_arg!r}"
+        )
+        assert parm_arg == "tx", f"expected parm_name='tx', got {parm_arg!r}"
+        assert keyframes_arg == [{"frame": 1, "value": 0}, {"frame": 10, "value": 5}], (
+            f"expected frames [[1,0],[10,5]] CONVERTED to [{{frame,value}}...] "
+            f"(Blocker-1), got {keyframes_arg!r}"
+        )
+
+    def test_apply_true_calls_set_keyframes_once_per_validated_entry(self, mock_hou, mock_set_keyframes):
+        # ROUND-3 FIX-PASS note (M3): `network` itself must now resolve as a
+        # real node -- the round-3 fix checks network resolution
+        # UNCONDITIONALLY, up front. Registering it here isolates this
+        # test's intended scenario (two validated in-scope entries) from
+        # the separate unresolvable-network case.
+        network_node = _make_node_with_parm(mock_hou, "/obj/rbd_sim", set())
+        node_a = _make_node_with_parm(mock_hou, "/obj/rbd_sim/a", {"tx"})
+        node_b = _make_node_with_parm(mock_hou, "/obj/rbd_sim/b", {"ty"})
+        mock_hou.node.side_effect = _node_lookup({
+            "/obj/rbd_sim": network_node,
+            "/obj/rbd_sim/a": node_a, "/obj/rbd_sim/b": node_b,
+        })
+
+        events = [
+            {"id": "kf1", "type": "keyframe", "target": "/obj/rbd_sim/a",
+             "params": {"parm": "tx", "frames": [[1, 0]]}},
+            {"id": "kf2", "type": "keyframe", "target": "/obj/rbd_sim/b",
+             "params": {"parm": "ty", "frames": [[5, 2]]}},
+        ]
+
+        result = _dispatch("compile_timeline", {
+            "network": "/obj/rbd_sim", "events": events,
+            "frame_range": [1, 5], "apply": True,
+        })
+        assert result["status"] == "success"
+        assert result["data"]["unresolved"] == []
+        assert mock_set_keyframes.call_count == 2, (
+            f"expected ONE _set_keyframes call per validated compiled.keyframes entry, "
+            f"got {mock_set_keyframes.call_count}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Blocker-4 — network-scope enforcement: out-of-network target -> unresolved
+# ---------------------------------------------------------------------------
+
+class TestCompileTimelineNetworkScopeEnforcement:
+    """Blocker-4: a compiled.keyframes entry whose target is NEITHER
+    `network` itself NOR under `network + '/'` is dropped to unresolved
+    BEFORE any write -- never applied."""
+
+    def test_out_of_network_target_is_unresolved_not_applied(self, mock_hou, mock_set_keyframes):
+        # ROUND-3 FIX-PASS note (M3): `network` itself must now resolve as a
+        # real node -- the round-3 fix checks network resolution
+        # UNCONDITIONALLY, up front, not only when a compiled entry's own
+        # target also fails to resolve. Registering it here isolates THIS
+        # test's intended scenario (an out-of-scope but perfectly
+        # resolvable target) from the separate unresolvable-network case
+        # pinned by TestCompileTimelineNetworkResolvedUpFrontUnconditionally.
+        network_node = _make_node_with_parm(mock_hou, "/obj/rbd_sim", set())
+        in_scope = _make_node_with_parm(mock_hou, "/obj/rbd_sim/inside", {"tx"})
+        out_of_scope = _make_node_with_parm(mock_hou, "/obj/other_network/outside", {"tx"})
+        mock_hou.node.side_effect = _node_lookup({
+            "/obj/rbd_sim": network_node,
+            "/obj/rbd_sim/inside": in_scope,
+            "/obj/other_network/outside": out_of_scope,
+        })
+
+        events = [
+            {"id": "kf_in", "type": "keyframe", "target": "/obj/rbd_sim/inside",
+             "params": {"parm": "tx", "frames": [[1, 0]]}},
+            {"id": "kf_out", "type": "keyframe", "target": "/obj/other_network/outside",
+             "params": {"parm": "tx", "frames": [[1, 0]]}},
+        ]
+
+        result = _dispatch("compile_timeline", {
+            "network": "/obj/rbd_sim", "events": events,
+            "frame_range": [1, 1], "apply": True,
+        })
+        assert result["status"] == "success", f"an out-of-network target must NOT raise, got {result!r}"
+        data = result["data"]
+        assert "kf_out" in data["unresolved"], (
+            f"an out-of-network target must be routed to unresolved, got {data['unresolved']!r}"
+        )
+        assert "kf_in" not in data["unresolved"]
+        assert mock_set_keyframes.call_count == 1, (
+            f"only the IN-SCOPE entry may be applied -- expected exactly 1 "
+            f"_set_keyframes call, got {mock_set_keyframes.call_count}"
+        )
+
+    def test_target_equal_to_network_itself_is_in_scope(self, mock_hou, mock_set_keyframes):
+        """The target being EQUAL to `network` (not merely a descendant)
+        is also in-scope."""
+        node = _make_node_with_parm(mock_hou, "/obj/rbd_sim", {"tx"})
+        mock_hou.node.side_effect = _node_lookup({"/obj/rbd_sim": node})
+
+        events = [{"id": "kf1", "type": "keyframe", "target": "/obj/rbd_sim",
+                   "params": {"parm": "tx", "frames": [[1, 0]]}}]
+
+        result = _dispatch("compile_timeline", {
+            "network": "/obj/rbd_sim", "events": events,
+            "frame_range": [1, 1], "apply": True,
+        })
+        assert result["status"] == "success"
+        assert result["data"]["unresolved"] == []
+        assert mock_set_keyframes.call_count == 1
+
+    def test_sibling_path_prefix_is_not_falsely_in_scope(self, mock_hou, mock_set_keyframes):
+        """A path that merely STARTS WITH the network string (without a
+        '/' boundary) must NOT be treated as in-scope -- e.g.
+        '/obj/rbd_sim_other' must not match network '/obj/rbd_sim'."""
+        # ROUND-3 FIX-PASS note (M3): `network` must resolve unconditionally.
+        network_node = _make_node_with_parm(mock_hou, "/obj/rbd_sim", set())
+        node = _make_node_with_parm(mock_hou, "/obj/rbd_sim_other", {"tx"})
+        mock_hou.node.side_effect = _node_lookup({
+            "/obj/rbd_sim": network_node,
+            "/obj/rbd_sim_other": node,
+        })
+
+        events = [{"id": "kf1", "type": "keyframe", "target": "/obj/rbd_sim_other",
+                   "params": {"parm": "tx", "frames": [[1, 0]]}}]
+
+        result = _dispatch("compile_timeline", {
+            "network": "/obj/rbd_sim", "events": events,
+            "frame_range": [1, 1], "apply": True,
+        })
+        assert result["status"] == "success"
+        assert result["data"]["unresolved"] == ["kf1"], (
+            f"a path-prefix match WITHOUT a '/' boundary must NOT be treated as "
+            f"in-scope, got unresolved={result['data']['unresolved']!r}"
+        )
+        assert mock_set_keyframes.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# FIX-PASS (codex-reviewer Blocker-1, SECURITY): network-scope enforcement
+# must use the CANONICAL resolved node path, not the raw target string.
+# ---------------------------------------------------------------------------
+
+class TestCompileTimelineNetworkScopeUsesCanonicalPath:
+    """Blocker-1 (SECURITY, path-traversal escape): the raw target string
+    '/obj/rbd_sim/../cam_escape' STRING-PASSES the scope check (it starts
+    with '/obj/rbd_sim/'), but hou.node() resolves it to the CANONICAL
+    '/obj/cam_escape' -- OUTSIDE the gated network. The scope check must
+    be performed against the node's own CANONICAL path (node.path()),
+    resolved via hou.node(), never the raw caller-supplied string. A
+    traversal target must be dropped to unresolved and NEVER written."""
+
+    def test_path_traversal_target_resolving_outside_network_is_unresolved_not_applied(
+        self, mock_hou, mock_set_keyframes
+    ):
+        # ROUND-3 FIX-PASS note (M3): `network` must resolve unconditionally.
+        network_node = _make_node_with_parm(mock_hou, "/obj/rbd_sim", set())
+        escape_node = _make_node_with_parm(mock_hou, "/obj/cam_escape", {"tx"})
+        # hou.node() is invoked with the RAW (unresolved) target string --
+        # the mock returns the escape node for that exact raw lookup, while
+        # the node's OWN .path() reports its CANONICAL (already-escaped)
+        # path, exactly as a real hou.node()/Node.path() pair would after
+        # Houdini normalizes a '..' path component.
+        mock_hou.node.side_effect = _node_lookup({
+            "/obj/rbd_sim": network_node,
+            "/obj/rbd_sim/../cam_escape": escape_node,
+        })
+
+        events = [{
+            "id": "kf_escape", "type": "keyframe",
+            "target": "/obj/rbd_sim/../cam_escape",
+            "params": {"parm": "tx", "frames": [[1, 0]]},
+        }]
+
+        result = _dispatch("compile_timeline", {
+            "network": "/obj/rbd_sim", "events": events,
+            "frame_range": [1, 1], "apply": True,
+        })
+        assert result["status"] == "success", (
+            f"a path-traversal target must NOT crash, got {result!r}"
+        )
+        data = result["data"]
+        assert "kf_escape" in data["unresolved"], (
+            f"a target that CANONICALLY resolves outside the gated network via "
+            f"a '..' path-traversal component must be routed to unresolved "
+            f"(the scope check must use the resolved node's CANONICAL path, "
+            f"not the raw target string) -- got unresolved={data['unresolved']!r}"
+        )
+        assert mock_set_keyframes.call_count == 0, (
+            f"a path-traversal target that canonically resolves OUTSIDE the "
+            f"network must NEVER be written -- expected 0 _set_keyframes calls, "
+            f"got {mock_set_keyframes.call_count}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Blocker-3 — missing-parm preflight: unresolved, pre-write, no crash
+# ---------------------------------------------------------------------------
+
+class TestCompileTimelineMissingParmPreflight:
+    """Blocker-3: a compiled.keyframes entry whose target node exists (and
+    is in-scope) but does NOT have the named parm is dropped to unresolved
+    BEFORE any write -- never a crash."""
+
+    def test_missing_parm_is_unresolved_not_applied(self, mock_hou, mock_set_keyframes):
+        node = _make_node_with_parm(mock_hou, "/obj/rbd_sim", {"ty"})  # no 'tx'
+        mock_hou.node.side_effect = _node_lookup({"/obj/rbd_sim": node})
+
+        events = [{"id": "kf1", "type": "keyframe", "target": "/obj/rbd_sim",
+                   "params": {"parm": "tx", "frames": [[1, 0]]}}]
+
+        result = _dispatch("compile_timeline", {
+            "network": "/obj/rbd_sim", "events": events,
+            "frame_range": [1, 1], "apply": True,
+        })
+        assert result["status"] == "success", f"a missing parm must NOT crash, got {result!r}"
+        data = result["data"]
+        assert data["unresolved"] == ["kf1"], (
+            f"a missing parm must route the event to unresolved, got {data['unresolved']!r}"
+        )
+        assert mock_set_keyframes.call_count == 0
+
+    def test_unresolvable_target_node_is_unresolved_not_applied(self, mock_hou, mock_set_keyframes):
+        """M3 FIX-PASS note: `network` itself is made resolvable in this
+        fixture (a real node) so this test continues to isolate its
+        INTENDED scenario -- an unresolvable TARGET node -- distinct from
+        the stricter "network itself is genuinely unresolvable" {ok:false}
+        case pinned separately below (TestCompileTimelineUnresolvableNetworkContractEquivalence).
+        Before this adjustment, `network` was ALSO left unresolvable by
+        the shared empty node_lookup, which the corrected M3 network-
+        resolution check would otherwise (incorrectly, for THIS test's
+        purpose) treat as a network-resolution failure."""
+        network_node = _make_node_with_parm(mock_hou, "/obj/rbd_sim", set())
+        mock_hou.node.side_effect = _node_lookup({
+            "/obj/rbd_sim": network_node,
+        })  # network resolves; the TARGET "/obj/does_not_exist" does not
+
+        events = [{"id": "kf1", "type": "keyframe", "target": "/obj/does_not_exist",
+                   "params": {"parm": "tx", "frames": [[1, 0]]}}]
+
+        result = _dispatch("compile_timeline", {
+            "network": "/obj/rbd_sim", "events": events,
+            "frame_range": [1, 1], "apply": True,
+        })
+        assert result["status"] == "success", f"an unresolvable target must NOT crash, got {result!r}"
+        assert result["data"]["unresolved"] == ["kf1"]
+        assert mock_set_keyframes.call_count == 0
+
+    def test_mixed_validated_and_missing_parm_entries_only_applies_the_validated_one(
+        self, mock_hou, mock_set_keyframes
+    ):
+        # ROUND-3 FIX-PASS note (M3): `network` must resolve unconditionally
+        # -- previously this test relied on the OLD conditional check never
+        # even asking whether `network` resolves (since a validated entry
+        # short-circuited the old guard).
+        network_node = _make_node_with_parm(mock_hou, "/obj/rbd_sim", set())
+        ok_node = _make_node_with_parm(mock_hou, "/obj/rbd_sim/ok", {"tx"})
+        bad_node = _make_node_with_parm(mock_hou, "/obj/rbd_sim/bad", set())
+        mock_hou.node.side_effect = _node_lookup({
+            "/obj/rbd_sim": network_node,
+            "/obj/rbd_sim/ok": ok_node, "/obj/rbd_sim/bad": bad_node,
+        })
+
+        events = [
+            {"id": "kf_ok", "type": "keyframe", "target": "/obj/rbd_sim/ok",
+             "params": {"parm": "tx", "frames": [[1, 0]]}},
+            {"id": "kf_bad", "type": "keyframe", "target": "/obj/rbd_sim/bad",
+             "params": {"parm": "tx", "frames": [[1, 0]]}},
+        ]
+
+        result = _dispatch("compile_timeline", {
+            "network": "/obj/rbd_sim", "events": events,
+            "frame_range": [1, 1], "apply": True,
+        })
+        assert result["status"] == "success"
+        assert "kf_bad" in result["data"]["unresolved"]
+        assert "kf_ok" not in result["data"]["unresolved"]
+        assert mock_set_keyframes.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# FIX-PASS (codex-reviewer Blocker-2, NON-ATOMIC apply): preflight must
+# reject a NON-WRITABLE (locked) parm -- checking `parm is not None` alone
+# is insufficient.
+# ---------------------------------------------------------------------------
+
+def _make_locked_node(mock_hou, path, parm_name):
+    """A node whose named parm EXISTS (passes a bare `parm is not None`
+    check) but reports itself LOCKED via parm.isLocked() -- a STABLE parm
+    object returned on every .parm(name) call (unlike
+    _make_node_with_parm's fresh-MagicMock-per-call side_effect), so a
+    test can pre-configure isLocked() and have it observed by the
+    handler's own later .parm(name) call."""
+    node = MagicMock(name=f"fake_locked_node_{path}")
+    node.path.return_value = path
+    parm_mock = MagicMock(name=f"parm_{parm_name}")
+    parm_mock.isLocked.return_value = True
+    node.parm.side_effect = lambda name: parm_mock if name == parm_name else None
+    return node
+
+
+class TestCompileTimelineLockedParmPreflight:
+    """Blocker-2: a compiled.keyframes entry whose target node + parm both
+    EXIST but the parm is LOCKED (non-writable) must be preflight-rejected
+    to unresolved BEFORE any write -- `parm is not None` alone is not a
+    writability check. The unrelated, unlocked entry must still apply
+    cleanly, and the whole call must complete WITHOUT an uncaught
+    exception (no partial mutation left by an exception escaping mid-loop
+    in `_apply_validated_keyframes`)."""
+
+    def test_locked_parm_is_preflight_rejected_and_never_applied(
+        self, mock_hou, mock_set_keyframes
+    ):
+        # ROUND-3 FIX-PASS note (M3): `network` must resolve unconditionally
+        # -- previously this test relied on the OLD conditional check never
+        # even asking whether `network` resolves (since a validated entry
+        # short-circuited the old guard).
+        network_node = _make_node_with_parm(mock_hou, "/obj/rbd_sim", set())
+        ok_node = _make_node_with_parm(mock_hou, "/obj/rbd_sim/ok", {"tx"})
+        locked_node = _make_locked_node(mock_hou, "/obj/rbd_sim/locked", "tx")
+        mock_hou.node.side_effect = _node_lookup({
+            "/obj/rbd_sim": network_node,
+            "/obj/rbd_sim/ok": ok_node, "/obj/rbd_sim/locked": locked_node,
+        })
+
+        events = [
+            {"id": "kf_ok", "type": "keyframe", "target": "/obj/rbd_sim/ok",
+             "params": {"parm": "tx", "frames": [[1, 0]]}},
+            {"id": "kf_locked", "type": "keyframe", "target": "/obj/rbd_sim/locked",
+             "params": {"parm": "tx", "frames": [[1, 0]]}},
+        ]
+
+        result = _dispatch("compile_timeline", {
+            "network": "/obj/rbd_sim", "events": events,
+            "frame_range": [1, 1], "apply": True,
+        })
+        assert result["status"] == "success", (
+            f"a locked target parm must be caught by preflight -- NOT an uncaught "
+            f"exception propagating through the dispatcher. Got {result!r}"
+        )
+        data = result["data"]
+        assert "kf_locked" in data["unresolved"], (
+            f"a LOCKED target parm must be preflight-rejected to unresolved "
+            f"(parm.isLocked() must be checked, not merely 'parm is not None'), "
+            f"got unresolved={data['unresolved']!r}"
+        )
+        assert "kf_ok" not in data["unresolved"], (
+            f"the unrelated, unlocked entry must NOT be affected, got "
+            f"unresolved={data['unresolved']!r}"
+        )
+        assert mock_set_keyframes.call_count == 1, (
+            f"exactly the ONE unlocked, valid entry must be applied -- the LOCKED "
+            f"entry must NEVER reach _set_keyframes. Got "
+            f"{mock_set_keyframes.call_count} call(s)."
+        )
+        call = mock_set_keyframes.call_args
+        applied_node = call.args[0] if call.args else call.kwargs.get("node_path")
+        assert applied_node == "/obj/rbd_sim/ok", (
+            f"the applied entry must be the UNLOCKED one, got node={applied_node!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# network resolution failure -> {ok:false} WITHOUT raising
+# ---------------------------------------------------------------------------
+
+class TestCompileTimelineUnresolvableNetwork:
+    def test_unresolvable_network_is_ok_false_not_raise(self, mock_hou, mock_set_keyframes):
+        mock_hou.node.side_effect = _node_lookup({})  # network itself doesn't resolve
+
+        result = _dispatch("compile_timeline", {
+            "network": "/obj/does_not_exist",
+            "events": [{"id": "kf1", "type": "keyframe", "target": "/obj/does_not_exist",
+                        "params": {"parm": "tx", "frames": [[1, 0]]}}],
+            "frame_range": [1, 1], "apply": True,
+        })
+        assert result["status"] == "success", (
+            f"an unresolvable network must be a NORMAL dispatcher return, never an "
+            f"exception. Got {result!r}"
+        )
+        data = result["data"]
+        assert data.get("ok") is False, f"expected ok:false for an unresolvable network, got {data!r}"
+        assert mock_set_keyframes.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# FIX-PASS (codex-reviewer Major-3): unresolvable network -> {ok:false} in
+# BOTH apply AND preview, regardless of whether any compiled entry's
+# target equals `network` verbatim (per the literal contract, not the
+# narrowed impl) -- and preview must mirror apply's terminal shape exactly
+# (Major-6).
+# ---------------------------------------------------------------------------
+
+class TestCompileTimelineUnresolvableNetworkContractEquivalence:
+    """Major-3: `hou.node(network)` unresolvable must degrade the WHOLE
+    call to {"ok": False, "error": ...} -- ALWAYS -- not only when a
+    compiled entry's target happens to equal `network` exactly. AND the
+    preview must return the SAME terminal shape for the SAME input
+    (Major-6 -- the preview must never diverge from what apply would do)."""
+
+    def test_unresolvable_network_is_ok_false_even_when_no_entry_targets_network_directly(
+        self, mock_hou, mock_set_keyframes
+    ):
+        mock_hou.node.side_effect = _node_lookup({})  # nothing resolves, incl. network itself
+
+        events = [{
+            "id": "kf1", "type": "keyframe", "target": "/obj/missing/child",
+            "params": {"parm": "tx", "frames": [[1, 0]]},
+        }]
+
+        result = _dispatch("compile_timeline", {
+            "network": "/obj/missing", "events": events,
+            "frame_range": [1, 1], "apply": True,
+        })
+        assert result["status"] == "success", f"an unresolvable network must not raise, got {result!r}"
+        data = result["data"]
+        assert data.get("ok") is False, (
+            f"an unresolvable `network` must degrade the WHOLE call to {{ok:false}} "
+            f"per the contract -- regardless of whether any compiled entry's "
+            f"target equals `network` verbatim. Got {data!r}"
+        )
+        assert mock_set_keyframes.call_count == 0
+
+    def test_preview_matches_apply_on_unresolvable_network(self, mock_hou, mock_set_keyframes):
+        mock_hou.node.side_effect = _node_lookup({})  # nothing resolves, incl. network itself
+
+        handlers = _import_handler_module()
+        events = [{
+            "id": "kf1", "type": "keyframe", "target": "/obj/missing/child",
+            "params": {"parm": "tx", "frames": [[1, 0]]},
+        }]
+        params = {"network": "/obj/missing", "events": events, "frame_range": [1, 1], "apply": True}
+
+        preview = handlers._preview_compile_timeline(params)
+        result = _dispatch("compile_timeline", params)
+        apply_data = result["data"]
+
+        assert apply_data.get("ok") is False, f"apply must degrade to ok:false, got {apply_data!r}"
+        assert preview.get("ok") is False, (
+            f"the PREVIEW must surface the SAME terminal unresolvable-network "
+            f"condition apply does (Major-6 -- preview must never diverge from "
+            f"apply). Got preview={preview!r}"
+        )
+        assert mock_set_keyframes.call_count == 0, (
+            "the preview must perform NO writes at all."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Major-6 — _preview_compile_timeline mirrors the apply validation
+# ---------------------------------------------------------------------------
+
+class TestPreviewCompileTimelineMirrorsApplyValidation:
+    """Major-6: _preview_compile_timeline runs the SAME read-only
+    preflight validation apply does, so its would-apply/unresolved split
+    matches exactly what apply would do -- WITHOUT any write."""
+
+    def test_preview_reports_would_set_keyframes_and_unresolved_matching_apply(
+        self, mock_hou, mock_set_keyframes
+    ):
+        # ROUND-3 FIX-PASS note (M3): `network` must resolve unconditionally.
+        network_node = _make_node_with_parm(mock_hou, "/obj/rbd_sim", set())
+        in_scope = _make_node_with_parm(mock_hou, "/obj/rbd_sim/inside", {"tx"})
+        no_parm = _make_node_with_parm(mock_hou, "/obj/rbd_sim/no_parm", set())
+        mock_hou.node.side_effect = _node_lookup({
+            "/obj/rbd_sim": network_node,
+            "/obj/rbd_sim/inside": in_scope,
+            "/obj/rbd_sim/no_parm": no_parm,
+        })
+
+        handlers = _import_handler_module()
+        events = [
+            {"id": "kf_ok", "type": "keyframe", "target": "/obj/rbd_sim/inside",
+             "params": {"parm": "tx", "frames": [[1, 0]]}},
+            {"id": "kf_no_parm", "type": "keyframe", "target": "/obj/rbd_sim/no_parm",
+             "params": {"parm": "tx", "frames": [[1, 0]]}},
+        ]
+
+        preview = handlers._preview_compile_timeline({
+            "network": "/obj/rbd_sim", "events": events,
+            "frame_range": [1, 1], "apply": True,
+        })
+
+        assert mock_set_keyframes.call_count == 0, (
+            "the preview must perform NO writes at all."
+        )
+        would_nodes = {e["node"] for e in preview["would_set_keyframes"]}
+        assert would_nodes == {"/obj/rbd_sim/inside"}, (
+            f"expected only the validated in-scope+has-parm entry in "
+            f"would_set_keyframes, got {preview['would_set_keyframes']!r}"
+        )
+        assert "kf_no_parm" in preview["unresolved"], (
+            f"the missing-parm entry must appear in the preview's unresolved list "
+            f"too, got {preview['unresolved']!r}"
+        )
+        assert preview["event_graph"] == {"nodes": 2, "edges": 0}
+
+    def test_preview_split_matches_a_real_apply_on_the_same_input(self, mock_hou, mock_set_keyframes):
+        """The preview's would_set_keyframes/unresolved split must be
+        computable from the SAME validation apply performs -- proven here
+        by running apply=true on the IDENTICAL events afterward and
+        checking the SAME event ended up applied/unresolved."""
+        # ROUND-3 FIX-PASS note (M3): `network` must resolve unconditionally.
+        network_node = _make_node_with_parm(mock_hou, "/obj/rbd_sim", set())
+        in_scope = _make_node_with_parm(mock_hou, "/obj/rbd_sim/inside", {"tx"})
+        out_of_scope = _make_node_with_parm(mock_hou, "/obj/elsewhere", {"tx"})
+        mock_hou.node.side_effect = _node_lookup({
+            "/obj/rbd_sim": network_node,
+            "/obj/rbd_sim/inside": in_scope, "/obj/elsewhere": out_of_scope,
+        })
+        handlers = _import_handler_module()
+
+        events = [
+            {"id": "kf_in", "type": "keyframe", "target": "/obj/rbd_sim/inside",
+             "params": {"parm": "tx", "frames": [[1, 0]]}},
+            {"id": "kf_out", "type": "keyframe", "target": "/obj/elsewhere",
+             "params": {"parm": "tx", "frames": [[1, 0]]}},
+        ]
+        params = {"network": "/obj/rbd_sim", "events": events, "frame_range": [1, 1], "apply": True}
+
+        preview = handlers._preview_compile_timeline(params)
+        assert "kf_out" in preview["unresolved"]
+        assert {e["node"] for e in preview["would_set_keyframes"]} == {"/obj/rbd_sim/inside"}
+
+        result = _dispatch("compile_timeline", params)
+        assert set(result["data"]["unresolved"]) == set(preview["unresolved"]), (
+            "the preview's unresolved split must match a real apply's unresolved split "
+            f"on identical input, got preview={preview['unresolved']!r} vs "
+            f"apply={result['data']['unresolved']!r}"
+        )
+        assert mock_set_keyframes.call_count == 1, (
+            "the real apply run must have applied exactly the ONE in-scope entry"
+        )
+
+    def test_preview_raise_denies(self, mock_hou):
+        """A raise inside the preview -> the 109 gate DENIES (mirrors
+        _preview_solve_layout's raise->DENY contract). A malformed event
+        (unknown type) makes the pure compile_plan raise ValueError -- the
+        preview must PROPAGATE it (never swallow it into a benign dict),
+        so the gate denies the call."""
+        handlers = _import_handler_module()
+        with pytest.raises(ValueError):
+            handlers._preview_compile_timeline({
+                "network": "/obj/rbd_sim",
+                "events": [{"id": "e1", "type": "not_a_real_event"}],
+                "frame_range": [1, 1], "apply": True,
+            })
+
+
+# ---------------------------------------------------------------------------
+# A model ValueError on a malformed event PROPAGATES (never folded into
+# {ok:false}/unresolved)
+# ---------------------------------------------------------------------------
+
+class TestCompileTimelineMalformedEventPropagates:
+    """A model-layer ValueError (a malformed event, e.g. an unknown type,
+    or a cyclic causes graph) PROPAGATES through compile_timeline as the
+    dispatcher's standard error envelope -- it must NEVER be folded into
+    {ok:false} or a benign unresolved entry."""
+
+    def test_direct_handler_call_raises_value_error(self, mock_hou):
+        handlers = _import_handler_module()
+        with pytest.raises(ValueError):
+            handlers.compile_timeline(
+                network="/obj/rbd_sim",
+                events=[{"id": "e1", "type": "not_a_real_event"}],
+                frame_range=[1, 1],
+                apply=True,
+            )
+
+    def test_dispatch_propagates_as_error_envelope_not_ok_false(self, mock_hou):
+        handlers = _import_handler_module()
+        result = _dispatch("compile_timeline", {
+            "network": "/obj/rbd_sim",
+            "events": [{"id": "e1", "type": "not_a_real_event"}],
+            "frame_range": [1, 1], "apply": True,
+        })
+        assert result["status"] == "error", (
+            f"a caller-contract ValueError (malformed event) must propagate as the "
+            f"DISPATCHER's error envelope (status:error), NOT be folded into a normal "
+            f"ok:false/unresolved success return. Got {result!r}."
+        )
+        assert result["error"]["code"] == "ValueError", (
+            f"expected error.code == 'ValueError', got {result['error']!r}"
+        )
+
+    def test_cyclic_causes_graph_propagates(self, mock_hou):
+        handlers = _import_handler_module()
+        events = [
+            {"id": "e1", "type": "fracture", "causes": ["e2"]},
+            {"id": "e2", "type": "emit", "causes": ["e1"]},
+        ]
+        result = _dispatch("compile_timeline", {
+            "network": "/obj/rbd_sim", "events": events,
+            "frame_range": [1, 1], "apply": True,
+        })
+        assert result["status"] == "error", f"a cyclic causes graph must propagate, got {result!r}"
+        assert result["error"]["code"] == "ValueError"
+
+
+# =============================================================================
+# ROUND-3 FIX-PASS (unitId pp12-117c, planSha UNCHANGED -- 379e4799ad34...) --
+# Sol's tier-3 diff-scoped RE-REVIEW (round 2 re-review) found 1 Blocker +
+# 2 Majors STILL-OPEN after a PRIOR reviewer wrongly marked them CLOSED.
+# See docs/homedini/plans/_agentic/_artifacts/codex-reviewer/pp12-117c/
+# review-verdict-rereview.json. NO contract change -- these tests pin the
+# ALREADY-LOCKED contract more precisely; they are RED against the CURRENT
+# (round-2) impl and must go GREEN under a round-3 fix that does not
+# regress anything above.
+# =============================================================================
+
+def _make_set_keyframes_with_mid_apply_failure(mock_hou, store: dict, *, fail_node: str, fail_parm: str):
+    """A `_set_keyframes` side_effect that RECORDS a genuine write into
+    *store* (keyed by (node_path, parm_name) -> set of written frames) for
+    every call EXCEPT the one matching (fail_node, fail_parm), which
+    RAISES hou.OperationFailed instead -- simulating a real Houdini-level
+    write failure (e.g. a callback that locked the parm strictly AFTER
+    preflight already observed isLocked() -> False; a genuine TOCTOU race
+    no preflight check can close in advance). The raise happens ONLY at
+    the write itself, never at construction, matching a real
+    parm.setKeyframe() failing mid-apply."""
+
+    def _fn(node_path, parm_name, keyframes):
+        if node_path == fail_node and parm_name == fail_parm:
+            raise mock_hou.OperationFailed(
+                f"simulated mid-apply write failure on {parm_name} of {node_path} "
+                f"(parm locked by a callback after preflight)"
+            )
+        store.setdefault((node_path, parm_name), set()).update(
+            kf["frame"] for kf in keyframes
+        )
+        return {
+            "node_path": node_path, "parm_name": parm_name,
+            "keyframes_set": len(keyframes), "status": "keyframes_set",
+        }
+
+    return _fn
+
+
+def _make_set_keyframes_with_mid_apply_runtime_error(store: dict, *, fail_node: str, fail_parm: str):
+    """SIBLING of `_make_set_keyframes_with_mid_apply_failure` above, for
+    Sol's re-review of REVISION 3 (docs/homedini/plans/_agentic/_artifacts/
+    codex-reviewer/pp12-117c/review-verdict-rereview.json): the locked
+    contract's B2 clause says the handler must catch "ANY mid-apply raise"
+    and degrade to the documented {ok:false} partial-apply/Undo error --
+    not merely the 3 narrow types `_apply_exception_types()` currently
+    enumerates (hou.OperationFailed, AttributeError, hou.PermissionError
+    when genuine). This variant raises a plain `RuntimeError` instead --
+    an exception type OUTSIDE that narrow tuple -- from the SAME injection
+    point (the `_set_keyframes` call for the SECOND validated entry), to
+    pin that "ANY raise" is honored for a type the current except clause
+    does NOT catch. Mirrors `_make_set_keyframes_with_mid_apply_failure`
+    exactly except for the raised exception type (no `mock_hou` needed --
+    RuntimeError is a real builtin, not a `hou.*` stand-in)."""
+
+    def _fn(node_path, parm_name, keyframes):
+        if node_path == fail_node and parm_name == fail_parm:
+            raise RuntimeError(
+                f"simulated mid-apply write failure on {parm_name} of {node_path} "
+                f"(a non-hou.OperationFailed/AttributeError/PermissionError raise -- "
+                f"e.g. an unexpected internal error inside setKeyframe)"
+            )
+        store.setdefault((node_path, parm_name), set()).update(
+            kf["frame"] for kf in keyframes
+        )
+        return {
+            "node_path": node_path, "parm_name": parm_name,
+            "keyframes_set": len(keyframes), "status": "keyframes_set",
+        }
+
+    return _fn
+
+
+# ---------------------------------------------------------------------------
+# B2 (ATOMICITY, REVISION 3 -- native-undo based, NOT a bespoke rollback):
+# on a mid-apply failure the handler STOPS immediately and returns the
+# documented partial-apply/use-Undo {ok:false} error; it must NEVER call a
+# bespoke `_delete_keyframe` compensating rollback (REVISION 3 REMOVED it --
+# it was the source of a data-loss Blocker: deleting a keyframe the call had
+# merely OVERWRITTEN instead of restoring its PRIOR value). Recovery is the
+# NATIVE `hou.undos.group` undo block the operator reverts with a single
+# Undo, plus the 109 operator preview/approve -- appropriate for a gated,
+# undo-wrapped tool.
+# ---------------------------------------------------------------------------
+
+class TestCompileTimelineMidApplyFailureStopsAndReportsUndo:
+    """REVISION 3 (operator decision 2026-07-11, after Sol's round-3
+    confirmation found the round-2 bespoke-rollback fix introduced a
+    DATA-LOSS Blocker -- deleting a keyframe the apply call OVERWROTE
+    rather than restoring its PRIOR value -- and made the class this
+    replaces (TestCompileTimelineAtomicApplyRollback) VACUOUS: its fixture
+    never registered the network node itself ('/obj/rbd_sim'), so the M3
+    unconditional up-front network-resolution check short-circuited to
+    {ok:false} BEFORE the apply path -- and therefore the mid-apply-
+    failure path -- ever ran; both the OLD (bespoke-rollback) and the NEW
+    (native-undo) impl degrade to {ok:false} on an unresolvable network,
+    so the old test passed for the WRONG reason).
+
+    The rev-3 apply-time atomicity guarantee for this GATED tool is NOT a
+    custom delete-based rollback. It is: (1) the ENTIRE validated set is
+    applied inside exactly ONE `hou.undos.group(...)` (a single native
+    undo step the operator reverts with one Undo); (2) on ANY mid-apply
+    raise -- a rare TOCTOU (a parm that passed preflight isLocked()==False
+    but a callback locks it, or any other genuine setKeyframe failure,
+    strictly AFTER preflight) -- the handler STOPS and degrades the WHOLE
+    call to {ok:false, error:'partial apply -- the gated call was
+    interrupted mid-write; use Undo to revert'}. It does NOT call the
+    SHIPPED compensating `_delete_keyframe` API -- there is NO bespoke
+    rollback to invoke. The residual (a rare TOCTOU can leave a partial
+    write) is ACCEPTED + documented as recoverable via the native undo
+    block, not papered over with a custom delete that risks destroying a
+    pre-existing keyframe value.
+
+    This test REGISTERS the network node ('/obj/rbd_sim') in the node
+    lookup -- unlike the vacuous class it replaces -- so the M3
+    unconditional network-resolution check passes and this test genuinely
+    REACHES `_apply_validated_keyframes` (not merely the {ok:false}
+    network-unresolvable short-circuit).
+
+    Assertions target the PUBLIC RETURNED CONTRACT (the {ok,error} shape)
+    plus two narrow checks that ARE the rev-3 contract itself (not an
+    accidental implementation-internals peek, tdd-with-agents.md Sec.2):
+    `_delete_keyframe` must NEVER be called (there is no bespoke rollback
+    to call), and `hou.undos.group` MUST have been entered (the native-
+    undo recovery mechanism the contract names). This test deliberately
+    does NOT assert whether entry-1's write is present or absent in any
+    tracking store after the failure -- REVISION 3 explicitly leaves that
+    outcome to Houdini's OWN native undo stack, which this mock cannot
+    faithfully observe either way."""
+
+    def test_mid_apply_failure_stops_and_returns_partial_apply_error(
+        self, mock_hou, monkeypatch
+    ):
+        network_node = _make_node_with_parm(mock_hou, "/obj/rbd_sim", set())
+        node_a = _make_node_with_parm(mock_hou, "/obj/rbd_sim/a", {"tx"})
+        node_b = _make_node_with_parm(mock_hou, "/obj/rbd_sim/b", {"ty"})
+        mock_hou.node.side_effect = _node_lookup({
+            "/obj/rbd_sim": network_node,
+            "/obj/rbd_sim/a": node_a, "/obj/rbd_sim/b": node_b,
+        })
+
+        import fxhoudinimcp_server.handlers.animation_handlers as _anim
+
+        store: dict = {}
+        fake_set_keyframes = MagicMock(
+            name="_set_keyframes",
+            side_effect=_make_set_keyframes_with_mid_apply_failure(
+                mock_hou, store, fail_node="/obj/rbd_sim/b", fail_parm="ty",
+            ),
+        )
+        # No side_effect: `_delete_keyframe` must never be reached under
+        # the rev-3 contract -- a bare spy is sufficient to prove that.
+        fake_delete_keyframe = MagicMock(name="_delete_keyframe")
+        monkeypatch.setattr(_anim, "_set_keyframes", fake_set_keyframes)
+        monkeypatch.setattr(_anim, "_delete_keyframe", fake_delete_keyframe)
+        sys.modules.pop("fxhoudinimcp_server.handlers.temporal_reasoning_handlers", None)
+
+        events = [
+            {"id": "kf_a", "type": "keyframe", "target": "/obj/rbd_sim/a",
+             "params": {"parm": "tx", "frames": [[1, 0], [10, 5]]}},
+            {"id": "kf_b", "type": "keyframe", "target": "/obj/rbd_sim/b",
+             "params": {"parm": "ty", "frames": [[1, 1], [10, 9]]}},
+        ]
+
+        result = _dispatch("compile_timeline", {
+            "network": "/obj/rbd_sim", "events": events,
+            "frame_range": [1, 10], "apply": True,
+        })
+        assert result["status"] == "success", (
+            f"a mid-apply write failure must degrade to a normal dispatcher "
+            f"return -- never an uncaught exception. Got {result!r}"
+        )
+        data = result["data"]
+        assert data.get("ok") is False, (
+            f"a mid-apply write failure must degrade the WHOLE call to "
+            f"{{ok:false}}, got {data!r}"
+        )
+        assert data.get("error") == (
+            "partial apply — the gated call was interrupted mid-write; "
+            "use Undo to revert"
+        ), (
+            f"REVISION 3 pins the EXACT documented partial-apply error "
+            f"string (lockedFieldContract 'REVISION 3 -- B2 ATOMICITY "
+            f"GUARANTEE, CLARIFIED') -- got error={data.get('error')!r}"
+        )
+        assert fake_delete_keyframe.call_count == 0, (
+            f"REVISION 3 REMOVED the bespoke rollback -- compile_timeline "
+            f"must NEVER call the compensating _delete_keyframe API on a "
+            f"mid-apply failure (it was the source of a data-loss Blocker: "
+            f"deleting a keyframe the call OVERWROTE instead of restoring "
+            f"its prior value). Got {fake_delete_keyframe.call_count} "
+            f"call(s): {fake_delete_keyframe.call_args_list!r}"
+        )
+        assert mock_hou.undos.group.called, (
+            "the ENTIRE apply must run inside exactly ONE hou.undos.group(...) "
+            "block -- the native undo step the operator recovers a partial "
+            "apply through -- but hou.undos.group was never entered."
+        )
+
+    def test_mid_apply_runtime_error_ALSO_stops_and_returns_partial_apply_error(
+        self, mock_hou, monkeypatch
+    ):
+        """Sol's re-review (round 3): the locked B2 clause says the handler
+        catches "ANY mid-apply raise ... (broadened except incl
+        hou.PermissionError)" -- not merely the 3 narrow types
+        `_apply_exception_types()` currently enumerates. This test injects
+        a plain `RuntimeError` (a type OUTSIDE that tuple) from the SAME
+        injection point as the sibling OperationFailed test above --
+        entry-2's `_set_keyframes` call, on the APPLY path, never from the
+        MODEL -- and pins the IDENTICAL rev-3 outcome: {ok:false} with the
+        exact documented partial-apply/Undo error string, zero
+        `_delete_keyframe` calls (there is no bespoke rollback to invoke),
+        and `hou.undos.group` entered. This is RED against the CURRENT impl
+        (whose except clause does not catch RuntimeError, so it escapes
+        uncaught and the dispatcher degrades the call to {status:"error"}
+        instead of the documented {status:"success", data:{ok:false,...}}
+        -- proving the "ANY mid-apply raise" contract is not yet fully
+        honored for an exception type outside the narrow tuple."""
+        network_node = _make_node_with_parm(mock_hou, "/obj/rbd_sim", set())
+        node_a = _make_node_with_parm(mock_hou, "/obj/rbd_sim/a", {"tx"})
+        node_b = _make_node_with_parm(mock_hou, "/obj/rbd_sim/b", {"ty"})
+        mock_hou.node.side_effect = _node_lookup({
+            "/obj/rbd_sim": network_node,
+            "/obj/rbd_sim/a": node_a, "/obj/rbd_sim/b": node_b,
+        })
+
+        import fxhoudinimcp_server.handlers.animation_handlers as _anim
+
+        store: dict = {}
+        fake_set_keyframes = MagicMock(
+            name="_set_keyframes",
+            side_effect=_make_set_keyframes_with_mid_apply_runtime_error(
+                store, fail_node="/obj/rbd_sim/b", fail_parm="ty",
+            ),
+        )
+        # No side_effect: `_delete_keyframe` must never be reached under
+        # the rev-3 contract -- a bare spy is sufficient to prove that.
+        fake_delete_keyframe = MagicMock(name="_delete_keyframe")
+        monkeypatch.setattr(_anim, "_set_keyframes", fake_set_keyframes)
+        monkeypatch.setattr(_anim, "_delete_keyframe", fake_delete_keyframe)
+        sys.modules.pop("fxhoudinimcp_server.handlers.temporal_reasoning_handlers", None)
+
+        events = [
+            {"id": "kf_a", "type": "keyframe", "target": "/obj/rbd_sim/a",
+             "params": {"parm": "tx", "frames": [[1, 0], [10, 5]]}},
+            {"id": "kf_b", "type": "keyframe", "target": "/obj/rbd_sim/b",
+             "params": {"parm": "ty", "frames": [[1, 1], [10, 9]]}},
+        ]
+
+        result = _dispatch("compile_timeline", {
+            "network": "/obj/rbd_sim", "events": events,
+            "frame_range": [1, 10], "apply": True,
+        })
+        assert result["status"] == "success", (
+            f"a mid-apply write failure -- of ANY exception type, per the "
+            f"locked B2 clause's 'ANY mid-apply raise' -- must degrade to a "
+            f"normal dispatcher return, never an uncaught exception escaping "
+            f"as {{status:'error'}}. Got {result!r}"
+        )
+        data = result["data"]
+        assert data.get("ok") is False, (
+            f"a mid-apply RuntimeError must degrade the WHOLE call to "
+            f"{{ok:false}} exactly like a hou.OperationFailed does, got {data!r}"
+        )
+        assert data.get("error") == (
+            "partial apply — the gated call was interrupted mid-write; "
+            "use Undo to revert"
+        ), (
+            f"REVISION 3 pins the EXACT documented partial-apply error "
+            f"string for ANY mid-apply raise (lockedFieldContract "
+            f"'REVISION 3 -- B2 ATOMICITY GUARANTEE, CLARIFIED') -- got "
+            f"error={data.get('error')!r}"
+        )
+        assert fake_delete_keyframe.call_count == 0, (
+            f"REVISION 3 REMOVED the bespoke rollback -- compile_timeline "
+            f"must NEVER call the compensating _delete_keyframe API on a "
+            f"mid-apply failure of ANY type. Got "
+            f"{fake_delete_keyframe.call_count} call(s): "
+            f"{fake_delete_keyframe.call_args_list!r}"
+        )
+        assert mock_hou.undos.group.called, (
+            "the ENTIRE apply must run inside exactly ONE hou.undos.group(...) "
+            "block -- the native undo step the operator recovers a partial "
+            "apply through -- but hou.undos.group was never entered."
+        )
+
+
+# ---------------------------------------------------------------------------
+# M3 (MAJOR, round-3 re-review STILL-OPEN) -- network resolution must be
+# checked UNCONDITIONALLY, up front -- not only when a compiled entry's
+# own target ALSO fails to resolve as a node.
+# ---------------------------------------------------------------------------
+
+class TestCompileTimelineNetworkResolvedUpFrontUnconditionally:
+    """M3 (MAJOR): per the ORIGINAL locked contract, step (1) is
+    UNCONDITIONALLY 'resolve network via hou.node(network) ->
+    unresolvable -> {ok:false,error}' -- BEFORE anything else. The
+    round-2 impl's `_network_genuinely_unresolvable` only fires when
+    `validated` is empty AND at least one dropped entry ALSO failed
+    because ITS OWN target node could not be resolved
+    (`node_unresolved_ids` non-empty). An `events=[]` call (or any call
+    whose compiled set is empty -- e.g. every event routes to
+    unresolved via compile_plan itself, producing zero
+    compiled_by_id entries) makes `node_unresolved_ids` empty by
+    construction (there is no target to even ATTEMPT resolving), so the
+    OLD conditional check never asks whether `network` itself resolves
+    at all -- silently returning an ordinary (non-error) result for a
+    `network` that does not exist as a scene node. Both `compile_timeline`
+    (apply=true AND apply=false) and `_preview_compile_timeline` must
+    surface the SAME unconditional {ok:false,error}."""
+
+    def test_apply_true_unresolvable_network_with_empty_events_is_ok_false(
+        self, mock_hou, mock_set_keyframes
+    ):
+        mock_hou.node.side_effect = _node_lookup({})  # network genuinely does not resolve
+
+        result = _dispatch("compile_timeline", {
+            "network": "/obj/does_not_exist", "events": [],
+            "frame_range": [1, 1], "apply": True,
+        })
+        assert result["status"] == "success", (
+            f"an unresolvable network must not raise, got {result!r}"
+        )
+        data = result["data"]
+        assert data.get("ok") is False, (
+            f"network resolution must be checked UNCONDITIONALLY (contract "
+            f"step 1), even with events=[] (zero compiled entries, so there "
+            f"is no per-entry node-resolution failure to trigger the OLD "
+            f"conditional check) -- expected {{ok:false}}, got a non-error "
+            f"result: {data!r}"
+        )
+        assert mock_set_keyframes.call_count == 0
+
+    def test_apply_false_unresolvable_network_with_empty_events_is_ok_false(
+        self, mock_hou, mock_set_keyframes
+    ):
+        mock_hou.node.side_effect = _node_lookup({})
+
+        result = _dispatch("compile_timeline", {
+            "network": "/obj/does_not_exist", "events": [],
+            "frame_range": [1, 1], "apply": False,
+        })
+        assert result["status"] == "success", (
+            f"an unresolvable network must not raise, got {result!r}"
+        )
+        data = result["data"]
+        assert data.get("ok") is False, (
+            f"apply=false must ALSO surface the unresolvable-network "
+            f"{{ok:false}} unconditionally (the gate is per-COMMAND, the "
+            f"scene-resolution check is not conditioned on apply), got "
+            f"{data!r}"
+        )
+        assert mock_set_keyframes.call_count == 0
+
+    def test_preview_unresolvable_network_with_empty_events_is_ok_false(self, mock_hou):
+        mock_hou.node.side_effect = _node_lookup({})
+        handlers = _import_handler_module()
+
+        preview = handlers._preview_compile_timeline({
+            "network": "/obj/does_not_exist", "events": [],
+            "frame_range": [1, 1], "apply": True,
+        })
+        assert preview.get("ok") is False, (
+            f"_preview_compile_timeline must ALSO surface the SAME "
+            f"unconditional unresolvable-network {{ok:false}} for "
+            f"events=[] (Major-6 -- preview must never diverge from "
+            f"apply), got {preview!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# B1-residual (MAJOR, round-3 re-review STILL-OPEN) -- compare targets
+# against the CANONICAL resolved network path, not the RAW `network` arg.
+# ---------------------------------------------------------------------------
+
+class TestCompileTimelineNetworkCanonicalizedOnce:
+    """B1-residual (MAJOR): the round-2 Blocker-1 fix already compares a
+    TARGET's resolved CANONICAL path against `network` -- but `network`
+    ITSELF is still compared as the RAW caller-supplied string, never
+    independently resolved/canonicalized. Two consequences:
+
+    (a) a non-canonical but RESOLVABLE `network` arg (e.g. a trailing
+        slash) false-REJECTS an otherwise perfectly in-scope target --
+        `_target_in_network_scope(canonical_target, "/obj/rbd_sim/")`
+        computes `canonical_target.startswith("/obj/rbd_sim//")` (double
+        slash), which never matches a real canonical child path.
+
+    (b) an EMPTY/unresolvable `network` string BYPASSES scope entirely --
+        `_target_in_network_scope(target, "")` returns True for virtually
+        ANY absolute Houdini path (`target.startswith("" + "/")` is True
+        for any path beginning with '/'), an unscoped-write security hole.
+
+    The fix resolves `network` to its OWN canonical
+    `hou.node(network).path()` ONCE, up front (folding into the SAME
+    unconditional resolution M3 requires), and compares every target's
+    canonical path against THAT resolved canonical network path -- never
+    the raw `network` string."""
+
+    def test_non_canonical_trailing_slash_network_still_accepts_in_scope_target(
+        self, mock_hou, mock_set_keyframes
+    ):
+        network_node = _make_node_with_parm(mock_hou, "/obj/rbd_sim", set())
+        target_node = _make_node_with_parm(mock_hou, "/obj/rbd_sim/box", {"tx"})
+        # hou.node() is invoked with the RAW `network` string the caller
+        # supplied ("/obj/rbd_sim/" -- a trailing slash); Houdini itself
+        # resolves that to the SAME canonical node as "/obj/rbd_sim" would
+        # -- the node's OWN .path() reports the CANONICAL form (no
+        # trailing slash), exactly as a real hou.Node.path() would.
+        mock_hou.node.side_effect = _node_lookup({
+            "/obj/rbd_sim/": network_node,
+            "/obj/rbd_sim/box": target_node,
+        })
+
+        events = [{"id": "kf1", "type": "keyframe", "target": "/obj/rbd_sim/box",
+                   "params": {"parm": "tx", "frames": [[1, 0]]}}]
+
+        result = _dispatch("compile_timeline", {
+            "network": "/obj/rbd_sim/",  # NON-canonical (trailing slash)
+            "events": events, "frame_range": [1, 1], "apply": True,
+        })
+        assert result["status"] == "success", (
+            f"a resolvable non-canonical `network` string must not crash, "
+            f"got {result!r}"
+        )
+        data = result["data"]
+        assert data["unresolved"] == [], (
+            f"a perfectly valid, in-scope target must NOT be false-rejected "
+            f"to unresolved merely because `network` was supplied in a "
+            f"non-canonical form (the raw-string scope comparison bug) -- "
+            f"got unresolved={data['unresolved']!r}"
+        )
+        assert mock_set_keyframes.call_count == 1, (
+            f"the in-scope target must actually be APPLIED once `network` "
+            f"is resolved to its own canonical path for the scope "
+            f"comparison, got {mock_set_keyframes.call_count} call(s)"
+        )
+
+    def test_empty_network_string_does_not_bypass_scope_and_degrades_ok_false(
+        self, mock_hou, mock_set_keyframes
+    ):
+        """An empty `network` does not resolve to any real scene node -- it
+        must degrade the WHOLE call to {ok:false} (the same up-front,
+        unconditional network-resolution requirement M3 pins), NOT be
+        silently treated as 'no scope boundary'. The raw-string comparison
+        `target.startswith('' + '/')` is True for virtually every absolute
+        Houdini path -- an unscoped-write security hole this test closes."""
+        target_node = _make_node_with_parm(mock_hou, "/obj/anything/at/all", {"tx"})
+        mock_hou.node.side_effect = _node_lookup({"/obj/anything/at/all": target_node})
+        # "" is deliberately NOT registered -- hou.node("") does not
+        # resolve to any real scene node.
+
+        events = [{"id": "kf1", "type": "keyframe", "target": "/obj/anything/at/all",
+                   "params": {"parm": "tx", "frames": [[1, 0]]}}]
+
+        result = _dispatch("compile_timeline", {
+            "network": "", "events": events,
+            "frame_range": [1, 1], "apply": True,
+        })
+        assert result["status"] == "success", f"an empty network must not raise, got {result!r}"
+        data = result["data"]
+        assert data.get("ok") is False, (
+            f"an empty/unresolvable `network` must degrade the WHOLE call "
+            f"to {{ok:false}} -- it must NEVER be treated as an unscoped "
+            f"wildcard that accepts an arbitrary target. Got {data!r}"
+        )
+        assert mock_set_keyframes.call_count == 0, (
+            f"an empty network must NEVER result in a write -- expected 0 "
+            f"_set_keyframes calls, got {mock_set_keyframes.call_count}"
+        )

@@ -119,3 +119,61 @@ async def houdini_assert_simulation(
             "cook_job": cook_job,
         },
     )
+
+
+@mcp.tool(meta={"require_approval": True})
+async def houdini_compile_timeline(
+    ctx: Context,
+    network: str,
+    events: list,
+    frame_range: list,
+    apply: bool = True,
+) -> dict:
+    """Compile an agent-authored event-timeline into concrete Houdini
+    KEYFRAMES on the EXISTING sim network (PP12-117 PR-3, the AUTHORING
+    half). Compiles ONLY two grounded event shapes -- a bare `keyframe`
+    event, and an activation event (emit/fracture/ignite/tear) that
+    carries an EXPLICIT params.parm + EXPLICIT params.frames -- into a
+    compiled.keyframes entry. Everything this narrowed, honest translation
+    cannot map (type-inferred activation without an explicit parm, a
+    threshold-triggered event, a causally-impossible caused event, an
+    out-of-network or missing target) is routed to `unresolved` instead of
+    being invented or silently dropped.
+
+    GATED (require_approval=True -- Capability.MUTATING handler-side; the
+    first MUTATING tool of the Temporal/Sim-Reasoning MCP member).
+    apply=False STILL goes through the gate (fail-safe -- gate capability
+    is per-COMMAND, not per-argument, mirroring houdini_solve_layout).
+
+    A SINGLE bridge.execute call -- the wrapper performs no result
+    interpretation and returns bridge.execute's result VERBATIM, including
+    the 109-gate pending-approval/preview shape (a normal, valid return --
+    never reinterpreted, never raised).
+
+    Args:
+        ctx: MCP lifespan context -- injected by FastMCP; hidden from client schema.
+        network: The sim network node every compiled keyframe target must
+            be `network` itself or a descendant under `network + '/'` --
+            an out-of-scope target is routed to `unresolved`, never
+            written.
+        events: List of event-timeline wire dicts (see
+            houdini_describe_sim_events for the vocabulary). Only a
+            keyframe event, or an activation event carrying an explicit
+            `parm` + `frames`, compiles; everything else is unresolved.
+        frame_range: [start, end] inclusive frame range -- reserved for
+            parity with the read-side tools; compile_timeline only WRITES
+            keyframes, it does not cook or step frames.
+        apply: When True (default), atomically set the preflight-validated
+            keyframes on the resolved target parms. When False, only the
+            compiled plan is returned -- no scene mutation.
+    """
+    bridge = _fxserver._get_bridge(ctx)
+    return await bridge.execute(
+        "compile_timeline",
+        {
+            "network": network,
+            "events": events,
+            "frame_range": frame_range,
+            "apply": apply,
+        },
+    )

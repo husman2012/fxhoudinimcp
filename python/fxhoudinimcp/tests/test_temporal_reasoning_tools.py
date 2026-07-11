@@ -481,3 +481,330 @@ class TestCtxSchemaGuard:
             f"'ctx' must NOT appear in houdini_assert_simulation's input schema properties. "
             f"Got properties={list(properties.keys())!r}."
         )
+
+
+# =============================================================================
+# houdini_compile_timeline — PP12-117 PR-3, the MUTATING/109-gated wrapper
+# (NARROWED SCOPE per plan pp12-117c lockedFieldContract, REVISION 2).
+#
+# TDD phase: RED — houdini_compile_timeline does NOT exist yet on
+# temporal_reasoning_tools.py. Every test below imports it via a fresh
+# `from fxhoudinimcp.tools.temporal_reasoning_tools import
+# houdini_compile_timeline` INSIDE the test (after any bridge patch is
+# active), exactly like the PR-2 classes above — an ImportError here fails
+# only these new tests, not the PR-2 suite above.
+#
+# Grounded LAYER-FOR-LAYER on test_spatial_reasoning_tools.py's
+# TestSolveLayout* classes (THE exemplar for a GATED wrapper test):
+# MagicMock(spec=HoudiniBridge); import-inside-test-after-patch;
+# require_approval=True via the mcp tool_map; exactly-one bridge.execute
+# call; exact params-dict key set; VERBATIM passthrough of BOTH a success
+# result AND a pending-approval/preview shape (never reinterpreted, never
+# raises, never gains/loses an 'ok' key); apply=false is STILL gated
+# (fail-safe — gate capability is per-COMMAND, not per-argument);
+# ctx-not-in-schema guard.
+#
+# Locked field contract (plan pp12-117c lockedFieldContract, REVISION 2):
+#     houdini_compile_timeline(ctx, network, events, frame_range,
+#                               apply=True) -> dict
+#         -> a SINGLE bridge.execute('compile_timeline', {
+#                'network': network, 'events': events,
+#                'frame_range': frame_range, 'apply': apply,
+#            })
+#
+# Decorated @mcp.tool(meta={'require_approval': True}) — GATED (the FIRST
+# MUTATING tool of the Temporal/Sim-Reasoning MCP member; PP12-109
+# security gate).
+# =============================================================================
+
+@pytest.fixture()
+def compile_timeline_bridge_mock():
+    """Spec-bound bridge mock returning a successful gated compile_timeline
+    result (SPEC 4.1 shape: compiled/event_graph/applied/unresolved)."""
+    mock = MagicMock(spec=HoudiniBridge)
+    mock.execute = AsyncMock(return_value={
+        "compiled": {
+            "keyframes": [{"node": "/obj/rbd_sim", "parm": "tx", "frames": [[1, 0], [10, 5]]}],
+            "chop_triggers": [],
+            "dop_parms": [],
+        },
+        "event_graph": {"nodes": 1, "edges": 0},
+        "applied": True,
+        "unresolved": [],
+    })
+    return mock
+
+
+@pytest.fixture()
+def compile_timeline_pending_approval_bridge_mock():
+    """Spec-bound bridge mock returning a 109-gate pending-approval shape —
+    a pending/preview response is NOT a failure and must survive the
+    wrapper untouched (mirrors solve_layout's pending-approval guard)."""
+    mock = MagicMock(spec=HoudiniBridge)
+    mock.execute = AsyncMock(return_value={
+        "status": "pending_approval",
+        "pending_id": "pend-compile-timeline-xyz789",
+        "preview": {
+            "would_set_keyframes": [{"node": "/obj/rbd_sim", "parm": "tx", "frame_count": 2}],
+            "unresolved": [],
+            "event_graph": {"nodes": 1, "edges": 0},
+        },
+    })
+    return mock
+
+
+class TestCompileTimelineToolsModuleImport:
+    """houdini_compile_timeline must be a callable on the EXISTING
+    temporal_reasoning_tools module (which already ships
+    houdini_describe_sim_events / houdini_assert_simulation from PR-2).
+    Until hou-dev adds it, this import raises ImportError — the RED
+    signal for this section."""
+
+    def test_existing_pr2_wrappers_unaffected(self):
+        """The PR-2 wrappers must still be importable — the new PR-3
+        wrapper must not clobber its existing siblings (append-only
+        contract)."""
+        from fxhoudinimcp.tools.temporal_reasoning_tools import (  # noqa: F401
+            houdini_assert_simulation,
+            houdini_describe_sim_events,
+        )
+        assert callable(houdini_describe_sim_events)
+        assert callable(houdini_assert_simulation)
+
+    def test_compile_timeline_callable_on_module(self):
+        """FAILS RED until hou-dev adds houdini_compile_timeline."""
+        from fxhoudinimcp.tools.temporal_reasoning_tools import houdini_compile_timeline  # noqa: F401
+        assert callable(houdini_compile_timeline), (
+            "houdini_compile_timeline must be a callable (the @mcp.tool coroutine)."
+        )
+
+
+class TestCompileTimelineRequireApprovalTrue:
+    """houdini_compile_timeline must have meta={'require_approval': True}
+    — GATED (Capability.MUTATING handler-side; the first MUTATING tool of
+    the Temporal/Sim-Reasoning MCP member)."""
+
+    def test_mcp_tool_meta_require_approval_true(self):
+        import fxhoudinimcp.tools.temporal_reasoning_tools  # noqa: F401
+        tool_map = _get_tool_map()
+        assert "houdini_compile_timeline" in tool_map, (
+            "houdini_compile_timeline not registered on the mcp server; hou-dev must "
+            "define it (decorated with @mcp.tool) in temporal_reasoning_tools.py."
+        )
+        tool_obj = tool_map["houdini_compile_timeline"]
+        meta = getattr(tool_obj, "meta", None) or getattr(tool_obj, "tags", None) or {}
+        require_approval = meta.get("require_approval", False) if isinstance(meta, dict) else False
+        assert require_approval is True, (
+            f"houdini_compile_timeline meta must have require_approval=True (GATED — "
+            f"a mutating tool). Got meta={meta!r}."
+        )
+
+
+class TestCompileTimelineBridgeContract:
+    """houdini_compile_timeline must delegate to bridge.execute EXACTLY
+    ONCE, with command 'compile_timeline' and the exact 4-key params dict
+    from the lockedFieldContract."""
+
+    @pytest.mark.asyncio
+    async def test_exactly_one_bridge_execute_call(self, compile_timeline_bridge_mock):
+        with patch("fxhoudinimcp.server._get_bridge", return_value=compile_timeline_bridge_mock):
+            from fxhoudinimcp.tools.temporal_reasoning_tools import houdini_compile_timeline
+
+            ctx_mock = MagicMock()
+            await houdini_compile_timeline(
+                ctx=ctx_mock,
+                network="/obj/rbd_sim",
+                events=[{
+                    "id": "kf1", "type": "keyframe", "target": "/obj/rbd_sim",
+                    "params": {"parm": "tx", "frames": [[1, 0], [10, 5]]},
+                }],
+                frame_range=[1, 10],
+            )
+
+        assert compile_timeline_bridge_mock.execute.call_count == 1, (
+            f"houdini_compile_timeline must make exactly ONE bridge.execute call, "
+            f"got {compile_timeline_bridge_mock.execute.call_count}."
+        )
+
+    @pytest.mark.asyncio
+    async def test_command_string_is_compile_timeline(self, compile_timeline_bridge_mock):
+        with patch("fxhoudinimcp.server._get_bridge", return_value=compile_timeline_bridge_mock):
+            from fxhoudinimcp.tools.temporal_reasoning_tools import houdini_compile_timeline
+
+            ctx_mock = MagicMock()
+            await houdini_compile_timeline(
+                ctx=ctx_mock, network="/obj/rbd_sim", events=[], frame_range=[1, 10],
+            )
+
+        call_args = compile_timeline_bridge_mock.execute.call_args
+        command = call_args[0][0] if call_args.args else call_args[1].get("command", "")
+        assert command == "compile_timeline", (
+            f"Expected bridge.execute('compile_timeline', ...) but got command={command!r}. "
+            "Command string must match register_handler's first arg exactly "
+            "(the 4-bug convention: command == register name == params keys == handler kwargs)."
+        )
+
+    @pytest.mark.asyncio
+    async def test_params_dict_has_exact_four_keys(self, compile_timeline_bridge_mock):
+        network = "/obj/rbd_sim"
+        events = [{
+            "id": "kf1", "type": "keyframe", "target": "/obj/rbd_sim",
+            "params": {"parm": "tx", "frames": [[1, 0], [10, 5]]},
+        }]
+        frame_range = [1, 10]
+
+        with patch("fxhoudinimcp.server._get_bridge", return_value=compile_timeline_bridge_mock):
+            from fxhoudinimcp.tools.temporal_reasoning_tools import houdini_compile_timeline
+
+            ctx_mock = MagicMock()
+            await houdini_compile_timeline(
+                ctx=ctx_mock, network=network, events=events, frame_range=frame_range,
+                apply=False,
+            )
+
+        call_args = compile_timeline_bridge_mock.execute.call_args
+        params = call_args[0][1] if len(call_args.args) > 1 else call_args[1].get("params", {})
+
+        expected_keys = {"network", "events", "frame_range", "apply"}
+        assert set(params.keys()) == expected_keys, (
+            f"params dict must be exactly {expected_keys!r}. Got keys={set(params.keys())!r}."
+        )
+        assert params["network"] == network
+        assert params["events"] == events
+        assert params["frame_range"] == frame_range
+        assert params["apply"] is False
+
+    @pytest.mark.asyncio
+    async def test_apply_defaults_to_true_and_is_forwarded(self, compile_timeline_bridge_mock):
+        """apply defaults to True and must be forwarded verbatim (not
+        omitted) when the caller doesn't pass it."""
+        with patch("fxhoudinimcp.server._get_bridge", return_value=compile_timeline_bridge_mock):
+            from fxhoudinimcp.tools.temporal_reasoning_tools import houdini_compile_timeline
+
+            ctx_mock = MagicMock()
+            await houdini_compile_timeline(
+                ctx=ctx_mock, network="/obj/rbd_sim", events=[], frame_range=[1, 10],
+            )
+
+        call_args = compile_timeline_bridge_mock.execute.call_args
+        params = call_args[0][1] if len(call_args.args) > 1 else call_args[1].get("params", {})
+        assert params.get("apply") is True, f"apply must default to True. Got {params.get('apply')!r}."
+
+
+class TestCompileTimelineResultPassthrough:
+    """The wrapper must return bridge.execute's result VERBATIM — including
+    the 109-gate pending-approval/preview shape (a normal, valid return —
+    never reinterpreted, never raised)."""
+
+    @pytest.mark.asyncio
+    async def test_success_result_passed_through_verbatim(self, compile_timeline_bridge_mock):
+        expected_result = compile_timeline_bridge_mock.execute.return_value
+        with patch("fxhoudinimcp.server._get_bridge", return_value=compile_timeline_bridge_mock):
+            from fxhoudinimcp.tools.temporal_reasoning_tools import houdini_compile_timeline
+
+            ctx_mock = MagicMock()
+            result = await houdini_compile_timeline(
+                ctx=ctx_mock, network="/obj/rbd_sim", events=[], frame_range=[1, 10],
+            )
+
+        assert result == expected_result, (
+            f"Wrapper must pass bridge.execute's result through unchanged. "
+            f"Expected {expected_result!r}, got {result!r}."
+        )
+
+    @pytest.mark.asyncio
+    async def test_pending_approval_result_passed_through_not_treated_as_failure(
+        self, compile_timeline_pending_approval_bridge_mock
+    ):
+        expected_result = compile_timeline_pending_approval_bridge_mock.execute.return_value
+        with patch(
+            "fxhoudinimcp.server._get_bridge",
+            return_value=compile_timeline_pending_approval_bridge_mock,
+        ):
+            from fxhoudinimcp.tools.temporal_reasoning_tools import houdini_compile_timeline
+
+            ctx_mock = MagicMock()
+            result = await houdini_compile_timeline(
+                ctx=ctx_mock, network="/obj/rbd_sim", events=[], frame_range=[1, 10],
+            )
+
+        assert result == expected_result, (
+            "A pending-approval bridge response must be returned VERBATIM — "
+            f"Expected {expected_result!r}, got {result!r}."
+        )
+        assert result.get("status") == "pending_approval"
+        assert "ok" not in result, (
+            f"Wrapper must not inject an 'ok' key into a pending-approval response. "
+            f"Got keys={list(result.keys())!r}."
+        )
+
+
+class TestCompileTimelineApplyFalseStillGated:
+    """apply=false must STILL go through bridge.execute with
+    require_approval still True on the tool (gate capability is
+    per-COMMAND, not per-argument — mirrors solve_layout's
+    apply=false-is-still-gated contract)."""
+
+    @pytest.mark.asyncio
+    async def test_apply_false_still_makes_a_single_gated_bridge_call(self, compile_timeline_bridge_mock):
+        import fxhoudinimcp.tools.temporal_reasoning_tools  # noqa: F401
+        tool_map = _get_tool_map()
+        tool_obj = tool_map["houdini_compile_timeline"]
+        meta = getattr(tool_obj, "meta", None) or getattr(tool_obj, "tags", None) or {}
+        require_approval = meta.get("require_approval", False) if isinstance(meta, dict) else False
+        assert require_approval is True, (
+            "houdini_compile_timeline must remain require_approval=True regardless of "
+            "the apply argument value (fail-safe — gate capability is per-COMMAND)."
+        )
+
+        with patch("fxhoudinimcp.server._get_bridge", return_value=compile_timeline_bridge_mock):
+            from fxhoudinimcp.tools.temporal_reasoning_tools import houdini_compile_timeline
+
+            ctx_mock = MagicMock()
+            await houdini_compile_timeline(
+                ctx=ctx_mock, network="/obj/rbd_sim", events=[], frame_range=[1, 10], apply=False,
+            )
+        assert compile_timeline_bridge_mock.execute.call_count == 1
+
+
+class TestCompileTimelineCtxSchemaGuard:
+    """ctx must NOT appear in houdini_compile_timeline's input schema
+    properties."""
+
+    def _get_tool_schema(self, tool_name: str) -> dict:
+        tool_map = _get_tool_map()
+        tool_obj = tool_map.get(tool_name)
+        if tool_obj is None:
+            return {}
+        return getattr(tool_obj, "parameters", getattr(tool_obj, "inputSchema", {})) or {}
+
+    def test_compile_timeline_ctx_not_in_schema(self):
+        import fxhoudinimcp.tools.temporal_reasoning_tools  # noqa: F401
+        tool_map = _get_tool_map()
+        assert "houdini_compile_timeline" in tool_map, (
+            "houdini_compile_timeline not registered on the mcp server; hou-dev must "
+            "define it (decorated with @mcp.tool) in temporal_reasoning_tools.py. "
+            "(Without this assertion, an absent tool would vacuously pass the "
+            "ctx-not-in-schema check below via an empty {} schema.)"
+        )
+        schema = self._get_tool_schema("houdini_compile_timeline")
+        properties = schema.get("properties", {})
+        assert "ctx" not in properties, (
+            f"'ctx' must NOT appear in houdini_compile_timeline's input schema properties. "
+            f"Got properties={list(properties.keys())!r}."
+        )
+
+
+class TestCompileTimelineWrapperImportsNoHouOrPxr:
+    """The wrapper module must import NO hou, NO pxr (CL-015) — it must
+    stay importable off-DCC for this pytest suite."""
+
+    def test_source_has_no_forbidden_imports(self):
+        import fxhoudinimcp.tools.temporal_reasoning_tools as mod
+        with open(mod.__file__, "r", encoding="utf-8") as f:
+            source = f.read()
+        forbidden_tokens = ["import hou", "from hou", "import pxr", "from pxr"]
+        for token in forbidden_tokens:
+            assert token not in source, (
+                f"temporal_reasoning_tools.py must not contain {token!r} (CL-015)."
+            )

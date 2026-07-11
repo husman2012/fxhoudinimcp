@@ -604,3 +604,309 @@ def evaluate_assertions(assertions) -> dict:
 
     overall_pass = all(r["pass"] for r in results) if results else True
     return {"results": results, "pass": bool(overall_pass)}
+
+
+# ---------------------------------------------------------------------------
+# compile_plan (FR-A authoring half, PP12-117 PR-3) -- PURE translation
+# ---------------------------------------------------------------------------
+#
+# ADDITIVE to this module (plan pp12-117c lockedFieldContract, revision 2).
+# The PR-1/PR-2 public surface above (EventSpec, EventGraph,
+# describe_sim_events, aggregate_assertion, evaluate_assertions) is
+# BYTE-UNCHANGED -- compile_plan reuses EventGraph/EventSpec/_event_from_dict
+# as-is, adding no new required fields and no behavioral change to any of
+# them.
+#
+# SCOPE (BINDING, HONEST-NARROW per the hypothesis-gate): compile_plan
+# translates ONLY two grounded event shapes into compiled.keyframes -- (1) a
+# bare `keyframe` event, and (2) an activation event (emit/fracture/ignite/
+# tear) that carries an EXPLICIT params.parm (non-empty str) + EXPLICIT
+# params.frames (a non-empty list of [frame,value] pairs). There is NO
+# type->parm inference (get_node_card is docs, not a semantic parm map --
+# the PR-2 invented-parm failure mode this PR deliberately does NOT repeat)
+# and NO synthesized on/off default. Everything else the translation cannot
+# map -- a threshold-triggered event (trigger.kind in {stress_gt, field_gt,
+# collision_with}), an activation event without an explicit parm, a
+# frame_eq-triggered event without explicit parm+frames, or a
+# causally-impossible caused event -- routes to `unresolved` (its event id),
+# contributing NOTHING to `compiled`, and NEVER raises for a well-formed
+# event. compiled.chop_triggers and compiled.dop_parms are ALWAYS [] in
+# PR-3 (their compilation is a later, DEFERRED PR).
+#
+# compile_plan is PURE: it emits node PATHS + parm NAMES + frames as plain
+# data; it does NOT verify a node/parm exists in a live scene and does NOT
+# check network-scope (that is the handler's apply-time preflight job,
+# below). It imports NO hou, NO Qt, NO pxr, and makes NO MCP call (CL-015).
+#
+# Cross-reference: plan pp12-117c lockedFieldContract revision 2, the
+# EVENT->SETUP table + the compile_plan steps.
+
+_THRESHOLD_TRIGGER_KINDS = frozenset({"stress_gt", "field_gt", "collision_with"})
+
+# The seven fields EventSpec itself owns. Any OTHER top-level key on a raw
+# event dict is an "event-specific field" (per the SPEC 4.1 per-event params
+# vocabulary -- rate/threshold/region/parm/frames/value/node) that must be
+# folded into `params` BEFORE EventSpec construction (Major-9), mirroring
+# PR-2's expect-normalization pattern (temporal_reasoning_handlers.py
+# _normalize_assertion). An extra key already present in `params` is left
+# as the nested value wins over a top-level duplicate of the same name.
+_EVENT_SPEC_OWN_FIELDS = frozenset({"id", "type", "target", "at_frame", "params", "trigger", "causes"})
+
+
+def _normalize_event_dict(raw: dict) -> dict:
+    """Fold any top-level event-specific field (not one of EventSpec's own
+    seven fields) into `params`, returning a NEW dict shaped exactly like
+    EventSpec.to_dict()'s own keys (a subset thereof) plus the merged
+    `params`. Mirrors the PR-2 expect-normalization pattern (Major-9).
+
+    A malformed `params` (present but not a dict) is passed through
+    UNCHANGED -- EventSpec.__post_init__'s own "params must be a dict"
+    ValueError is the correct place for that to surface, not here.
+    """
+    if not isinstance(raw, dict):
+        return raw  # let _event_from_dict/EventSpec raise on this downstream
+
+    extras = {k: v for k, v in raw.items() if k not in _EVENT_SPEC_OWN_FIELDS}
+    raw_params = raw.get("params", {})
+    if isinstance(raw_params, dict):
+        merged_params = dict(raw_params)
+        for k, v in extras.items():
+            merged_params.setdefault(k, v)
+    else:
+        merged_params = raw_params
+
+    normalized = {k: raw[k] for k in _EVENT_SPEC_OWN_FIELDS if k in raw}
+    normalized["params"] = merged_params
+    return normalized
+
+
+def _is_threshold_triggered(e: EventSpec) -> bool:
+    """True iff *e*'s trigger.kind is one of the DEFERRED threshold kinds
+    (stress_gt/field_gt/collision_with) -- their compilation to
+    chop_triggers/dop_parms is a later PR; PR-3 always routes them to
+    unresolved, NEVER raising, regardless of any explicit params.parm/
+    frames also present on the event (per the locked EVENT->SETUP table)."""
+    return bool(e.trigger) and e.trigger.get("kind") in _THRESHOLD_TRIGGER_KINDS
+
+
+def _frames_are_well_formed(frames) -> bool:
+    """FIX-PASS (codex-reviewer Major-4): True iff *frames* is a
+    non-empty list of well-formed [frame, value] pairs -- each item is a
+    2-element list/tuple whose BOTH elements are a scalar int/float (bool
+    excluded). A merely non-empty-list check is insufficient (it lets a
+    single malformed item like "not-a-pair" through); every item must be
+    individually validated so compile_plan never emits a malformed
+    compiled.keyframes entry (e.g. {node:'', frames:['not-a-pair']})."""
+    if not isinstance(frames, list) or not frames:
+        return False
+    for item in frames:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            return False
+        f, v = item
+        if isinstance(f, bool) or not isinstance(f, (int, float)):
+            return False
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return False
+    return True
+
+
+def _translate_event(e: EventSpec) -> "dict | None":
+    """Translate ONE EventSpec into a compiled.keyframes entry, or None
+    when it cannot be mapped (routes to unresolved).
+
+    A threshold-triggered event (ANY event type) is DEFERRED -- unresolved,
+    regardless of any explicit params.parm/frames it may also carry. Every
+    other event type (keyframe, and the four activation types emit/
+    fracture/ignite/tear, including a frame_eq-triggered event) compiles
+    IFF it carries a NON-EMPTY `target` (FIX-PASS Major-4 -- an empty
+    node path is never a valid keyframe-apply target, even with a
+    well-formed frames payload) AND an EXPLICIT non-empty-str params.parm
+    AND a well-formed, non-empty params.frames list where EVERY item is a
+    valid [frame, value] pair (FIX-PASS Major-4 -- validated item-by-item,
+    not merely checked for non-empty-list-ness) -- the identical
+    requirement for both a bare `keyframe` event and an EXPLICIT-parm
+    activation event (Major-5: no synthesized on/off default is ever
+    produced)."""
+    if _is_threshold_triggered(e):
+        return None
+
+    if not isinstance(e.target, str) or not e.target:
+        return None
+
+    parm = e.params.get("parm")
+    frames = e.params.get("frames")
+    if not isinstance(parm, str) or not parm:
+        return None
+    if not _frames_are_well_formed(frames):
+        return None
+
+    return {"node": e.target, "parm": parm, "frames": frames}
+
+
+def _explicit_at_frame_ids(raw_events: list) -> set:
+    """FIX-PASS (codex-reviewer Major-5): the set of event ids whose RAW
+    event dict carries an explicit top-level `at_frame` key -- used by the
+    causal time-order check to distinguish "explicitly set" (even to 0)
+    from "never set, silently defaulted to 0" (EventSpec.at_frame's own
+    dataclass default). Read from the RAW pre-normalization dicts because
+    `at_frame` is one of EventSpec's own fields (_EVENT_SPEC_OWN_FIELDS)
+    and survives normalization unchanged when present."""
+    ids = set()
+    for raw in raw_events:
+        if isinstance(raw, dict) and "at_frame" in raw:
+            eid = raw.get("id")
+            if isinstance(eid, str):
+                ids.add(eid)
+    return ids
+
+
+def _min_explicit_frame(frames) -> "int | float | None":
+    """FIX-PASS (codex-reviewer Major-5): the MIN frame value from a
+    params.frames list, or None when frames is absent/malformed/empty or
+    contains no well-formed [frame, value] items. This is the fallback
+    causal timestamp for an event whose `at_frame` was never explicitly
+    set."""
+    if not isinstance(frames, list) or not frames:
+        return None
+    candidates = []
+    for item in frames:
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            f = item[0]
+            if not isinstance(f, bool) and isinstance(f, (int, float)):
+                candidates.append(f)
+    return min(candidates) if candidates else None
+
+
+def _causal_timestamp(e: EventSpec, explicit_at_frame_ids: set) -> "int | float | None":
+    """FIX-PASS (codex-reviewer Major-5): the causal timestamp used by the
+    time-order check -- e.at_frame when the RAW event explicitly carried
+    an `at_frame` key, ELSE the MIN frame derived from the event's own
+    EXPLICIT params.frames, ELSE None (no derivable causal timestamp --
+    the edge is skipped for that side, consistent with "a threshold/
+    deferred side skips the check"). Comparing two silently-defaulted-to-0
+    at_frame values (the pre-fix behavior) missed a real causally-
+    impossible edge whenever neither event set at_frame explicitly."""
+    if e.id in explicit_at_frame_ids:
+        return e.at_frame
+    return _min_explicit_frame(e.params.get("frames"))
+
+
+def _compile_events(events: list, network: "str | None" = None) -> dict:
+    """The shared internal computation behind compile_plan -- ADDITIONALLY
+    exposes the event-id -> compiled-entry association (`compiled_by_id`)
+    and the topo `order`, which the handler's apply-time preflight
+    (temporal_reasoning_handlers.compile_timeline) needs to route a
+    preflight-DROPPED entry (out-of-network / missing-parm / malformed
+    frames) back to its SOURCE EVENT ID for `unresolved` -- a piece of
+    information compile_plan's own public 3-key return does not carry.
+    Mirrors the established private-helper-for-handler-use convention
+    (spatial_reasoning_model._object_from_dict/_relation_from_dict, called
+    directly by spatial_reasoning_handlers.py).
+
+    Returns {"compiled_by_id": {event_id: {node,parm,frames}},
+    "unresolved_ids": [...ordered by topo order...], "order": [...],
+    "event_graph": {nodes, edges}}. Raises ValueError exactly as
+    compile_plan does (an unknown event type, a malformed field, a
+    duplicate/dangling/cyclic causes graph).
+    """
+    del network  # unused by the pure translation -- see compile_plan's docstring
+
+    normalized = [_normalize_event_dict(e) for e in events]
+    specs = [_event_from_dict(nd) for nd in normalized]
+
+    graph = EventGraph(events=specs)
+    order = graph.topo_order()  # raises ValueError: dup id / dangling edge / cycle
+
+    by_id = {e.id: e for e in specs}
+    compiled_by_id: dict = {}
+    unresolved_set: set = set()
+
+    for eid in order:
+        entry = _translate_event(by_id[eid])
+        if entry is None:
+            unresolved_set.add(eid)
+        else:
+            compiled_by_id[eid] = entry
+
+    # Causal time-order pass (Major-10; FIX-PASS Major-5 -- the timestamp
+    # is now derived per-event via _causal_timestamp, not raw e.at_frame)
+    # -- a SECOND pass over already-translated events, since a violation
+    # can only be detected once BOTH sides of an edge have a translation
+    # result.
+    explicit_at_frame_ids = _explicit_at_frame_ids(events)
+    for eid in order:
+        e = by_id[eid]
+        if not e.causes or eid not in compiled_by_id:
+            continue  # the cause side itself is deferred -- skip its edges
+        cause_frame = _causal_timestamp(e, explicit_at_frame_ids)
+        if cause_frame is None:
+            continue  # no derivable causal timestamp for the cause side
+        for caused_id in e.causes:
+            if caused_id not in compiled_by_id:
+                continue  # the caused side is deferred -- skip this edge
+            caused = by_id[caused_id]
+            caused_frame = _causal_timestamp(caused, explicit_at_frame_ids)
+            if caused_frame is None:
+                continue  # no derivable causal timestamp for the caused side
+            if caused_frame < cause_frame:
+                compiled_by_id.pop(caused_id, None)
+                unresolved_set.add(caused_id)
+
+    return {
+        "compiled_by_id": compiled_by_id,
+        "unresolved_ids": [eid for eid in order if eid in unresolved_set],
+        "order": order,
+        "event_graph": {
+            "nodes": len(specs),
+            "edges": sum(len(e.causes) for e in specs),
+        },
+    }
+
+
+def compile_plan(events: list, network: "str | None" = None) -> dict:
+    """Translate a raw event-timeline list into a concrete Houdini setup
+    plan -- the SPEC 4.1 {compiled:{keyframes,chop_triggers,dop_parms},
+    event_graph:{nodes,edges}, unresolved:[...]} shape, exactly.
+
+    Steps (plan pp12-117c lockedFieldContract revision 2):
+      (1) NORMALIZE each raw event (top-level event-specific fields folded
+          into `params`, Major-9), then build an EventSpec per event --
+          construction/validation errors (an unknown type, a malformed
+          field) RAISE ValueError (reusing EventSpec.__post_init__
+          unchanged).
+      (2) build an EventGraph and call topo_order() -- REUSES PR-1's
+          duplicate-id/dangling-edge/cycle validation unchanged; any of
+          those RAISE ValueError.
+      (3) translate each event in topo order (_translate_event) into
+          either a compiled.keyframes entry or `unresolved`.
+      (4) CAUSAL TIME-ORDER (Major-10): for a `causes` edge cause->caused
+          where BOTH sides already translated to a compiled entry (a
+          threshold-triggered or otherwise-unmapped side is DEFERRED --
+          the time check is SKIPPED for that edge entirely, per the locked
+          contract's "a threshold/deferred side skips the check"), require
+          caused.at_frame >= cause.at_frame; a violation moves the CAUSED
+          event (never the cause) from compiled to unresolved -- this is a
+          ROUTING decision, NEVER a raise.
+
+    `network` is accepted but UNUSED by this pure translation -- passing it
+    does not change the compiled output (it exists so callers/tests can
+    pass it without special-casing; the handler's apply-time preflight is
+    where `network` actually scopes writes).
+
+    An event this translation cannot map (type-inferred activation,
+    threshold-trigger, a causally-impossible caused event) contributes
+    NOTHING to `compiled` and appears in `unresolved` instead -- NEVER
+    raises for a well-formed-but-unmappable event. compiled.chop_triggers
+    and compiled.dop_parms are ALWAYS [] (their compilation is DEFERRED).
+    """
+    internal = _compile_events(events, network)
+    order = internal["order"]
+    compiled_by_id = internal["compiled_by_id"]
+
+    keyframes = [compiled_by_id[eid] for eid in order if eid in compiled_by_id]
+
+    return {
+        "compiled": {"keyframes": keyframes, "chop_triggers": [], "dop_parms": []},
+        "event_graph": internal["event_graph"],
+        "unresolved": internal["unresolved_ids"],
+    }
