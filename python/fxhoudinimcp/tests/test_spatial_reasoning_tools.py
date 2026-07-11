@@ -469,3 +469,304 @@ class TestCtxSchemaGuard:
             f"'ctx' must NOT appear in houdini_assert_scene's input schema properties. "
             f"Got properties={list(properties.keys())!r}."
         )
+
+
+# ===========================================================================
+# houdini_solve_layout — MUTATING, GATED (PP12-116 PR-3)
+#
+# Unit: pp12-116c
+# testVerificationSurface: pytest-model
+# planSha: 8f36b134044347a08c2025aafbc41c8140f98a9f8871b6e663e07e823203b366
+#
+# These tests are written BEFORE the implementation (red phase). They will
+# fail with ImportError until hou-dev adds houdini_solve_layout to THIS
+# module (which already ships houdini_describe_relations /
+# houdini_assert_scene from PR-2) plus the corresponding
+# solve_layout / _preview_solve_layout handler on
+# fxhoudinimcp_server/handlers/spatial_reasoning_handlers.py (not exercised
+# directly by this file -- that is test_spatial_reasoning_handlers.py's
+# job).
+#
+# Grounded against (layer-for-layer template, per plan pp12-116c
+# reuseSurvey + lockedFieldContract):
+#   - test_cop_onnx_setup_tools.py (pp12-113c) -- THE exemplar for a GATED
+#     wrapper test: MagicMock(spec=HoudiniBridge); import-inside-test-
+#     after-patch; require_approval=True assertion via the mcp tool_map;
+#     exactly-one bridge.execute call; exact params-dict key set; VERBATIM
+#     passthrough of BOTH a success result AND a pending-approval/preview
+#     shape (never reinterpreted, never raises, never gains/loses an 'ok'
+#     key); ctx-not-in-schema guard.
+#   - the TestBridgeSpecBoundGuard class ABOVE (already covers the
+#     MagicMock(spec=HoudiniBridge) .call-raises-AttributeError PP12-110
+#     regression guard for THIS module -- not duplicated here).
+#
+# Locked field contract (plan pp12-116c lockedFieldContract, "tool --
+# solve_layout"):
+#
+#     houdini_solve_layout(
+#         ctx, objects, relations, bounds=None, apply=True, max_iters=200,
+#     ) -> dict
+#         -> a SINGLE bridge.execute('solve_layout', {
+#                'objects': objects, 'relations': relations,
+#                'bounds': bounds, 'apply': apply, 'max_iters': max_iters,
+#            })
+#
+# Decorated @mcp.tool(meta={"require_approval": True}) -- GATED (the first
+# MUTATING tool of the spatial_reasoning family; PP12-109 security gate).
+# apply=false is STILL gated (fail-safe -- gate capability is per-COMMAND,
+# not per-argument; a separate ungated dry-run tool is out-of-scope, M3).
+# ===========================================================================
+
+@pytest.fixture()
+def solve_layout_bridge_mock():
+    """Spec-bound bridge mock returning a successful gated solve_layout result."""
+    mock = MagicMock(spec=HoudiniBridge)
+    mock.execute = AsyncMock(return_value={
+        "transforms": {
+            "box_a": {"t": [0.0, 0.0, 0.0], "r": [0.0, 0.0, 0.0]},
+            "box_b": {"t": [5.0, 0.0, 0.0], "r": [0.0, 0.0, 0.0]},
+        },
+        "solved": True,
+        "iterations": 1,
+        "unsatisfied": [],
+    })
+    return mock
+
+
+@pytest.fixture()
+def solve_layout_pending_approval_bridge_mock():
+    """Spec-bound bridge mock returning a 109-gate pending-approval shape --
+    a pending/preview response is NOT a failure and must survive the
+    wrapper untouched (mirrors the cop_onnx_setup_node pending-approval
+    regression guard)."""
+    mock = MagicMock(spec=HoudiniBridge)
+    mock.execute = AsyncMock(return_value={
+        "status": "pending_approval",
+        "pending_id": "pend-solve-layout-xyz789",
+        "preview": {
+            "would_move": ["box_a", "box_b"],
+            "apply": True,
+            "note": "solve_layout will move 2 object(s)",
+        },
+    })
+    return mock
+
+
+class TestSolveLayoutToolsModuleImport:
+    """houdini_solve_layout must be a callable on the EXISTING
+    spatial_reasoning_tools module (which already ships
+    houdini_describe_relations / houdini_assert_scene from PR-2). Until
+    hou-dev adds it, this import raises ImportError -- the RED signal."""
+
+    def test_existing_pr2_wrappers_unaffected(self):
+        """houdini_describe_relations / houdini_assert_scene (PR-2) must
+        still be importable -- the new wrapper must not clobber its
+        existing siblings (append-only contract)."""
+        from fxhoudinimcp.tools.spatial_reasoning_tools import (  # noqa: F401
+            houdini_assert_scene,
+            houdini_describe_relations,
+        )
+        assert callable(houdini_describe_relations)
+        assert callable(houdini_assert_scene)
+
+    def test_solve_layout_callable_on_module(self):
+        """FAILS RED until hou-dev adds houdini_solve_layout."""
+        from fxhoudinimcp.tools.spatial_reasoning_tools import houdini_solve_layout  # noqa: F401
+        assert callable(houdini_solve_layout), (
+            "houdini_solve_layout must be a callable (the @mcp.tool coroutine)."
+        )
+
+
+class TestSolveLayoutRequireApprovalTrue:
+    """houdini_solve_layout must have meta={'require_approval': True} --
+    GATED (Capability.MUTATING handler-side; PP12-109 security gate)."""
+
+    def test_mcp_tool_meta_require_approval_true(self):
+        import fxhoudinimcp.tools.spatial_reasoning_tools  # noqa: F401
+        tool_map = _get_tool_map()
+        assert "houdini_solve_layout" in tool_map, (
+            "houdini_solve_layout not registered on the mcp server; hou-dev must "
+            "define it (decorated with @mcp.tool) in spatial_reasoning_tools.py."
+        )
+        tool_obj = tool_map["houdini_solve_layout"]
+        meta = getattr(tool_obj, "meta", None) or getattr(tool_obj, "tags", None) or {}
+        require_approval = meta.get("require_approval", False) if isinstance(meta, dict) else False
+        assert require_approval is True, (
+            f"houdini_solve_layout meta must have require_approval=True (GATED -- "
+            f"a mutating tool; PP12-109 security gate). Got meta={meta!r}."
+        )
+
+
+class TestSolveLayoutBridgeContract:
+    """houdini_solve_layout must delegate to bridge.execute EXACTLY ONCE,
+    with command 'solve_layout' and the exact 5-key params dict from the
+    lockedFieldContract."""
+
+    @pytest.mark.asyncio
+    async def test_exactly_one_bridge_execute_call(self, solve_layout_bridge_mock):
+        with patch("fxhoudinimcp.server._get_bridge", return_value=solve_layout_bridge_mock):
+            from fxhoudinimcp.tools.spatial_reasoning_tools import houdini_solve_layout
+
+            ctx_mock = MagicMock()
+            await houdini_solve_layout(
+                ctx=ctx_mock,
+                objects=[{"id": "box_a", "node": "/obj/box_a"}],
+                relations=[],
+            )
+
+        assert solve_layout_bridge_mock.execute.call_count == 1, (
+            f"houdini_solve_layout must make exactly ONE bridge.execute call, "
+            f"got {solve_layout_bridge_mock.execute.call_count}."
+        )
+
+    @pytest.mark.asyncio
+    async def test_command_string_is_solve_layout(self, solve_layout_bridge_mock):
+        with patch("fxhoudinimcp.server._get_bridge", return_value=solve_layout_bridge_mock):
+            from fxhoudinimcp.tools.spatial_reasoning_tools import houdini_solve_layout
+
+            ctx_mock = MagicMock()
+            await houdini_solve_layout(
+                ctx=ctx_mock,
+                objects=[{"id": "box_a", "node": "/obj/box_a"}],
+                relations=[],
+            )
+
+        call_args = solve_layout_bridge_mock.execute.call_args
+        command = call_args[0][0] if call_args.args else call_args[1].get("command", "")
+        assert command == "solve_layout", (
+            f"Expected bridge.execute('solve_layout', ...) but got command={command!r}. "
+            "Command string must match register_handler's first arg exactly "
+            "(the 4-bug convention: command == register name == params keys == handler kwargs)."
+        )
+
+    @pytest.mark.asyncio
+    async def test_params_dict_has_exact_five_keys(self, solve_layout_bridge_mock):
+        objects = [{"id": "box_a", "node": "/obj/box_a"}]
+        relations = [{"type": "non_overlap", "a": "box_a", "b": "box_b"}]
+        bounds = {"room": [0.0, 0.0, 10.0, 10.0]}
+
+        with patch("fxhoudinimcp.server._get_bridge", return_value=solve_layout_bridge_mock):
+            from fxhoudinimcp.tools.spatial_reasoning_tools import houdini_solve_layout
+
+            ctx_mock = MagicMock()
+            await houdini_solve_layout(
+                ctx=ctx_mock,
+                objects=objects,
+                relations=relations,
+                bounds=bounds,
+                apply=False,
+                max_iters=50,
+            )
+
+        call_args = solve_layout_bridge_mock.execute.call_args
+        params = call_args[0][1] if len(call_args.args) > 1 else call_args[1].get("params", {})
+
+        expected_keys = {"objects", "relations", "bounds", "apply", "max_iters"}
+        assert set(params.keys()) == expected_keys, (
+            f"params dict must be exactly {expected_keys!r}. Got keys={set(params.keys())!r}."
+        )
+        assert params["objects"] == objects
+        assert params["relations"] == relations
+        assert params["bounds"] == bounds
+        assert params["apply"] is False
+        assert params["max_iters"] == 50
+
+    @pytest.mark.asyncio
+    async def test_defaults_forwarded_when_omitted(self, solve_layout_bridge_mock):
+        """bounds=None, apply=True, max_iters=200 are the documented
+        defaults -- they must be forwarded verbatim (not omitted) when the
+        caller doesn't pass them."""
+        with patch("fxhoudinimcp.server._get_bridge", return_value=solve_layout_bridge_mock):
+            from fxhoudinimcp.tools.spatial_reasoning_tools import houdini_solve_layout
+
+            ctx_mock = MagicMock()
+            await houdini_solve_layout(
+                ctx=ctx_mock,
+                objects=[{"id": "box_a", "node": "/obj/box_a"}],
+                relations=[],
+            )
+
+        call_args = solve_layout_bridge_mock.execute.call_args
+        params = call_args[0][1] if len(call_args.args) > 1 else call_args[1].get("params", {})
+        assert params.get("bounds") is None, f"bounds must default to None. Got {params.get('bounds')!r}."
+        assert params.get("apply") is True, f"apply must default to True. Got {params.get('apply')!r}."
+        assert params.get("max_iters") == 200, f"max_iters must default to 200. Got {params.get('max_iters')!r}."
+
+
+class TestSolveLayoutResultPassthrough:
+    """The wrapper must return bridge.execute's result VERBATIM -- including
+    the 109-gate pending-approval/preview shape (a normal, valid return --
+    never reinterpreted, never raised)."""
+
+    @pytest.mark.asyncio
+    async def test_success_result_passed_through_verbatim(self, solve_layout_bridge_mock):
+        expected_result = solve_layout_bridge_mock.execute.return_value
+        with patch("fxhoudinimcp.server._get_bridge", return_value=solve_layout_bridge_mock):
+            from fxhoudinimcp.tools.spatial_reasoning_tools import houdini_solve_layout
+
+            ctx_mock = MagicMock()
+            result = await houdini_solve_layout(
+                ctx=ctx_mock,
+                objects=[{"id": "box_a", "node": "/obj/box_a"}],
+                relations=[],
+            )
+
+        assert result == expected_result, (
+            f"Wrapper must pass bridge.execute's result through unchanged. "
+            f"Expected {expected_result!r}, got {result!r}."
+        )
+
+    @pytest.mark.asyncio
+    async def test_pending_approval_result_passed_through_not_treated_as_failure(
+        self, solve_layout_pending_approval_bridge_mock
+    ):
+        expected_result = solve_layout_pending_approval_bridge_mock.execute.return_value
+        with patch(
+            "fxhoudinimcp.server._get_bridge",
+            return_value=solve_layout_pending_approval_bridge_mock,
+        ):
+            from fxhoudinimcp.tools.spatial_reasoning_tools import houdini_solve_layout
+
+            ctx_mock = MagicMock()
+            result = await houdini_solve_layout(
+                ctx=ctx_mock,
+                objects=[{"id": "box_a", "node": "/obj/box_a"}],
+                relations=[],
+            )
+
+        assert result == expected_result, (
+            "A pending-approval bridge response must be returned VERBATIM -- "
+            f"Expected {expected_result!r}, got {result!r}."
+        )
+        assert result.get("status") == "pending_approval"
+        assert "ok" not in result, (
+            f"Wrapper must not inject an 'ok' key into a pending-approval response. "
+            f"Got keys={list(result.keys())!r}."
+        )
+
+
+class TestSolveLayoutCtxSchemaGuard:
+    """ctx must NOT appear in houdini_solve_layout's input schema properties."""
+
+    def _get_tool_schema(self, tool_name: str) -> dict:
+        tool_map = _get_tool_map()
+        tool_obj = tool_map.get(tool_name)
+        if tool_obj is None:
+            return {}
+        return getattr(tool_obj, "parameters", getattr(tool_obj, "inputSchema", {})) or {}
+
+    def test_solve_layout_ctx_not_in_schema(self):
+        import fxhoudinimcp.tools.spatial_reasoning_tools  # noqa: F401
+        tool_map = _get_tool_map()
+        assert "houdini_solve_layout" in tool_map, (
+            "houdini_solve_layout not registered on the mcp server; hou-dev must "
+            "define it (decorated with @mcp.tool) in spatial_reasoning_tools.py. "
+            "(Without this assertion, an absent tool would vacuously pass the "
+            "ctx-not-in-schema check below via an empty {} schema.)"
+        )
+        schema = self._get_tool_schema("houdini_solve_layout")
+        properties = schema.get("properties", {})
+        assert "ctx" not in properties, (
+            f"'ctx' must NOT appear in houdini_solve_layout's input schema properties. "
+            f"Got properties={list(properties.keys())!r}."
+        )

@@ -336,3 +336,368 @@ def assert_scene(
 
 
 register_handler("assert_scene", assert_scene, Capability.READONLY)
+
+
+###### solve_layout (FR-A, MUTATING/GATED) -- PP12-116 PR-3
+#
+# Grounded LAYER-FOR-LAYER on the SHIPPED gated exemplar
+# (cop_onnx_handlers.py: _preview_setup_node + cop_onnx_setup_node +
+# register_handler(..., Capability.MUTATING, preview_fn=..., preview_
+# required=True)) and this module's OWN PR-2 world-AABB resolution
+# (_world_aabb_center_and_extents, BYTE-FROZEN, untouched below).
+#
+# COORDINATE FRAME + MODEL CONTRACT (plan pp12-116c lockedFieldContract,
+# revision 2): spatial_reasoning_model.solve_layout(spec) returns
+# transforms for ALL objects (fixed ones unchanged at their input t/r);
+# t is the WORLD-AABB CENTER, r the WORLD rotation degrees -- identical
+# to assert_scene's contract above. Construction/validation errors RAISE
+# ValueError (propagates); a feasible-but-unsatisfiable spec returns
+# solved:false + unsatisfied[] (never raises).
+#
+# APPLY MAPPING (the load-bearing write-side correctness, B1/B2/B3/M1/M2/
+# M5 of the locked contract):
+#   (B1) an OBJ node's t/r PARMS are LOCAL (relative to the parent
+#        chain) while the model's t/r are WORLD. Apply is SCOPED to OBJ
+#        nodes whose parentAndSubnetTransform() is IDENTITY (the standard
+#        /obj-level case, where LOCAL == WORLD) -- a non-identity parent
+#        is a scene-resolution error / preview DENY, never silently
+#        corrupted.
+#   (B2) setting r rotates about the pivot, moving an off-center object's
+#        world center by the pivot-to-center radius -- NOT a small
+#        residual. Apply order is ROTATE-THEN-REREAD-THEN-TRANSLATE:
+#        (1) set parmTuple('r'); (2) RE-READ the POST-ROTATION world-AABB
+#        center via _world_aabb_center_and_extents (BYTE-FROZEN);
+#        (3) set parmTuple('t') to cur_objt + (solved_t -
+#        post_rotation_center). See _apply_solved_transforms.
+#   (B3) two objects sharing one OBJ ancestor (e.g. two SOPs in one geo)
+#        fight over a single t/r pair -- ALL movable objects must resolve
+#        to DISTINCT OBJ nodes, and a movable OBJ must not coincide with
+#        a FIXED object's OBJ. See _check_movable_targets.
+#   (M2) _world_aabb_center_and_extents returns (t, r, bbox), NEVER the
+#        node -- _resolve_obj_node (new, below) is the helper that
+#        resolves the actual MUTABLE OBJ node for the apply to write.
+#   (M5) the whole multi-object apply PRE-VALIDATES every movable object
+#        (resolvable + distinct-OBJ + identity-parent) BEFORE any parm
+#        write, and runs inside exactly ONE hou.undos.group(...) context
+#        (never per-object) -- see _apply_solved_transforms.
+#
+# GATED (Capability.MUTATING + a positional _preview_solve_layout that
+# pre-validates and raises -> gate DENY + preview_required=True).
+# apply=false is STILL gated (fail-safe -- gate capability is per-COMMAND,
+# not per-argument).
+
+def _resolve_obj_node(node):
+    """Resolve *node* to the mutable hou.ObjNode solve_layout's apply
+    writes parmTuple('t'/'r') on: an hou.ObjNode resolves to itself; a
+    hou.SopNode resolves to its containing OBJ ancestor (walking
+    node.parent() up to the nearest hou.ObjNode). Raises
+    hou.OperationFailed when no OBJ ancestor is found, or when node is
+    neither a SopNode nor an ObjNode.
+
+    Distinct from _world_aabb_center_and_extents (BYTE-FROZEN, untouched
+    by this PR): that helper returns (t, r, bbox) for READING a node's
+    world placement; this helper returns the actual mutable OBJ NODE
+    solve_layout's apply WRITES to (M2 fold, plan pp12-116c
+    lockedFieldContract revision 2).
+    """
+    if isinstance(node, hou.ObjNode):
+        return node
+    if isinstance(node, hou.SopNode):
+        parent = node.parent()
+        while parent is not None and not isinstance(parent, hou.ObjNode):
+            parent = parent.parent()
+        if parent is None:
+            raise hou.OperationFailed(
+                f"SopNode has no containing ObjNode: {node.path()}"
+            )
+        return parent
+    raise hou.OperationFailed(
+        f"Node is neither a SopNode nor an ObjNode: {node.path()}"
+    )
+
+
+def _resolve_obj_nodes_for_objects(objects_wire: list) -> dict:
+    """Resolve {oid: (wire_node, obj_node, is_fixed)} for every solve_layout
+    wire object via _resolve_obj_node -- the mutable-node resolution shared
+    by _preview_solve_layout (cheap validation only, no bbox/geometry read)
+    and solve_layout's own apply-time pre-validation (M5: the dispatcher's
+    direct-call surface bypasses the 109-gate preview_fn entirely, so the
+    SAME check must ALSO run inside the real apply).
+
+    wire_node is the object's OWN wire node (hou.node(node_path) --
+    unresolved-to-OBJ) -- retained (fix-cycle 3, B1) so a subsequent
+    apply-time re-read of the object's world-AABB center can consult the
+    SAME geometry source used for the object's INITIAL resolution, rather
+    than the (possibly different) geometry of the resolved OBJ node's own
+    displayNode(). obj_node is the mutable hou.ObjNode _resolve_obj_node
+    resolves wire_node to -- the node solve_layout's apply WRITES
+    parmTuple('t'/'r') on.
+
+    Raises hou.OperationFailed on a missing node path or an unresolvable
+    node (propagated from hou.node() / _resolve_obj_node()).
+    """
+    resolved: dict = {}
+    for obj_wire in objects_wire:
+        oid = obj_wire["id"]
+        node_path = obj_wire.get("node") or ""
+        if not node_path:
+            raise hou.OperationFailed(
+                f"Object {oid!r}: solve_layout requires a node path for every object"
+            )
+        wire_node = hou.node(node_path)
+        if wire_node is None:
+            raise hou.OperationFailed(
+                f"Node not found: {node_path} (object id={oid!r})"
+            )
+        resolved[oid] = (
+            wire_node,
+            _resolve_obj_node(wire_node),
+            bool(obj_wire.get("fixed", False)),
+        )
+    return resolved
+
+
+def _is_ancestor_or_descendant(path_a: str, path_b: str) -> bool:
+    """True iff *path_a* and *path_b* are the SAME OBJ path, or one is an
+    ANCESTOR of the other in the node hierarchy (B2, fix-cycle 3,
+    codex-adversarial-reviewer verified Blocker): moving an ancestor OBJ
+    transforms every descendant OBJ along with it (Houdini's parent-child
+    transform inheritance), so an ancestor/descendant pair can no more be
+    independently placed than two objects sharing the exact same OBJ node.
+    Uses `/`-boundary-safe path-prefix containment (`q == p` or
+    `q.startswith(p + "/")` or `p.startswith(q + "/")`) so "/obj/subnet1"
+    is NOT flagged as an ancestor of "/obj/subnet10" (a naive
+    `startswith(p)` without the "/" boundary would falsely match)."""
+    if path_a == path_b:
+        return True
+    if path_b.startswith(path_a + "/"):
+        return True
+    if path_a.startswith(path_b + "/"):
+        return True
+    return False
+
+
+def _check_movable_targets(resolved: dict) -> None:
+    """Validate the apply-time invariants over an already-resolved
+    {oid: (wire_node, obj_node, is_fixed)} dict (B1/B2/B3, plan pp12-116c
+    lockedFieldContract revision 2): every MOVABLE (non-fixed) object's
+    OBJ node must have an IDENTITY parentAndSubnetTransform() (else its
+    LOCAL t/r parms silently diverge from its WORLD t/r -- B1), and every
+    movable OBJ node must be ANCESTRY-DISTINCT (neither the same node, nor
+    an ancestor, nor a descendant -- B2) from every other movable's AND
+    every fixed object's OBJ node (moving one OBJ silently drags along any
+    OBJ nested beneath it, and two OBJs sharing one ancestor/descendant
+    relationship -- like two OBJs at the same path -- cannot be
+    independently placed -- B3).
+
+    Raises hou.OperationFailed (-> gate DENY / apply scene-resolution
+    error) on any violation. FIXED objects are exempt from the
+    identity-parent check (they are never written).
+    """
+    movable_paths: dict = {}
+    fixed_paths: dict = {}
+    for oid, (_wire_node, obj_node, is_fixed) in resolved.items():
+        path = obj_node.path()
+        if is_fixed:
+            fixed_paths[oid] = path
+            continue
+        if obj_node.parentAndSubnetTransform() != hou.Matrix4(1):
+            raise hou.OperationFailed(
+                f"Object {oid!r}: OBJ node {path!r} has a non-identity "
+                f"parentAndSubnetTransform() -- solve_layout's apply is scoped "
+                f"to identity-parent OBJ nodes"
+            )
+        for other_oid, other_path in movable_paths.items():
+            if _is_ancestor_or_descendant(other_path, path):
+                raise hou.OperationFailed(
+                    f"Objects {other_oid!r} ({other_path!r}) and {oid!r} "
+                    f"({path!r}) resolve to the same or an ancestor/descendant "
+                    f"OBJ node -- cannot be independently placed"
+                )
+        movable_paths[oid] = path
+
+    for oid, path in movable_paths.items():
+        for fixed_oid, fixed_path in fixed_paths.items():
+            if _is_ancestor_or_descendant(fixed_path, path):
+                raise hou.OperationFailed(
+                    f"Movable object {oid!r} ({path!r}) shares the same or an "
+                    f"ancestor/descendant OBJ node with fixed object "
+                    f"{fixed_oid!r} ({fixed_path!r}) -- cannot be independently "
+                    f"placed"
+                )
+
+
+def _apply_solved_transforms(transforms: dict, resolved: dict) -> None:
+    """Move each non-fixed object's OBJ node so its world-AABB center lands
+    at transforms[oid]['t'] under transforms[oid]['r'] -- via
+    ROTATE-THEN-REREAD-THEN-TRANSLATE (B2, plan pp12-116c
+    lockedFieldContract revision 2): (1) set the rotation parm FIRST;
+    (2) RE-READ the POST-ROTATION world-AABB center via
+    _world_aabb_center_and_extents (BYTE-FROZEN, unmodified) -- via the
+    object's OWN WIRE NODE, NOT the resolved OBJ node (B1, fix-cycle 3):
+    the object's INITIAL resolution (solve_layout, before this apply runs)
+    always reads its world-AABB center/bbox via the wire node, so the
+    post-rotation re-read MUST consult that SAME geometry source -- an
+    OBJ's displayNode() geometry can differ from a wire SopNode that is
+    some OTHER SOP under the same OBJ, and reading the wrong one computes
+    a wrong post-rotation center and corrupts the translate delta even
+    when the object needs zero net movement; (3) set the translation parm
+    to cur_objt + (solved_t - post_rotation_center) -- correct regardless
+    of the object's local geometry offset from its pivot. FIXED objects
+    are NEVER written. The whole multi-object apply runs inside exactly
+    ONE hou.undos.group(...) context (M5 atomicity -- entered once for the
+    WHOLE apply, never per-object), so a mid-apply exception propagates
+    out of this single context and is caught by the caller's
+    scene-resolution try/except boundary.
+    """
+    with hou.undos.group("solve_layout apply"):
+        for oid, (wire_node, obj_node, is_fixed) in resolved.items():
+            if is_fixed:
+                continue
+            solved_t = transforms[oid]["t"]
+            solved_r = transforms[oid]["r"]
+
+            obj_node.parmTuple("r").set(tuple(solved_r))
+
+            post_t, _post_r, _post_bbox = _world_aabb_center_and_extents(wire_node)
+
+            cur_objt = obj_node.parmTuple("t").eval()
+            new_t = tuple(cur_objt[i] + (solved_t[i] - post_t[i]) for i in range(3))
+            obj_node.parmTuple("t").set(new_t)
+
+
+def _preview_solve_layout(params: dict) -> dict:
+    """Return the 109-gate approval payload for solve_layout WITHOUT
+    solving or mutating. CHEAP validation only (M4: stays well under the
+    ~30s preview timeout) -- resolves every wire object's mutable OBJ node
+    and validates the identity-parent + distinct-OBJ invariants (M1-DENY:
+    an invalid apply target is DENIED at the gate, not merely flagged).
+    Does NOT invoke spatial_reasoning_model.solve_layout and does NOT read
+    any node's geometry/bounding box.
+
+    Called POSITIONALLY by the gate middleware as ``preview_fn(params)`` --
+    a single ``params: dict`` argument, NOT ``**params`` (matches
+    _preview_setup_node's convention).
+
+    Returns:
+        {"would_move": [<non-fixed object ids>], "apply": <echoed apply>,
+         "note": <human-readable summary>}
+
+    Raises:
+        hou.OperationFailed: on an unresolvable node, two movable objects
+            sharing one OBJ ancestor, a movable object sharing a fixed
+            object's OBJ, or a movable OBJ with a non-identity
+            parentAndSubnetTransform() -- the gate DENIES the call.
+    """
+    objects = params.get("objects", [])
+    apply = params.get("apply", True)
+
+    resolved = _resolve_obj_nodes_for_objects(objects)
+    _check_movable_targets(resolved)
+
+    would_move = [oid for oid, (_, _, is_fixed) in resolved.items() if not is_fixed]
+    return {
+        "would_move": would_move,
+        "apply": apply,
+        "note": (
+            f"solve_layout will move {len(would_move)} object(s)"
+            if apply else
+            "apply=false -- no scene mutation"
+        ),
+    }
+
+
+def solve_layout(
+    *,
+    objects: list,
+    relations: list,
+    bounds: "dict | None" = None,
+    apply: bool = True,
+    max_iters: int = 200,
+) -> dict:
+    """Solve relations->positions for a scene and, when apply=true, MOVE
+    each non-fixed node so its world-AABB center lands at the solved
+    center under the solved rotation. GATED (Capability.MUTATING, PP12-109
+    security gate) -- see _preview_solve_layout / register_handler below.
+
+    STEPS (plan pp12-116c lockedFieldContract, "tool -- solve_layout"):
+    (1) resolve each wire object {id, node, bbox?, fixed?} into an
+    ObjectSpec: bbox = the caller's if given else the hou world-AABB
+    extents (_world_aabb_center_and_extents, PR-2 reuse); t/r = the
+    object's CURRENT world-AABB center/rotation, ALWAYS read via the node
+    (solve_layout's wire schema has no caller-transform override, unlike
+    assert_scene's separate `transforms` param). (2) build a LayoutSpec.
+    (3) delegate the solve to the byte-frozen
+    spatial_reasoning_model.solve_layout (a caller-contract ValueError --
+    e.g. an unknown relation type -- PROPAGATES, never folded into
+    {ok:false}). (4) if apply=true: PRE-VALIDATE every movable object
+    (resolvable + distinct-OBJ + identity-parent, _check_movable_targets)
+    BEFORE any parm write, then apply via
+    ROTATE-THEN-REREAD-THEN-TRANSLATE inside a single hou.undos.group
+    (_apply_solved_transforms). (5) return the model's result dict
+    VERBATIM. A scene-resolution failure (an unresolvable node, a
+    non-identity parent, a shared OBJ ancestor) returns
+    {"ok": False, "error": "<reason>"} WITHOUT raising -- at either the
+    initial-resolution phase or the apply phase.
+    """
+    try:
+        resolved_objects = []
+        resolved_nodes: dict = {}
+        for obj_wire in objects:
+            oid = obj_wire["id"]
+            node_path = obj_wire.get("node") or ""
+            if not node_path:
+                raise hou.OperationFailed(
+                    f"Object {oid!r}: solve_layout requires a node path for every object"
+                )
+            node = hou.node(node_path)
+            if node is None:
+                raise hou.OperationFailed(
+                    f"Node not found: {node_path} (object id={oid!r})"
+                )
+
+            t, r, bbox_from_node = _world_aabb_center_and_extents(node)
+            wire_bbox = obj_wire.get("bbox")
+            bbox_final = tuple(wire_bbox) if wire_bbox is not None else bbox_from_node
+            is_fixed = bool(obj_wire.get("fixed", False))
+
+            resolved_objects.append(_model._object_from_dict({
+                "id": oid,
+                "bbox": bbox_final,
+                "fixed": is_fixed,
+                "t": list(t),
+                "r": list(r),
+                "node": node_path,
+            }))
+
+            resolved_nodes[oid] = (node, _resolve_obj_node(node), is_fixed)
+
+        relation_specs = [_model._relation_from_dict(rd) for rd in (relations or [])]
+    except (hou.OperationFailed, AttributeError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+    layout_spec = _model.LayoutSpec(
+        objects=resolved_objects,
+        relations=relation_specs,
+        bounds=bounds,
+        max_iters=max_iters,
+    )
+    result = _model.solve_layout(layout_spec)
+
+    if apply:
+        try:
+            _check_movable_targets(resolved_nodes)
+            _apply_solved_transforms(result["transforms"], resolved_nodes)
+        except (hou.OperationFailed, AttributeError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    return result
+
+
+register_handler(
+    "solve_layout",
+    solve_layout,
+    Capability.MUTATING,
+    preview_fn=_preview_solve_layout,
+    preview_required=True,
+)

@@ -112,3 +112,53 @@ async def houdini_assert_scene(
             "checks": checks,
         },
     )
+
+
+@mcp.tool(meta={"require_approval": True})
+async def houdini_solve_layout(
+    ctx: Context,
+    objects: list,
+    relations: list,
+    bounds: "dict | None" = None,
+    apply: bool = True,
+    max_iters: int = 200,
+) -> dict:
+    """Solve relations -> positions for a scene and, when apply=true, MOVE
+    each non-fixed object so its world-AABB center lands at the solved
+    center under the solved rotation. GATED (require_approval=True --
+    Capability.MUTATING handler-side; the first MUTATING tool of the
+    Spatial-Reasoning MCP member, PP12-109 security gate). apply=false
+    STILL goes through the gate (fail-safe -- gate capability is per-
+    COMMAND, not per-argument).
+
+    A SINGLE bridge.execute call -- the wrapper performs no result
+    interpretation and returns bridge.execute's result VERBATIM, including
+    the 109-gate pending-approval/preview shape (a normal, valid return --
+    never reinterpreted, never raised).
+
+    Args:
+        ctx: MCP lifespan context -- injected by FastMCP; hidden from client schema.
+        objects: List of {"id", "node", "bbox"?: [w,d,h]|None, "fixed"?}
+            wire dicts. Unlike assert_scene, solve_layout has no separate
+            caller-transform override -- each object's current t/r is
+            ALWAYS read from its node; bbox is read from the live scene
+            when omitted.
+        relations: List of relation wire dicts (see houdini_describe_relations
+            for the vocabulary) the solve attempts to satisfy.
+        bounds: Optional {"room": [x0, z0, x1, z1]} X-Z containing footprint.
+        apply: When True (default), move each non-fixed object's node to
+            the solved transform. When False, only the proposed transforms
+            are returned -- no scene mutation.
+        max_iters: Relaxation-loop iteration budget passed to the solver.
+    """
+    bridge = _fxserver._get_bridge(ctx)
+    return await bridge.execute(
+        "solve_layout",
+        {
+            "objects": objects,
+            "relations": relations,
+            "bounds": bounds,
+            "apply": apply,
+            "max_iters": max_iters,
+        },
+    )
