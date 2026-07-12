@@ -225,6 +225,116 @@ def _create_material_network(
 register_handler("materials.create_material_network", _create_material_network)
 
 
+###### materials.create_mtlx_material
+
+def _create_mtlx_material(
+    *,
+    name: str,
+    parent_path: str = "/stage",
+    base_color: list[float] | None = None,
+    metalness: float | None = None,
+    roughness: float | None = None,
+    textures: dict[str, str] | None = None,
+    normal_map: str | None = None,
+    **_: Any,
+) -> dict[str, Any]:
+    """Create a COMPLETE Solaris MaterialX material and publish it as a USD Material prim.
+
+    Unlike ``create_material_network`` (which makes a bare VOP node in ``/mat``), this builds a
+    ``materiallibrary`` LOP containing an ``mtlxstandard_surface`` (+ optional textures and a
+    normal map). The ``materiallibrary`` AUTO-PUBLISHES that surface as a USD ``Material`` prim at
+    ``<matpathprefix>/<name>`` on the stage (default ``/materials/<name>``) — a ready-to-bind
+    material in one call. Live-confirmed publishing mechanism (Houdini 21.0.729): no extra
+    surface-output wiring is required; the materiallibrary collects the mtlx surface by name.
+
+    Args:
+        name: material name; the published ``Material`` prim is ``<matpathprefix>/<name>``.
+        parent_path: LOP parent to build the ``materiallibrary`` under (default ``/stage``).
+        base_color: ``[r, g, b]`` diffuse color (mtlxstandard_surface ``base_color``).
+        metalness: 0..1 metalness.
+        roughness: 0..1 (sets ``specular_roughness``).
+        textures: ``{surface_input_name: file_path}`` — one ``mtlxUsdUVTexture`` per entry, wired
+            to the named surface input (e.g. ``{"base_color": "$HIP/tex/albedo.<UDIM>.exr"}``).
+        normal_map: a file path → ``mtlxUsdUVTexture`` → ``mtlxnormalmap`` → the surface ``normal``.
+
+    Returns:
+        ``{materiallibrary_path, surface_path, material_prim_path}``.
+    """
+    parent = _get_node(parent_path)
+
+    # The materiallibrary LOP is the publish container; the mtlx surface created inside it is
+    # auto-collected into a Material prim (Phase-0 hython-probed, 21.0.729).
+    try:
+        matlib = parent.createNode("materiallibrary", node_name=f"{name}_matlib")
+        surf = matlib.createNode("mtlxstandard_surface", node_name=name)
+    except hou.OperationFailed as e:
+        raise ValueError(f"Failed to build materiallibrary/mtlx surface under {parent_path}: {e}")
+
+    # Base surface parms — only those explicitly provided. FAIL-LOUD if an explicitly
+    # requested parm is missing (a version mismatch / renamed parm): a silent no-op would
+    # report success while ignoring the caller's material value (fail-loud-discipline).
+    if base_color is not None:
+        pt = surf.parmTuple("base_color")
+        if pt is None:
+            raise ValueError("mtlxstandard_surface has no 'base_color' parm tuple "
+                             "(version mismatch?) — cannot honor the requested base_color")
+        pt.set(base_color)
+    if metalness is not None:
+        p = surf.parm("metalness")
+        if p is None:
+            raise ValueError("mtlxstandard_surface has no 'metalness' parm (version mismatch?)")
+        p.set(metalness)
+    if roughness is not None:
+        p = surf.parm("specular_roughness")
+        if p is None:
+            raise ValueError("mtlxstandard_surface has no 'specular_roughness' parm "
+                             "(version mismatch?) — cannot honor the requested roughness")
+        p.set(roughness)
+
+    # Optional textures: one mtlxUsdUVTexture per surface input, wired by name (setNamedInput
+    # raises on an unknown input name — fail-loud). A missing `file` parm also fails loud: a
+    # wired texture node with no file path is a silent no-op that would report success.
+    for input_name, file_path in (textures or {}).items():
+        tex = matlib.createNode("mtlxUsdUVTexture", node_name=f"{name}_{input_name}")
+        fp = tex.parm("file")
+        if fp is None:
+            raise ValueError(f"mtlxUsdUVTexture has no 'file' parm (version mismatch?) — "
+                             f"cannot set the texture for input {input_name!r}")
+        fp.set(file_path)
+        surf.setNamedInput(input_name, tex, 0)
+
+    # Optional normal map: texture -> mtlxnormalmap (input 0) -> surface 'normal'.
+    if normal_map:
+        ntex = matlib.createNode("mtlxUsdUVTexture", node_name=f"{name}_normal_tex")
+        fp = ntex.parm("file")
+        if fp is None:
+            raise ValueError("mtlxUsdUVTexture has no 'file' parm (version mismatch?) — "
+                             "cannot set the normal-map texture")
+        fp.set(normal_map)
+        nmap = matlib.createNode("mtlxnormalmap", node_name=f"{name}_normalmap")
+        nmap.setInput(0, ntex)
+        surf.setNamedInput("normal", nmap, 0)
+
+    matlib.layoutChildren()
+    matlib.setDisplayFlag(True)
+    _focus_network_editor(matlib)
+
+    # Material prim path = matpathprefix + surface node name (live-confirmed: /materials/<name>).
+    prefix = "/materials/"
+    mpp = matlib.parm("matpathprefix")
+    if mpp is not None and mpp.eval():
+        prefix = mpp.eval()
+    material_prim_path = prefix.rstrip("/") + "/" + name
+
+    return {
+        "materiallibrary_path": matlib.path(),
+        "surface_path": surf.path(),
+        "material_prim_path": material_prim_path,
+    }
+
+register_handler("materials.create_mtlx_material", _create_mtlx_material)
+
+
 ###### materials.assign_material
 
 def _assign_material(
@@ -284,6 +394,123 @@ def _assign_material(
     }
 
 register_handler("materials.assign_material", _assign_material)
+
+
+###### materials.bind_usd_material
+
+def _bind_usd_material(
+    *,
+    input_lop: str,
+    geo_pattern: str,
+    material_prim: str,
+    name: str = "bind_material",
+    **_: Any,
+) -> dict[str, Any]:
+    """Bind a USD Material prim to geometry prims on a stage (the LOP material:binding).
+
+    This is the LOP/Solaris counterpart of ``assign_material`` (which drives the SOP ``material``
+    node). It creates an ``assignmaterial`` LOP wired after ``input_lop`` and authors a USD
+    ``material:binding`` on every prim matching ``geo_pattern`` — the by-pattern factory the
+    hand-built assignmaterial LOP otherwise requires. Live-confirmed (Houdini 21.0.729): the
+    binding is a USD ``material:binding`` relationship readable via ``UsdShade.MaterialBindingAPI``.
+
+    Fails loud (fail-loud-discipline): the material prim must exist on the input stage, and the
+    pattern must match at least one prim (a binding that authors nothing is a silent no-op that
+    would report success).
+
+    Args:
+        input_lop: LOP node whose stage carries the geometry + material prims (bound after it).
+        geo_pattern: USD primitive pattern for the prims to bind (e.g. ``/asset/geo/*`` or a
+            collection like ``/table.collections:donuts``).
+        material_prim: Path of the USD Material prim to bind (e.g. ``/materials/redmat``).
+        name: Name for the created ``assignmaterial`` LOP.
+
+    Returns:
+        ``{assignmaterial_path, material_prim, geo_pattern, bound_count, bound_prims}``.
+    """
+    if not geo_pattern:
+        raise ValueError("geo_pattern must be a non-empty primitive pattern")
+    if not material_prim:
+        raise ValueError("material_prim must be a non-empty material prim path")
+
+    from pxr import UsdShade
+
+    src = _get_node(input_lop)
+    if src.type().category().name() != "Lop":
+        raise ValueError(
+            f"input_lop must be a LOP node, got {src.type().category().name()} ({input_lop})")
+
+    # The material prim must exist on the input stage AND be a UsdShade.Material — binding a
+    # non-material prim (or a missing path) is a silent no-op that would report success.
+    in_stage = src.stage()
+    if in_stage is None:
+        raise ValueError(f"input_lop {input_lop} has no cooked USD stage")
+    mat_p = in_stage.GetPrimAtPath(material_prim)
+    if not (mat_p and mat_p.IsValid()):
+        raise ValueError(
+            f"material_prim {material_prim!r} does not exist on {input_lop}'s stage")
+    if not mat_p.IsA(UsdShade.Material):
+        raise ValueError(
+            f"material_prim {material_prim!r} is a {mat_p.GetTypeName()}, not a UsdShade.Material")
+
+    parent = src.parent()
+    print(f"[workflow] Creating Assign Material LOP '{name}' under {parent.path()}")
+    am = parent.createNode("assignmaterial", name)
+    am.setInput(0, src)
+    nm = am.parm("nummaterials")
+    if nm is None:
+        raise ValueError("assignmaterial has no 'nummaterials' parm (version mismatch?)")
+    nm.set(1)
+    for pn, val in (("primpattern1", geo_pattern),
+                    ("matspecmethod1", "path"),  # Explicit Path (vs cvex/vexpr)
+                    ("matspecpath1", material_prim)):
+        p = am.parm(pn)
+        if p is None:
+            raise ValueError(f"assignmaterial has no '{pn}' parm (version mismatch?)")
+        p.set(val)
+
+    am.setDisplayFlag(True)
+    layout_if_enabled(parent)
+    _focus_network_editor(am)
+
+    # Fail-loud in two independent steps so a pre-existing upstream binding to the SAME material
+    # can't false-pass a typo'd pattern (the whole-stage traversal would):
+    #   (1) resolve geo_pattern to the ACTUAL prims it matches on this node's stage (pattern-only,
+    #       binding-independent) — empty match => the pattern hit nothing.
+    #   (2) confirm THIS node authored material_prim's direct binding on those matched prims.
+    out_stage = am.stage()
+    if out_stage is None:
+        raise ValueError(f"assignmaterial {am.path()} has no cooked USD stage")
+    rule = hou.LopSelectionRule()
+    rule.setPathPattern(geo_pattern)
+    matched = [str(p) for p in rule.expandedPaths(am)]
+    if not matched:
+        raise ValueError(
+            f"geo_pattern {geo_pattern!r} matched no prims on {am.path()}'s stage "
+            f"(nothing to bind — check the pattern)")
+    bound_prims: list[str] = []
+    for prim_path in matched:
+        prim = out_stage.GetPrimAtPath(prim_path)
+        if not prim:
+            continue
+        rel = UsdShade.MaterialBindingAPI(prim).GetDirectBindingRel()
+        if rel and material_prim in [str(t) for t in rel.GetTargets()]:
+            bound_prims.append(prim_path)
+    if not bound_prims:
+        raise ValueError(
+            f"assignmaterial matched {len(matched)} prim(s) for {geo_pattern!r} but none carry a "
+            f"direct material:binding to {material_prim!r} — the binding did not author")
+
+    print(f"[workflow] Bound {material_prim} to {len(bound_prims)}/{len(matched)} matched prim(s) via {am.path()}")
+    return {
+        "assignmaterial_path": am.path(),
+        "material_prim": material_prim,
+        "geo_pattern": geo_pattern,
+        "bound_count": len(bound_prims),
+        "bound_prims": bound_prims[:50],
+    }
+
+register_handler("materials.bind_usd_material", _bind_usd_material)
 
 
 ###### materials.list_material_types

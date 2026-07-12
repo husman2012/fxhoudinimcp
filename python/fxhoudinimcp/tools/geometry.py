@@ -29,6 +29,35 @@ async def get_geometry_info(ctx: Context, node_path: str) -> dict:
     )
 
 
+@mcp.tool(meta={"require_approval": False})
+async def get_heightfield_layer_stats(
+    ctx: Context,
+    node_path: str,
+    layer: str = "height",
+    histogram_bins: int = 0,
+) -> dict:
+    """Per-layer voxel statistics (min/max/mean, optional histogram) for a heightfield layer.
+
+    A heightfield layer is a Volume prim named after the layer (``height``, ``mask``, ...).
+    Reads the actual voxel content — the anti-fabrication read for terrain evals (assert on real
+    erosion/mask ranges, not existence). READ-ONLY / ungated.
+
+    Args:
+        node_path: SOP node whose geometry carries the heightfield layers.
+        layer: layer (Volume prim) name to read (default ``height``).
+        histogram_bins: if > 0, also return a ``histogram`` of that many bins over [min, max].
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute(
+        "geometry.get_heightfield_layer_stats",
+        {
+            "node_path": node_path,
+            "layer": layer,
+            "histogram_bins": histogram_bins,
+        },
+    )
+
+
 @mcp.tool()
 async def get_points(
     ctx: Context,

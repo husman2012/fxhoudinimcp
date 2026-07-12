@@ -507,14 +507,16 @@ def _setup_flip_sim(
     name: str = "flip_sim",
     **_: Any,
 ) -> dict:
-    """Build a complete FLIP fluid simulation network.
+    """Build a complete, EMITTING FLIP fluid simulation network.
 
-    Creates a geometry node with a DOP Network, FLIP solver, FLIP source,
-    FLIP domain/tank, Object Merge for source, and a File Cache.
+    Creates a geometry node with an Object Merge for the source, a DOP Network
+    holding a FLIP Object (sourced from the source geometry via its `soppath` parm)
+    and a FLIP Solver, a DOP Import, and a File Cache. The FLIP Object generates the
+    fluid particles from the source SOP — there is no separate FLIP-source/tank node.
 
     Args:
-        source_geo: Path to the source geometry SOP.
-        domain: Domain type hint (reserved for future use).
+        source_geo: Path to the source geometry SOP (becomes the initial fluid).
+        domain: Domain type hint (currently unused; the FLIP object's implicit grid is used).
         particle_sep: Particle separation distance for the FLIP sim.
         name: Name for the top-level geometry node.
     """
@@ -552,47 +554,25 @@ def _setup_flip_sim(
         flipsolver = dopnet.createNode("flipsolver::2.0", "flipsolver1")
     all_nodes.append(flipsolver.path())
 
-    # -- Step 5: Create FLIP Object
-    print("[workflow] Creating FLIP Object DOP")
+    # -- Step 5: Create FLIP Object, SOURCED from the source geometry via its `soppath` parm.
+    # A flipobject has NO inputs — it generates fluid particles from the SOP named in `soppath`.
+    # Setting soppath to the source is THE fix for the previously-degraded factory: without it the
+    # object had no fluid and the sim emitted 0 particles (object_count stayed 0). The old code
+    # also created a `flipsource`/`fluidtank` that do not exist in the DOP context (H21) and were
+    # never wired into anything — removed. Live-proven 2026-07-03: sourced flipobject -> 1268
+    # particles / object_count 1 after stepping.
+    print("[workflow] Creating FLIP Object DOP (sourced from the source geometry via soppath)")
+    flipobj = dopnet.createNode("flipobject", "flipobject1")
+    all_nodes.append(flipobj.path())
+    _set_parm_safe(flipobj, "particlesep", particle_sep)
+    _set_parm_safe(flipobj, "soppath", objmerge.path())
+    flipsolver.setInput(0, flipobj, 0)
+    # The solver is the dopnet's sim output — make it the display node so a headless
+    # dop.cook() (and the dopimport) actually pull the simulation.
     try:
-        flipobj = dopnet.createNode("flipobject", "flipobject1")
-        all_nodes.append(flipobj.path())
-        _set_parm_safe(flipobj, "particlesep", particle_sep)
-        flipsolver.setInput(0, flipobj, 0)
-    except hou.OperationFailed:
-        print("[workflow] Warning: flipobject not available")
-        flipobj = None
-
-    # -- Step 6: Create FLIP Source
-    print("[workflow] Creating FLIP Source DOP")
-    try:
-        flipsource = dopnet.createNode("flipsource", "flipsource1")
-        all_nodes.append(flipsource.path())
-    except hou.OperationFailed:
-        print("[workflow] Warning: flipsource not available, trying volume source")
-        try:
-            flipsource = dopnet.createNode("sourcevolume", "flipsource1")
-            all_nodes.append(flipsource.path())
-        except hou.OperationFailed:
-            print("[workflow] Warning: source volume not available")
-            flipsource = None
-
-    # -- Step 7: Create FLIP Tank / Domain
-    print("[workflow] Creating FLIP Tank / Domain")
-    try:
-        fliptank = geo.createNode("fluidtank", "flip_tank1")
-        all_nodes.append(fliptank.path())
-    except hou.OperationFailed:
-        print("[workflow] Warning: fluidtank not available, creating box domain")
-        try:
-            fliptank = geo.createNode("box", "flip_domain1")
-            _set_parm_safe(fliptank, "sizex", 4.0)
-            _set_parm_safe(fliptank, "sizey", 4.0)
-            _set_parm_safe(fliptank, "sizez", 4.0)
-            all_nodes.append(fliptank.path())
-        except Exception as e:
-            print(f"[workflow] Warning: could not create domain: {e}")
-            fliptank = None
+        flipsolver.setDisplayFlag(True)
+    except Exception:
+        pass
 
     # -- Step 8: DOP Import
     print("[workflow] Creating DOP Import SOP")
@@ -750,6 +730,271 @@ def _setup_vellum_sim(
         "configure_path": vellum_configure.path(),
         "cache_path": filecache.path(),
         "sim_type": sim_type,
+        "all_nodes": all_nodes,
+    }
+
+
+###### workflow.setup_constraint_network
+
+_CONSTRAINT_TYPES = ("glue", "soft", "hard")
+
+
+def _setup_constraint_network(
+    geo_path: str = "/obj/geo1",
+    constraint_type: str = "glue",
+    strength: float = 10000.0,
+    ground: bool = True,
+    name: str = "constraint_sim",
+    **_: Any,
+) -> dict:
+    """Build a complete fractured-RBD sim with a CONSTRAINT NETWORK (glue/soft/hard).
+
+    Fractures the source (rbdmaterialfracture, whose output 1 is the constraint geometry),
+    sets the constraint TYPE + STRENGTH on it (rbdconstraintproperties), and feeds geometry +
+    constraints into the SOP Bullet solver — the multi-node build agents otherwise hand-assemble
+    every time. The constraint strength is also exposed as a per-piece attribute (glue
+    'strength' / soft 'stiffness') so a downstream weak-zone can vary it for a break pattern.
+
+    Args:
+        geo_path: Source geometry object path (fractured into pieces).
+        constraint_type: "glue" (rigid until strength exceeded), "soft" (springy), or "hard".
+        strength: Glue strength (default 10000) or, for soft, the stiffness.
+        ground: Add a ground plane to the solver.
+        name: Top-level geo node name.
+    """
+    if constraint_type not in _CONSTRAINT_TYPES:
+        raise ValueError(
+            f"constraint_type must be one of {_CONSTRAINT_TYPES}, got {constraint_type!r}")
+
+    obj = _ensure_obj_context()
+    all_nodes: list[str] = []
+
+    print(f"[workflow] Creating geo node '{name}' under /obj")
+    geo = obj.createNode("geo", name)
+    for child in geo.children():
+        child.destroy()
+    all_nodes.append(geo.path())
+
+    print(f"[workflow] Creating Object Merge for source: {geo_path}")
+    objmerge = geo.createNode("object_merge", "source_geo")
+    _set_parm_safe(objmerge, "objpath1", geo_path)
+    all_nodes.append(objmerge.path())
+
+    # Fracture: rbdmaterialfracture output 0 = geometry, 1 = constraints, 2 = proxy.
+    # It is REQUIRED here (unlike setup_rbd_sim's optional fracture) because the constraint
+    # network IS its constraints output — a scatter+voronoifracture fallback produces none.
+    print("[workflow] Creating RBD Material Fracture SOP (source of the constraint network)")
+    fracture = geo.createNode("rbdmaterialfracture", "fracture1")
+    fracture.setInput(0, objmerge, 0)
+    all_nodes.append(fracture.path())
+
+    # Constraint properties on the constraints output: set type + strength (+ the strength
+    # attribute the solver reads per-piece, so a weak zone can override it downstream).
+    print(f"[workflow] Creating RBD Constraint Properties ({constraint_type}, strength={strength})")
+    conprops = geo.createNode("rbdconstraintproperties", "constraint_props1")
+    conprops.setInput(0, fracture, 1)
+    _set_parm_safe(conprops, "constrainttype", constraint_type)
+    if constraint_type == "glue":
+        _set_parm_safe(conprops, "doglue_strength", 1)
+        _set_parm_safe(conprops, "glue_strength", strength)
+    elif constraint_type == "soft":
+        _set_parm_safe(conprops, "dosoft_stiffness", 1)
+        _set_parm_safe(conprops, "soft_stiffness", strength)
+    all_nodes.append(conprops.path())
+
+    # SOP Bullet solver: input 0 = geometry, 1 = constraints (with properties), 2 = proxy.
+    print("[workflow] Creating SOP-level RBD Bullet Solver with constraints")
+    solver = geo.createNode("rbdbulletsolver", "rbd_solver1")
+    solver.setInput(0, fracture, 0)
+    solver.setInput(1, conprops, 0)
+    solver.setInput(2, fracture, 2)
+    _set_parm_safe(solver, "useground", 1 if ground else 0)
+    all_nodes.append(solver.path())
+
+    print("[workflow] Creating File Cache SOP")
+    try:
+        filecache = geo.createNode("filecache", "file_cache1")
+    except hou.OperationFailed:
+        filecache = geo.createNode("filecache::2.0", "file_cache1")
+    filecache.setInput(0, solver, 0)
+    all_nodes.append(filecache.path())
+    try:
+        filecache.setDisplayFlag(True)
+        filecache.setRenderFlag(True)
+    except Exception:
+        pass
+
+    print("[workflow] Laying out nodes")
+    layout_if_enabled(geo)
+    _focus_network_editor(filecache)
+
+    print(f"[workflow] Constraint-network RBD simulation '{name}' setup complete")
+
+    return {
+        "success": True,
+        "geo_path": geo.path(),
+        "fracture_path": fracture.path(),
+        "constraint_props_path": conprops.path(),
+        "solver_path": solver.path(),
+        "cache_path": filecache.path(),
+        "constraint_type": constraint_type,
+        "all_nodes": all_nodes,
+    }
+
+
+###### workflow.setup_whitewater
+
+def _set_tuple_safe(node: hou.Node, parm_name: str, value: tuple) -> bool:
+    """Set a parmTuple value if it exists. Returns True on success."""
+    pt = node.parmTuple(parm_name)
+    if pt is not None:
+        try:
+            pt.set(value)
+            return True
+        except Exception as e:
+            print(f"[workflow] Could not set tuple {parm_name}: {e}")
+    return False
+
+
+def _setup_whitewater(
+    source_geo: str = "/obj/geo1",
+    particle_sep: float = 0.2,
+    name: str = "whitewater_sim",
+    foam_amount: float = 1.0,
+    **_: Any,
+) -> dict:
+    """Build a complete SOP whitewater (foam/spray/bubble) simulation in one call.
+
+    Builds the full two-solver SOP pipeline the multi-node build otherwise hand-assembles:
+    a FLIP liquid (flipcontainer -> flipsolver) feeds a fluidcompress, whose surface+velocity
+    fields drive a whitewatersource (emission volume) and a whitewatersolver (the whitewater
+    particles). The FLIP is a self-sourcing waterline tank with a stream velocity, so it
+    reliably produces the surface turbulence whitewater emits from; the source object is
+    added into the sim as extra fluid.
+
+    Wiring facts (live-grounded, H21 21.0.729 — see forkF2 record):
+      * flipcontainer has 3 outputs that feed the flipsolver's 3 inputs (0->0, 1->1, 2->2);
+        output 1 (Container) carries the gridscale/particlesep DETAIL attrs the solver requires.
+      * fluidcompress(solver 0/1/2) produces the compressed surface+vel / container / collisions.
+      * whitewatersource needs enablesplash=on to activate emission from a drifting tank
+        (pure speed-based emission yields an empty emit field); speedrange is lowered to match.
+
+    Args:
+        source_geo: Source geometry object path (added as fluid via a flipsource).
+        particle_sep: FLIP particle separation (controls resolution) — must be > 0.
+        name: Top-level geo node name.
+        foam_amount: Whitewater emission amount (whitewatersource emissionamount) — must be >= 0.
+    """
+    if particle_sep <= 0:
+        raise ValueError(f"particle_sep must be > 0, got {particle_sep}")
+    if foam_amount < 0:
+        raise ValueError(f"foam_amount must be >= 0, got {foam_amount}")
+    if hou.node(source_geo) is None:
+        raise ValueError(f"source_geo not found: {source_geo}")
+
+    obj = _ensure_obj_context()
+    all_nodes: list[str] = []
+
+    print(f"[workflow] Creating geo node '{name}' under /obj")
+    geo = obj.createNode("geo", name)
+    for child in geo.children():
+        child.destroy()
+    all_nodes.append(geo.path())
+
+    print(f"[workflow] Creating Object Merge for source: {source_geo}")
+    objmerge = geo.createNode("object_merge", "source_geo")
+    _set_parm_safe(objmerge, "objpath1", source_geo)
+    all_nodes.append(objmerge.path())
+
+    # Source object -> flipsource (becomes fluid particles fed into the sim).
+    print("[workflow] Creating FLIP Source from the object")
+    flipsource = geo.createNode("flipsource", "flip_source")
+    flipsource.setInput(0, objmerge, 0)
+    all_nodes.append(flipsource.path())
+
+    # FLIP domain. particlesep controls resolution; output 1 carries the container field.
+    print(f"[workflow] Creating FLIP Container (particlesep={particle_sep})")
+    container = geo.createNode("flipcontainer", "flip_container")
+    _set_parm_safe(container, "particlesep", particle_sep)
+    _set_tuple_safe(container, "size", (5.0, 3.0, 5.0))
+    all_nodes.append(container.path())
+
+    # Sources input = container's initial fluid (out 0) merged with the object's flipsource.
+    src_merge = geo.createNode("merge", "sources")
+    src_merge.setInput(0, container, 0)
+    src_merge.setInput(1, flipsource, 0)
+    all_nodes.append(src_merge.path())
+
+    # FLIP solver: all 3 container outputs feed the 3 solver inputs. dowaterline self-sources a
+    # pool + a stream velocity gives the surface turbulence whitewater needs.
+    print("[workflow] Creating FLIP Solver (waterline tank + stream)")
+    flip_solver = geo.createNode("flipsolver", "flip_solver")
+    _set_parm_safe(flip_solver, "dowaterline", 1)
+    _set_parm_safe(flip_solver, "waterline", 0.5)
+    _set_parm_safe(flip_solver, "water_velocityx", 6.0)
+    flip_solver.setInput(0, src_merge, 0)
+    flip_solver.setInput(1, container, 1)
+    flip_solver.setInput(2, container, 2)
+    all_nodes.append(flip_solver.path())
+
+    # Fluid Compress: produces the compressed surface+vel (0), container (1), collisions (2)
+    # that the whitewater source consumes.
+    print("[workflow] Creating Fluid Compress")
+    compress = geo.createNode("fluidcompress", "fluid_compress")
+    _set_parm_safe(compress, "particlesep", particle_sep)
+    compress.setInput(0, flip_solver, 0)
+    compress.setInput(1, flip_solver, 1)
+    compress.setInput(2, flip_solver, 2)
+    all_nodes.append(compress.path())
+
+    # Whitewater Source: emission volume from the liquid's surface+vel. enablesplash is what
+    # activates emission for a drifting tank (curvature/vorticity broaden it); foam_amount scales.
+    print(f"[workflow] Creating Whitewater Source (foam_amount={foam_amount})")
+    wwsource = geo.createNode("whitewatersource", "whitewater_source")
+    wwsource.setInput(0, compress, 0)
+    wwsource.setInput(1, compress, 1)
+    wwsource.setInput(2, compress, 2)
+    _set_parm_safe(wwsource, "enablesplash", 1)
+    _set_parm_safe(wwsource, "enablecurvature", 1)
+    _set_parm_safe(wwsource, "enablevorticity", 1)
+    _set_tuple_safe(wwsource, "speedrange", (0.1, 0.5))
+    _set_parm_safe(wwsource, "emissionamount", foam_amount)
+    all_nodes.append(wwsource.path())
+
+    # Whitewater Solver: its 3 inputs come from the whitewater source's 3 outputs.
+    print("[workflow] Creating Whitewater Solver")
+    wwsolver = geo.createNode("whitewatersolver", "whitewater_solver")
+    wwsolver.setInput(0, wwsource, 0)
+    wwsolver.setInput(1, wwsource, 1)
+    wwsolver.setInput(2, wwsource, 2)
+    all_nodes.append(wwsolver.path())
+
+    print("[workflow] Creating File Cache SOP")
+    try:
+        filecache = geo.createNode("filecache", "whitewater_cache")
+    except hou.OperationFailed:
+        filecache = geo.createNode("filecache::2.0", "whitewater_cache")
+    filecache.setInput(0, wwsolver, 0)
+    all_nodes.append(filecache.path())
+    try:
+        filecache.setDisplayFlag(True)
+        filecache.setRenderFlag(True)
+    except Exception:
+        pass
+
+    print("[workflow] Laying out nodes")
+    layout_if_enabled(geo)
+    _focus_network_editor(filecache)
+
+    print(f"[workflow] Whitewater simulation '{name}' setup complete")
+
+    return {
+        "success": True,
+        "geo_path": geo.path(),
+        "flip_solver_path": flip_solver.path(),
+        "source_path": wwsource.path(),
+        "solver_path": wwsolver.path(),
+        "cache_path": filecache.path(),
         "all_nodes": all_nodes,
     }
 
@@ -1131,6 +1376,8 @@ register_handler("workflow.setup_pyro_sim", _setup_pyro_sim)
 register_handler("workflow.setup_rbd_sim", _setup_rbd_sim)
 register_handler("workflow.setup_flip_sim", _setup_flip_sim)
 register_handler("workflow.setup_vellum_sim", _setup_vellum_sim)
+register_handler("workflow.setup_constraint_network", _setup_constraint_network)
+register_handler("workflow.setup_whitewater", _setup_whitewater)
 register_handler("workflow.create_material", _create_material)
 register_handler("workflow.assign_material", _assign_material)
 register_handler("workflow.build_sop_chain", _build_sop_chain)

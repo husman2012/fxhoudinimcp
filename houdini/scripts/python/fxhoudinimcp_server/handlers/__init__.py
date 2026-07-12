@@ -43,6 +43,8 @@ _HANDLER_MODULES = [
     "render_readback_handlers",
     "usd_export_handlers",
     "cop_onnx_handlers",
+    "spatial_reasoning_handlers",
+    "temporal_reasoning_handlers",
 ]
 
 _loaded = []

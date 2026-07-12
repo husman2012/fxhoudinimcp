@@ -148,6 +148,76 @@ async def setup_vellum_sim(
 
 
 @mcp.tool()
+async def setup_constraint_network(
+    ctx: Context,
+    geo_path: str = "/obj/geo1",
+    constraint_type: str = "glue",
+    strength: float = 10000.0,
+    ground: bool = True,
+    name: str = "constraint_sim",
+) -> dict:
+    """Build a fractured-RBD simulation with a CONSTRAINT NETWORK (glue/soft/hard) in one call.
+
+    Preferred over hand-wiring — fractures the source (rbdmaterialfracture), sets the constraint
+    type + strength on its constraint output (rbdconstraintproperties), and feeds geometry +
+    constraints into the SOP Bullet solver. The strength is also a per-piece attribute (glue
+    'strength' / soft 'stiffness') so a downstream weak-zone can vary it for a break pattern.
+
+    Args:
+        geo_path: Source geometry object path (fractured into pieces).
+        constraint_type: "glue" (rigid until broken), "soft" (springy), or "hard".
+        strength: Glue strength (default 10000) or, for soft, the stiffness.
+        ground: Add a ground plane to the solver.
+        name: Top-level geo node name.
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute(
+        "workflow.setup_constraint_network",
+        {
+            "geo_path": geo_path,
+            "constraint_type": constraint_type,
+            "strength": strength,
+            "ground": ground,
+            "name": name,
+        },
+    )
+
+
+@mcp.tool()
+async def setup_whitewater(
+    ctx: Context,
+    source_geo: str = "/obj/geo1",
+    particle_sep: float = 0.2,
+    name: str = "whitewater_sim",
+    foam_amount: float = 1.0,
+) -> dict:
+    """Build a complete SOP whitewater (foam/spray/bubble) simulation in one call.
+
+    Preferred over hand-wiring the two-solver pipeline — builds a FLIP liquid
+    (flipcontainer -> flipsolver, a self-sourcing waterline tank with a stream velocity),
+    compresses it (fluidcompress), and drives a whitewatersource (emission volume) +
+    whitewatersolver (the foam/spray/bubble particles). The source object is added into the
+    FLIP as extra fluid. Whitewater emission is activated via the source's splash detection.
+
+    Args:
+        source_geo: Source geometry object path (added as fluid).
+        particle_sep: FLIP particle separation / resolution (> 0).
+        name: Top-level geo node name.
+        foam_amount: Whitewater emission amount (>= 0).
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute(
+        "workflow.setup_whitewater",
+        {
+            "source_geo": source_geo,
+            "particle_sep": particle_sep,
+            "name": name,
+            "foam_amount": foam_amount,
+        },
+    )
+
+
+@mcp.tool()
 async def create_material(
     ctx: Context,
     name: str = "material1",
