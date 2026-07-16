@@ -70,6 +70,14 @@ def _ensure_out_context() -> hou.Node:
     return out
 
 
+# pyrosolver_sparse input connectors, by MEANING not position:
+#   0 Objects | 1 Advection | 2 Sourcing | 3 Forces      (probe-verified, H22.0.368)
+# Named because the old code's `setInput(0, merge_of_object_and_source)` silently fed a
+# source into the Objects connector -- an index is not self-documenting, a name is.
+_SOLVER_IN_OBJECTS = 0
+_SOLVER_IN_SOURCING = 2
+
+
 def _set_parm_safe(node: hou.Node, parm_name: str, value: Any) -> bool:
     """Set a parameter value if the parameter exists. Returns True on success."""
     parm = node.parm(parm_name)
@@ -108,11 +116,12 @@ def _setup_pyro_sim_sop(
     all_nodes.append(pyrosource.path())
 
     # -- Pyro Solver SOP (SOP-level, Houdini 20+)
+    # `pyrosolver` is the live, non-deprecated SOP on H21 and H22. A previous
+    # `pyrosolver::3.0` attempt was removed: that type exists in NO node-type category
+    # on either build, so its createNode raised on EVERY call and the except-branch
+    # always fired -- a permanently-dead fast path.
     print("[workflow] Creating Pyro Solver SOP")
-    try:
-        pyrosolver = geo.createNode("pyrosolver::3.0", "pyro_solver1")
-    except hou.OperationFailed:
-        pyrosolver = geo.createNode("pyrosolver", "pyro_solver1")
+    pyrosolver = geo.createNode("pyrosolver", "pyro_solver1")
     pyrosolver.setInput(0, pyrosource, 0)
     all_nodes.append(pyrosolver.path())
 
@@ -157,8 +166,9 @@ def _setup_pyro_sim_dop(
 ) -> dict:
     """Build a DOP-level Pyro simulation (fallback for older Houdini).
 
-    Uses a DOP Network with smokeobject, sourcevolume, pyrosolver,
-    and gasresizefluiddynamic.
+    Uses a DOP Network with smokeobject_sparse, volumesource and pyrosolver_sparse
+    (the non-deprecated set on H22). No external resize node: the sparse solver
+    resizes internally and gasresizefluiddynamic takes no inputs.
 
     Args:
         geo: Parent geometry node.
@@ -172,63 +182,78 @@ def _setup_pyro_sim_dop(
     all_nodes.append(dopnet.path())
     _set_parm_safe(dopnet, "substep", substeps)
 
-    # -- Smoke Object
-    print("[workflow] Creating smokeobject DOP")
-    try:
-        smokeobj = dopnet.createNode("smokeobject", "smokeobject1")
-    except hou.OperationFailed:
-        smokeobj = dopnet.createNode("smokeconfigureobject", "smokeobject1")
+    # -- Smoke Object (sparse)
+    # H22 deprecates BOTH `smokeobject` and `smokeconfigureobject` -> smokeobject_sparse.
+    # The old try/except was dead twice over: createNode("smokeobject") still SUCCEEDS on
+    # H22 (a deprecation does not raise -- CL-023), so the fallback never fired; and
+    # smokeconfigureobject takes 1 input vs smokeobject's 0, so it was shape-incompatible
+    # with the merge wiring below anyway. smokeobject_sparse keeps the 0-in/1-out shape
+    # (probe-verified on 22.0.368).
+    print("[workflow] Creating smokeobject_sparse DOP")
+    smokeobj = dopnet.createNode("smokeobject_sparse", "smokeobject1")
     all_nodes.append(smokeobj.path())
 
     # -- Source Volume
     print("[workflow] Creating source volume DOP")
     source_vol = None
     try:
-        source_vol = dopnet.createNode("sourcevolume", "source_volume1")
+        # `volumesource`, NOT `sourcevolume`. sourcevolume is deprecated (since H17!)
+        # AND -- the actual bug -- its source-path parm is `source_path`, which is not
+        # among the names tried below. _set_parm_safe returns False silently on a miss
+        # (it only warns when a parm EXISTS but set() throws), so this loop matched
+        # NOTHING and the DOP path has always built a source volume that was never
+        # pointed at the source geometry. volumesource carries `soppath`, so the same
+        # loop now resolves. Both are 1-in/1-out (probe-verified on 22.0.368).
+        source_vol = dopnet.createNode("volumesource", "source_volume1")
         all_nodes.append(source_vol.path())
         # Point the source volume at the Object Merge SOP
         for parm_name in ("sop_path", "soppath", "geometry"):
             if _set_parm_safe(source_vol, parm_name, objmerge.path()):
                 print(f"[workflow] Set source volume {parm_name} = {objmerge.path()}")
                 break
+        else:
+            # Fail loud: silently leaving the source unwired is the bug above.
+            print(
+                "[workflow] ERROR: no source-path parm could be set on "
+                f"{source_vol.path()} -- the sim would have NO source geometry"
+            )
     except hou.OperationFailed:
-        print("[workflow] Warning: sourcevolume not available, skipping")
+        print("[workflow] Warning: volumesource not available, skipping")
 
-    # -- Pyro Solver
-    print("[workflow] Creating pyrosolver DOP")
-    try:
-        pyrosolver = dopnet.createNode("pyrosolver::2.0", "pyrosolver1")
-    except hou.OperationFailed:
-        pyrosolver = dopnet.createNode("pyrosolver", "pyrosolver1")
+    # -- Pyro Solver (sparse)
+    # H22 deprecates pyrosolver::2.0 -> pyrosolver_sparse.
+    #
+    # THE INPUTS ARE SEMANTIC, NOT POSITIONAL -- read the labels, do not count them:
+    #   pyrosolver_sparse : ('Objects', 'Advection', 'Sourcing', 'Forces')       [4]
+    #   pyrosolver::2.0   : ('Object', 'Pre-solve', 'Velocity Update',
+    #                        'Advection', 'Sourcing (post-solve)')               [5]
+    # The old code merged the smoke object AND the source volume together and fed the
+    # merge into input 0 -- i.e. it handed a SOURCE to the OBJECTS connector. That was
+    # wrong on ::2.0 too (its input 0 is 'Object'), so the sim never sourced. The source
+    # belongs on the 'Sourcing' connector: index 2 on sparse (index 4 on the old solver).
+    # Live-verified on 22.0.368: with the source on input 2 the dopnet cooks and reports
+    # 1 sim object; with it merged into input 0 it reports none.
+    print("[workflow] Creating pyrosolver_sparse DOP")
+    pyrosolver = dopnet.createNode("pyrosolver_sparse", "pyrosolver1")
     all_nodes.append(pyrosolver.path())
 
-    # -- Resize Container
-    print("[workflow] Creating resize container DOP")
-    resize = None
-    try:
-        resize = dopnet.createNode("gasresizefluiddynamic", "resize_container1")
-        all_nodes.append(resize.path())
-    except hou.OperationFailed:
-        print("[workflow] Warning: gasresizefluiddynamic not available, skipping")
+    # -- Wire the solver: Objects <- smoke object, Sourcing <- volume source.
+    # No external resize node: `gasresizefluiddynamic` has ZERO inputs (inputLabels ==
+    # ()), so the old `resize.setInput(0, pyrosolver, 0)` raised hou.InvalidInput on
+    # EVERY call and a broad `except Exception` swallowed it. pyrosolver_sparse does its
+    # own sparse resizing internally, so the node is not needed at all.
+    print("[workflow] Wiring solver: Objects <- smoke, Sourcing <- volume source")
+    pyrosolver.setInput(_SOLVER_IN_OBJECTS, smokeobj, 0)
+    if source_vol is not None:
+        pyrosolver.setInput(_SOLVER_IN_SOURCING, source_vol, 0)
+    else:
+        print("[workflow] ERROR: no source volume -- the sim will have NO sourcing")
 
-    # -- Merge DOP to combine smoke object and source volume
-    print("[workflow] Creating merge DOP and wiring solver chain")
-    try:
-        merge_dop = dopnet.createNode("merge", "merge1")
-        merge_dop.setInput(0, smokeobj, 0)
-        if source_vol is not None:
-            merge_dop.setInput(1, source_vol, 0)
-        pyrosolver.setInput(0, merge_dop, 0)
-        all_nodes.append(merge_dop.path())
-    except Exception as e:
-        print(f"[workflow] Warning: merge DOP failed, wiring directly: {e}")
-        pyrosolver.setInput(0, smokeobj, 0)
-
-    if resize is not None:
-        try:
-            resize.setInput(0, pyrosolver, 0)
-        except Exception as e:
-            print(f"[workflow] Warning: could not wire resize container: {e}")
+    # The solver must carry the dopnet's display flag or the network cooks to NOTHING.
+    # Isolated on 22.0.368: identical net, flag unset -> simulation().objects() == 0;
+    # flag set -> 1. The dopnet has no other output wired to the solver, so without this
+    # the whole chain is inert while every call still returns "success": True.
+    pyrosolver.setDisplayFlag(True)
 
     # -- DOP Import SOP
     print("[workflow] Creating DOP Import SOP")
@@ -278,8 +303,8 @@ def _setup_pyro_sim(
 
     Tries the modern SOP-level approach first (Houdini 20+, using
     pyrosource + pyrosolver SOPs).  Falls back to the classic DOP
-    approach (smokeobject + sourcevolume + pyrosolver DOPs) for
-    older Houdini versions.
+    approach (smokeobject_sparse + volumesource + pyrosolver_sparse DOPs)
+    for older Houdini versions.
 
     Args:
         source_geo: Path to the source geometry SOP to drive the simulation.
