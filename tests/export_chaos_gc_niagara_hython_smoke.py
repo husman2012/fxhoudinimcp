@@ -317,6 +317,21 @@ def main():
             tmp_dir,
         )
 
+        # Release Houdini's Alembic archive handles BEFORE TemporaryDirectory
+        # unlinks the .abc, or teardown dies on a Windows file lock and takes the
+        # whole smoke down -- with every check having already PASSED.
+        #
+        # Measured on 22.0.368 (destroying the reader is NOT enough; Houdini caches
+        # Alembic archives globally):
+        #   after the alembic SOP cooks    -> unlink LOCKED (PermissionError 32)
+        #   after destroying the SOP + geo -> unlink LOCKED (PermissionError 32)
+        #   after hou.hipFile.clear()      -> unlink OK
+        #
+        # The same lock exists on H21, where it surfaced as NotADirectoryError
+        # (WinError 267): py3.12+ changed shutil.rmtree(onerror=) -> onexc=, so the
+        # H22 traceback LOOKS new while the bug is old. Old bug, new clothes.
+        hou.hipFile.clear(suppress_save_prompt=True)
+
     print(f"\n{'='*60}")
     print("SUMMARY")
     print(f"{'='*60}")
