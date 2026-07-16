@@ -48,14 +48,35 @@ from fxhoudinimcp_server.handlers.graph_handlers import _resolve_node_type
 # Helpers
 # ---------------------------------------------------------------------------
 
-# The 7 FR-1 KineFX/APEX node types whose build-level availability is probed.
-# These are SOP-context types; all resolve via hou.sopNodeTypeCategory().
+# The FR-1 KineFX/APEX node types whose build-level availability is probed.
+# SOP-context types; all resolve via hou.sopNodeTypeCategory().
+#
+# FR-1 promises to "confirm every KineFX/APEX node type USED resolves", so this list is
+# pinned to what the handler actually creates (python/fxhoudinimcp/tests/
+# test_kinefx_probe_list.py asserts it against this module's AST). Corrected 2026-07-15:
+#
+#   - REMOVED `motiontransform`: exists in NO node-type category on H21.0.729 or
+#     H22.0.368, and the handler never creates it. The probe reported `false` for it
+#     forever -- honestly; the FR-1 spec simply named a node Houdini never shipped. No
+#     type carries the label "Motion Transform" (nearest: kinefx::fktransfer "FK
+#     Transfer", kinefx::biped_retarget "Biped Retarget") -- naming one would be a
+#     guess. The retarget chain actually built is rigmatchpose -> [mappoints] ->
+#     fullbodyik, all three of which are probed below.
+#   - `rigmatchpose` -> `kinefx::rigmatchpose`: the bare form only resolves through
+#     Houdini's un-namespaced fallback, so the probe was reporting on a different string
+#     than the code runs.
+#   - ADDED `kinefx::mappoints` + `kinefx::fullbodyik`: used by setup_retarget but
+#     previously unprobed -- the probe was blind to two thirds of its own chain.
+#
+# `apex::autorigcomponent` is probed but not yet created here: it is the APEX surface
+# FR-1 covers for the (still-gated) build_apex_graph work. Verified present on both builds.
 _KINEFX_NODE_TYPES = [
     "kinefx::fbxcharacterimport",
     "kinefx::fbxanimimport",
     "bonedeform",
-    "rigmatchpose",
-    "motiontransform",
+    "kinefx::rigmatchpose",
+    "kinefx::mappoints",
+    "kinefx::fullbodyik",
     "kinefx::secondarymotion",
     "apex::autorigcomponent",
 ]

@@ -97,20 +97,20 @@ if _PYTEST_AVAILABLE:
     pytestmark = pytest.mark.hython_smoke
 
 # ===========================================================================
-# The 7 KineFX / APEX node types under test (§9.1)
+# The KineFX / APEX node types under test (§9.1)
 # ===========================================================================
 
-# Each entry: (node_type, context_type)
-# All live under /obj or OBJ-level containers reachable from /obj.
-_KINEFX_NODE_TYPES = [
-    ("kinefx::fbxcharacterimport", "sop"),
-    ("kinefx::fbxanimimport",      "sop"),
-    ("bonedeform",                 "sop"),
-    ("rigmatchpose",               "sop"),
-    ("motiontransform",            "sop"),
-    ("kinefx::secondarymotion",    "sop"),
-    ("apex::autorigcomponent",     "sop"),
-]
+# IMPORTED, never redefined. This list used to be duplicated here, which is exactly how
+# it drifted from the handler: it kept asserting `motiontransform` was creatable long
+# after that type was known to exist on no build, so this smoke was permanently red.
+# The handler is the single source of truth; test_kinefx_probe_list.py pins that list
+# to the handler's own AST.
+from fxhoudinimcp_server.handlers.character_handlers import (  # noqa: E402
+    _KINEFX_NODE_TYPES as _HANDLER_NODE_TYPES,
+)
+
+# Each entry: (node_type, context_type). All live under /obj or OBJ-level containers.
+_KINEFX_NODE_TYPES = [(t, "sop") for t in _HANDLER_NODE_TYPES]
 
 
 # ===========================================================================
