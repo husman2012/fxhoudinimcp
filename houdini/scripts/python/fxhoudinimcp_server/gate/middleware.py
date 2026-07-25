@@ -134,6 +134,23 @@ def _run_preview(command: str, params: dict[str, Any]) -> tuple[dict | None, str
     if preview_fn is None:
         return None, None
 
+    # ADR-0007 Phase 3: never run a preview_fn for a CODE_EXEC command.  A queued CODE_EXEC call
+    # can no longer be approved (see _approve_pending_call), which leaves preview_fn as the ONLY
+    # code path such an entry could still execute — a preview_fn that "previews" by running the
+    # operator-supplied snippet would be an un-gated code-exec.  Guarded on capability rather than
+    # command name so it also holds for any future CODE_EXEC command that registers a preview.
+    from homedini.dcc.mcp_gate.gate_model import Capability as CoreCap
+    if _cap_from_dispatcher(command) is CoreCap.CODE_EXEC:
+        # Recoverable-suspicious, not expected-absence: no shipped CODE_EXEC handler registers a
+        # preview, so reaching here means an unusual registration the operator should see rather
+        # than a routine skip (fail-loud-discipline's WARNING tier).
+        log.warning(
+            "_run_preview: refusing to run a preview_fn registered on CODE_EXEC command %r "
+            "(ADR-0007) — a preview that executes the payload would be un-gated code execution",
+            command,
+        )
+        return None, "preview is not run for code_exec commands (ADR-0007)"
+
     container: dict[str, Any] = {}
 
     def _run() -> None:
@@ -322,6 +339,26 @@ def _gated_dispatch(command: str, params: dict[str, Any]) -> dict[str, Any]:
             reasons=[],
         )
 
+    # --- ADR-0007 Seam 1: never-list hard DENY ---
+    # scene.new_scene / scene.load_scene / cache.clear_cache destroy state that neither Houdini
+    # undo nor a saved .hip recovers. Denied regardless of mode (the floor below ACT_SAFE/TRUSTED),
+    # checked here because this is where the dispatch command string is known (decide() is
+    # tool-name-blind). Sound only alongside the ACT_SAFE CODE_EXEC DENY in policy.decide: without
+    # it, execute_python walks around any command-name list (review finding B1).
+    from homedini.dcc.mcp_gate.never_list import is_irreversible_command
+    if is_irreversible_command(command):
+        _emit_audit(gate, command, params, "denied", classification)
+        return {
+            "gate": "denied",
+            "status": "denied",
+            "reason": (
+                f"Command '{command}' is never allowed: it destroys scene or cache state that "
+                f"neither Houdini undo nor a saved .hip can recover."
+            ),
+            "mode": _mode_str(cfg.mode),
+            "capability": capability.value,
+        }
+
     # --- Policy decision ---
     decision = decide(cfg.mode, capability, classification)
 
@@ -460,7 +497,10 @@ def _gated_dispatch(command: str, params: dict[str, Any]) -> dict[str, Any]:
         return {"gate": "denied", "status": "denied", "reason": f"Unexpected policy decision: {decision!r}"}
 
 
-def _emit_audit(gate, command: str, params: dict, event_type: str, classification, pending_id: str | None = None) -> None:
+def _emit_audit(
+    gate, command: str, params: dict, event_type: str, classification,
+    pending_id: str | None = None, capability_override: str | None = None,
+) -> None:
     """Append an AuditEvent to the gate's audit log.  Errors are logged, not raised.
 
     AuditEvent expects a 'classification' field (serialised dict) and
@@ -487,7 +527,11 @@ def _emit_audit(gate, command: str, params: dict, event_type: str, classificatio
             ts=datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
             event=event_type,
             tool=command,
-            capability=str(_cap_from_dispatcher(command).value),
+            capability=(
+                capability_override
+                if capability_override is not None
+                else str(_cap_from_dispatcher(command).value)
+            ),
             mode=gate.config.mode.value,
             classification=cl_dict,
             code_sha256=code_sha256,
@@ -496,6 +540,78 @@ def _emit_audit(gate, command: str, params: dict, event_type: str, classificatio
         gate.audit.append(ev)
     except Exception as exc:  # noqa: BLE001
         log.warning("_emit_audit: failed to write audit event for %r: %s", command, exc)
+
+
+def _emit_refusal_audit(
+    gate, command: str, pending_id: str | None = None, capability: str | None = None
+) -> None:
+    """Record a refused gate-control attempt (ADR-0007 Phase 3) in the audit log.
+
+    A refusal is the tripwire that something tried to escalate its own authority — the single most
+    interesting event in the log — so it is recorded even though nothing ran.  Errors are logged,
+    never raised: failing to write the audit line must not turn a refusal into an exception.
+
+    Args:
+        gate: the live _GateInstance whose audit log receives the event.
+        command: the gate-control command that was refused.
+        pending_id: linked PendingCall id, when the refusal concerned a queued call.
+        capability: the capability that was actually refused, when it differs from `command`'s own.
+            Refusing an approval is the case that matters: the interesting capability belongs to
+            the QUEUED ENTRY (e.g. code_exec), while the gate command itself is readonly, and the
+            entry is purged moments later — so without this the log could never be reconstructed.
+    """
+    try:
+        from homedini.dcc.mcp_gate.gate_model import Classification, Severity
+        benign = Classification(danger=False, classes=[], severity=Severity.NONE, reasons=[])
+        _emit_audit(
+            gate, command, {}, "refused", benign,
+            pending_id=pending_id, capability_override=capability,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("_emit_refusal_audit: failed to record refusal of %r: %s", command, exc)
+
+
+def _demote_live_non_settable_mode(gate) -> None:
+    """Demote a live gate whose mode is no longer command-settable (ADR-0007 Phase 3).
+
+    The GATE singleton lives on hou.session so it survives importlib.reload().  A session that had
+    already reached TRUSTED before this hardening landed would therefore carry TRUSTED straight
+    through the reload that installs the hardening — the refusal in _set_permission_mode blocks
+    only NEW escalations, not one already in effect.  Demoting here makes the hardening apply to
+    the session that installs it, not merely to sessions started afterwards.  PROPOSE is the target
+    because it is the same safe tier config._demote_file_trusted falls back to.
+
+    Args:
+        gate: the live _GateInstance; its .config is replaced in place when demotion applies.
+    """
+    from dataclasses import replace
+
+    from homedini.dcc.mcp_gate.gate_model import Mode
+    from homedini.dcc.mcp_gate.policy import is_mode_command_settable
+
+    # Capture the mode's display value INSIDE the guard too. Re-reading gate.config.mode below to
+    # log it would be a second unguarded access on exactly the malformed object the guard just
+    # caught -- and this runs BEFORE the wrap, so raising here would leave dispatch UNGATED.
+    try:
+        mode = gate.config.mode
+        settable = is_mode_command_settable(mode)
+        mode_label = getattr(mode, "value", mode)
+    except Exception as exc:  # noqa: BLE001
+        # Fail closed: a mode we cannot evaluate must not be left in force.
+        log.error(
+            "install_gate: could not evaluate live gate mode (%s); demoting to PROPOSE", exc
+        )
+        settable = False
+        mode_label = "<unreadable>"
+    if settable:
+        return
+
+    log.warning(
+        "install_gate: live gate mode %r is no longer command-settable; demoting to %r (ADR-0007).",
+        mode_label,
+        Mode.PROPOSE.value,
+    )
+    gate.config = replace(gate.config, mode=Mode.PROPOSE)
 
 
 def _warn_undeclared_commands() -> None:
@@ -531,12 +647,14 @@ def install_gate() -> None:
     The GATE singleton is stashed on hou.session so it survives reload().
     Config is read from $HOUDINI_USER_PREF_DIR/mcp_gate/mcp_gate.json.
 
-    Re-install ordering (ADR §3.4.4 D4):
+    Re-install ordering (ADR §3.4.4 D4, revised by ADR-0007 Phase 3):
     1. RESTORE existing GATE from hou.session FIRST — preserves the live
        PendingQueue across a Python-module reload.
-    2. Check wrap idempotency SECOND and separately — these two are independent.
-    3. Register gate handlers, warn undeclared commands, wire wrap only on
-       first install.
+    2. Demote a live mode that is no longer command-settable (ADR-0007).
+    3. Register gate handlers on EVERY install — BEFORE the wrap idempotency
+       check, so a reload actually replaces the previous version's closures.
+    4. Check wrap idempotency, rebinding a stale wrapper if one is installed.
+    5. Warn undeclared commands and wire the wrap only on first install.
     """
     import fxhoudinimcp_server.dispatcher as _d
 
@@ -563,16 +681,37 @@ def install_gate() -> None:
         _set_gate(gate)
         log.debug("install_gate: built fresh GATE from config %r", config_path)
 
-    # Step 2: Wrap idempotency is SEPARATE from the GATE restore (R4C).
-    # Check only after GATE is resolved so we never drop the live queue.
+    # Step 2 (ADR-0007 Phase 3): demote a live tier that is no longer command-settable, so this
+    # hardening binds the session that installs it rather than only later ones.
+    _demote_live_non_settable_mode(gate)
+
+    # Step 3 (ADR-0007 Phase 3): register gate handlers on EVERY install, BEFORE the wrap
+    # idempotency check.  Handlers are resolved by name from _handler_registry at CALL time, so a
+    # reload that re-executes this module but hits the idempotency return below would otherwise
+    # leave the PREVIOUS module version's closures live — meaning a refusal shipped in this file
+    # would not actually be in force in the session that installed it.  register_handler overwrites
+    # by name, so re-registering is idempotent and cheap.
+    _register_gate_handlers(_d, gate)
+
+    # Step 4: Wrap idempotency is SEPARATE from the GATE restore (R4C) and from handler
+    # registration.  Check only after GATE is resolved so we never drop the live queue.
     if getattr(_d.dispatch, "_is_gated", False) is True:
-        log.debug(
-            "install_gate: gate wrap already applied (idempotent no-op); queue preserved"
-        )
+        # The wrap is applied — but after importlib.reload() the installed callable is the PREVIOUS
+        # module version's _gated_dispatch, so fork-side changes to the gated path are not in force.
+        # Rebind to the current wrapper WITHOUT re-capturing _ORIGINAL_DISPATCH: it still points at
+        # the real dispatch, and re-capturing here would wrap the gate around itself — the
+        # double-wrap this guard exists to prevent.
+        if _d.dispatch is not _gated_dispatch:
+            _d.dispatch = _gated_dispatch
+            _gated_dispatch._is_gated = True  # type: ignore[attr-defined]
+            log.info("install_gate: rebound a stale gated dispatch to the reloaded wrapper")
+        else:
+            log.debug(
+                "install_gate: gate wrap already applied (idempotent no-op); queue preserved"
+            )
         return
 
-    # Step 3: Register gate handlers, backstop-warn undeclared commands, wire wrap.
-    _register_gate_handlers(_d, gate)
+    # Step 5: backstop-warn undeclared commands, wire wrap.
     _warn_undeclared_commands()
 
     # Preserve _ORIGINAL_DISPATCH before wrapping.
@@ -600,7 +739,9 @@ def _register_gate_handlers(_d, gate_ref) -> None:
     Thunks use a late-binding lambda to _get_gate() so that if the gate
     singleton is replaced (e.g. in tests), handlers see the live object.
     """
+    from homedini.dcc.mcp_gate.gate_model import Capability as CoreCap
     from homedini.dcc.mcp_gate.gate_model import Mode
+    from homedini.dcc.mcp_gate.policy import is_mode_command_settable
 
     # --- gate.get_permission_mode ---
     def _get_permission_mode() -> dict:
@@ -626,6 +767,27 @@ def _register_gate_handlers(_d, gate_ref) -> None:
                 "gate": "allowed",
                 "status": "error",
                 "error": f"Unknown mode {mode!r}. Valid: {[m.value for m in Mode]}",
+            }
+        # ADR-0007 Phase 3: refuse any mode that is not command-settable.  TRUSTED is the only mode
+        # whose decide() ALLOWs CODE_EXEC, so whoever can set it owns the scene.  The HTTP bridge
+        # carries NO caller identity — the panel's own bridge_call and an agent shelling out to
+        # curl are indistinguishable here — so the refusal is unconditional rather than
+        # identity-based.  The panel only ever sets ACT_SAFE, which stays settable, so nothing
+        # legitimate is lost.  Checked on the RESOLVED Mode enum, so string variants can't slip past.
+        if not is_mode_command_settable(new_mode):
+            log.warning(
+                "gate.set_permission_mode: REFUSED escalation to %r (not command-settable)",
+                new_mode.value,
+            )
+            _emit_refusal_audit(g, "gate.set_permission_mode")
+            _settable = sorted(m.value for m in Mode if is_mode_command_settable(m))
+            return {
+                "gate": "allowed",
+                "status": "denied",
+                "error": (
+                    f"Mode {new_mode.value!r} cannot be set through the gate-control command "
+                    f"(ADR-0007). Settable modes: {_settable}."
+                ),
             }
         from dataclasses import replace
         g.config = replace(g.config, mode=new_mode)
@@ -677,6 +839,46 @@ def _register_gate_handlers(_d, gate_ref) -> None:
         peek_entry = next(
             (e for e in pending_entries if e.get("id") == pending_id), None
         )
+
+        # ADR-0007 Phase 3: refuse to approve anything that is not MUTATING.  With TRUSTED no
+        # longer settable (see _set_permission_mode), NO mode ALLOWs CODE_EXEC — so approving a
+        # queued CODE_EXEC call was the last remaining path from QUEUE to execution, i.e. a
+        # backdoor around the execute_code FLOOR in policy.decide.  Refused for everyone because
+        # the bridge has no caller identity.  MUTATING approvals are deliberately untouched: the
+        # operator's propose-mode GateRail still approves reversible edits, which is what it is for.
+        # Fail closed — only an explicitly MUTATING entry is approvable, so a missing or
+        # unparseable capability refuses rather than runs.
+        if peek_entry is None:
+            # Refuse HERE rather than falling through to queue.approve()'s KeyError path. Both purge
+            # expired entries first, so list() and approve() agree today — but authorization must
+            # not depend on that staying true. Presentation output is not an authorization source,
+            # and if the two ever diverged this branch would run an unchecked thunk.
+            return {
+                "gate": "allowed",
+                "status": "error",
+                "error": f"No pending call with id {pending_id!r} (expired or already handled).",
+            }
+
+        _entry_cap = str(peek_entry.get("capability", ""))
+        if _entry_cap != CoreCap.MUTATING.value:
+            log.warning(
+                "gate.approve_pending_call: REFUSED approval of %r (capability=%r)",
+                pending_id, _entry_cap,
+            )
+            # Audit the PENDING ENTRY's capability, not this gate command's own (readonly). The
+            # entry is purged moments later, so recording "readonly" would leave a log from which
+            # the actual refused attempt could never be reconstructed.
+            _emit_refusal_audit(g, "gate.approve_pending_call", pending_id, capability=_entry_cap)
+            return {
+                "gate": "allowed",
+                "status": "denied",
+                "error": (
+                    f"Pending call {pending_id!r} has capability {_entry_cap!r} and cannot be "
+                    f"approved (ADR-0007). Only {CoreCap.MUTATING.value!r} calls are "
+                    f"approvable — code execution has no approval path. Use "
+                    f"gate.reject_pending_call to discard it."
+                ),
+            }
 
         # B3 / ADR 0005 rev2 §3.4f: retrieve original call params BEFORE the
         # approve() call removes the entry from the queue.  params_of() returns
