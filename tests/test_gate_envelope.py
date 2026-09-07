@@ -511,22 +511,37 @@ def _gate_handlers(mock_hou, monkeypatch, gate):
     return _d._handler_registry
 
 
-class TestModeEscalationRefused:
-    """R1 — gate.set_permission_mode can never reach a tier that ALLOWs CODE_EXEC."""
+class TestModeSettingIsAllowlisted:
+    """R1 (ADR-0007 Phase 4) — set_permission_mode honours the allowlist; TRUSTED is now on it.
 
-    def test_trusted_is_refused_and_the_live_mode_is_unchanged(self, mock_hou, monkeypatch):
+    Phase 3 held TRUSTED off the list; Phase 4 restored it because it is the operator's only path to
+    CODE_EXEC and the panel that was to supply the alternative was never built. The allowlist is
+    unchanged as a MECHANISM — it is still explicit, so a future floor-lifting mode is refused until
+    someone lists it deliberately. With every current mode listed, the `is_mode_command_settable`
+    refusal branch (and its audit) is now reachable only by such a future mode; the nearest live
+    coverage is the unknown-mode path below.
+    """
+
+    def test_trusted_is_settable_and_takes_effect(self, mock_hou, monkeypatch):
         from homedini.dcc.mcp_gate.gate_model import Mode
-        gate, audit = _make_real_gate(mode=Mode.PROPOSE)
+        gate, _ = _make_real_gate(mode=Mode.PROPOSE)
         reg = _gate_handlers(mock_hou, monkeypatch, gate)
 
         result = reg["gate.set_permission_mode"](mode="trusted")
 
-        assert result["status"] == "denied", result
+        assert result["status"] == "success", result
+        assert gate.config.mode is Mode.TRUSTED
+
+    def test_an_unknown_mode_is_refused_and_the_live_mode_is_unchanged(self, mock_hou, monkeypatch):
+        from homedini.dcc.mcp_gate.gate_model import Mode
+        gate, _ = _make_real_gate(mode=Mode.PROPOSE)
+        reg = _gate_handlers(mock_hou, monkeypatch, gate)
+
+        result = reg["gate.set_permission_mode"](mode="god_mode")
+
+        assert result["status"] == "error", result
         assert gate.config.mode is Mode.PROPOSE, (
-            "the refusal returned denied but STILL changed the live mode"
-        )
-        assert any(getattr(e, "event", "") == "refused" for e in audit), (
-            "a refused escalation must be audited - it is the tripwire that one was attempted"
+            "an unknown mode was rejected but STILL changed the live mode"
         )
 
     def test_every_settable_mode_still_round_trips(self, mock_hou, monkeypatch):
@@ -650,8 +665,8 @@ class TestInstallGateLifecycle:
         import fxhoudinimcp_server.gate.middleware as mw
         return _d, mw
 
-    def test_a_live_trusted_session_is_demoted_on_install(self, mock_hou, monkeypatch):
-        """BLOCKER 2: the GATE survives reload on hou.session, so TRUSTED would survive with it."""
+    def test_a_live_trusted_session_survives_install(self, mock_hou, monkeypatch):
+        """ADR-0007 Phase 4 preserves an explicitly selected trusted mode across reinstall."""
         from homedini.dcc.mcp_gate.gate_model import Mode
         gate, _ = _make_real_gate(mode=Mode.TRUSTED)
         _d, mw = self._prepare(mock_hou, monkeypatch, gate)
@@ -662,8 +677,8 @@ class TestInstallGateLifecycle:
 
         mw.install_gate()
 
-        assert gate.config.mode is Mode.PROPOSE, (
-            "a session already at TRUSTED kept it across the install that hardens the gate"
+        assert gate.config.mode is Mode.TRUSTED, (
+            "an explicitly trusted session lost its mode across reinstall"
         )
 
     def test_handlers_are_re_registered_even_when_already_gated(self, mock_hou, monkeypatch):

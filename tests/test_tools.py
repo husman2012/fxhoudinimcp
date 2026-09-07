@@ -148,30 +148,26 @@ class TestMaterialTools:
         )
 
 
-class TestGateControlToolsAreNotAgentReachable:
-    """ADR-0007 Phase 2 — the authority-escalation gate tools must NOT be exposed as agent tools.
+class TestGateControlToolsAreAgentReachable:
+    """ADR-0007 Phase 4 — the full gate-control surface is reachable from an MCP client.
 
-    An agent that can set_permission_mode (change its own tier) or approve_pending_call (approve its
-    own queued call) defeats the gate. This is the fence that lets a Codex child (no CLI
-    --disallowed-tools) be added to the panel safely; the panel/operator reach these via a DIRECT
-    bridge call, not the FastMCP wrapper, so removing the wrappers does not affect them.
+    Phase 2 withheld set_permission_mode and approve_pending_call, assuming the in-Houdini panel
+    would be the operator's route to them. The panel was never built, so every client sat in PROPOSE
+    with a queue nothing could drain. Enforcement lives in the HANDLERS (mode allowlist;
+    MUTATING-only approval) — the bridge carries no caller identity, so a shell-capable agent
+    reached these commands regardless and the wrappers fenced only the operator.
     """
 
     @pytest.mark.asyncio
-    async def test_escalation_gate_tools_are_not_registered(self):
+    async def test_gate_control_tools_are_registered(self):
         from fxhoudinimcp.server import mcp
 
         names = {t.name for t in await mcp.list_tools()}
-        assert "set_permission_mode" not in names, (
-            "set_permission_mode must NOT be an agent tool — it is authority escalation (ADR-0007 P2)"
-        )
-        assert "approve_pending_call" not in names, (
-            "approve_pending_call must NOT be an agent tool — it is a self-approval bypass (ADR-0007 P2)"
-        )
+        assert "set_permission_mode" in names
+        assert "approve_pending_call" in names
 
     @pytest.mark.asyncio
     async def test_readonly_gate_introspection_tools_are_still_registered(self):
-        # The fence is surgical: the agent may still SEE the mode and the queue, just not change them.
         from fxhoudinimcp.server import mcp
 
         names = {t.name for t in await mcp.list_tools()}
@@ -179,9 +175,18 @@ class TestGateControlToolsAreNotAgentReachable:
         assert "list_pending_calls" in names
 
     @pytest.mark.asyncio
-    async def test_the_removed_tool_symbols_are_gone_from_the_module(self):
-        # Belt-and-suspenders: a re-added @mcp.tool() would re-register it, so also pin the symbols.
+    async def test_every_gate_command_has_a_tool_wrapper(self):
+        # The module docstring promises all 7 gate commands; a silently-dropped wrapper is the
+        # regression that stranded the operator under Phase 2.
         import fxhoudinimcp.tools.gate as gate_tools
 
-        assert not hasattr(gate_tools, "set_permission_mode")
-        assert not hasattr(gate_tools, "approve_pending_call")
+        for name in (
+            "get_permission_mode",
+            "set_permission_mode",
+            "list_pending_calls",
+            "approve_pending_call",
+            "reject_pending_call",
+            "classify_code",
+            "get_audit_log",
+        ):
+            assert hasattr(gate_tools, name), f"missing gate tool wrapper: {name}"

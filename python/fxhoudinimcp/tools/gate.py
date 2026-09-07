@@ -20,22 +20,27 @@ from fxhoudinimcp.server import mcp, _get_bridge
 async def get_permission_mode(ctx: Context) -> dict:
     """Get the current MCP gate permission mode.
 
-    Returns the active permission mode: 'trusted', 'propose', or 'read_only'.
+    Returns the active mode: 'read_only', 'propose', 'approve', 'act_safe', or 'trusted'.
     """
     bridge = _get_bridge(ctx)
     return await bridge.execute("gate.get_permission_mode", {})
 
 
-# NOTE (Homedini ADR-0007 Phase 2): the agent-facing `set_permission_mode` and
-# `approve_pending_call` tools are DELIBERATELY NOT exposed. They are authority-escalation
-# surfaces — an agent that can change its own permission tier, or approve its own queued call,
-# defeats the gate. The in-Houdini agent panel sets the mode via a DIRECT bridge call
-# (`homedini.ai.agent_panel.mcp_read.bridge_call` -> the `gate.set_permission_mode` dispatch
-# command, which is still registered in middleware._register_gate_handlers), NOT through this
-# FastMCP wrapper, so the panel is unaffected. Operator approval of a queued call likewise uses a
-# direct bridge call, not an agent tool. The dispatch commands still exist; only the AGENT-reachable
-# tool wrappers are withheld — the fence that lets a Codex child (which has no CLI --disallowed-tools)
-# be added to the panel safely.
+###### gate.set_permission_mode
+
+
+@mcp.tool()
+async def set_permission_mode(ctx: Context, mode: str) -> dict:
+    """Set the MCP gate permission mode.
+
+    Args:
+        mode: one of 'read_only', 'propose', 'approve', 'act_safe', 'trusted'.
+            Underscores and hyphens are both accepted.
+
+    Returns the resolved mode, or a denial if the mode is not command-settable.
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute("gate.set_permission_mode", {"mode": mode})
 
 
 ###### gate.list_pending_calls
@@ -52,9 +57,21 @@ async def list_pending_calls(ctx: Context) -> dict:
     return await bridge.execute("gate.list_pending_calls", {})
 
 
-# gate.approve_pending_call is intentionally NOT exposed as an agent tool (ADR-0007 Phase 2, see the
-# note above): self-approving a queued call is the operator's decision, driven by a direct bridge
-# call, never by the agent.
+###### gate.approve_pending_call
+
+
+@mcp.tool()
+async def approve_pending_call(ctx: Context, pending_id: str) -> dict:
+    """Approve a queued call and run it.
+
+    Only MUTATING entries are approvable — the handler refuses CODE_EXEC ones, which have no
+    approval path (ADR-0007). To run code, set mode 'trusted' and issue the call directly.
+
+    Args:
+        pending_id: The pending_id returned when the call was queued.
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute("gate.approve_pending_call", {"pending_id": pending_id})
 
 
 ###### gate.reject_pending_call
