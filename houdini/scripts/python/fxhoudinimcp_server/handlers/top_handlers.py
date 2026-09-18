@@ -8,6 +8,7 @@ from __future__ import annotations
 
 # Built-in
 import logging
+import os
 
 # Third-party
 import hou
@@ -271,7 +272,102 @@ def cook_top_node(
         logger.debug("Could not read node errors: %s", e)
         result["errors"] = []
 
+    if block:
+        # A blocking cook "succeeded" only if its work items did. PDG marks
+        # failed items CookedFail without raising, and can mark an item
+        # CookedSuccess whose expected outputs were never written (e.g. a
+        # ROP Fetch of an unsaved scene on H22); both used to be reported
+        # as success.
+        report = _verify_cooked_work_items(node)
+        result["state_counts"] = report["state_counts"]
+        problems = list(result["errors"])
+        if report["failed"]:
+            first = report["failed"][0]
+            problems.append(
+                f"{len(report['failed'])} of {report['total']} work item(s) "
+                f"failed (e.g. item {first['index']}: {first['log']})"
+            )
+        if report["missing_outputs"]:
+            problems.append(
+                f"{len(report['missing_outputs'])} expected output file(s) "
+                f"missing after the cook, e.g. {report['missing_outputs'][0]}"
+            )
+        if problems:
+            raise hou.OperationFailed(
+                f"cook_top_node {node.path()}: " + "; ".join(problems)
+            )
+
     return result
+
+
+def _file_paths(work_item, *attr_names) -> list[str]:
+    """Paths of a work item's file list, trying attribute names in order."""
+    for name in attr_names:
+        files = getattr(work_item, name, None)
+        if files is None:
+            continue
+        paths = []
+        for entry in files:
+            path = getattr(entry, "path", entry)
+            localize = getattr(work_item, "localizePath", None)
+            if callable(localize):
+                try:
+                    path = localize(path)
+                except Exception:
+                    pass
+            paths.append(str(path))
+        return paths
+    return []
+
+
+def _verify_cooked_work_items(node: hou.Node) -> dict:
+    """State counts, failed items and missing expected outputs of a cook."""
+    pdg_node = _get_pdg_node(node)
+    counts: dict[str, int] = {}
+    failed: list[dict] = []
+    missing: list[str] = []
+    total = 0
+    for work_item in pdg_node.workItems:
+        total += 1
+        state = _work_item_state_name(work_item.state)
+        counts[state] = counts.get(state, 0) + 1
+        if state in ("cooked_fail", "cooked_cancel"):
+            last_line = ""
+            try:
+                lines = (work_item.logMessages or "").strip().splitlines()
+                last_line = lines[-1] if lines else ""
+            except Exception:
+                pass
+            failed.append(
+                {"index": work_item.index, "state": state, "log": last_line[-200:]}
+            )
+        elif state in ("cooked_success", "cooked_cache"):
+            expected = _file_paths(
+                work_item, "expectedOutputFiles", "expectedResultData"
+            )
+            for path in expected:
+                if not os.path.exists(path):
+                    missing.append(path)
+            # PDG drops expected outputs it could not find and only logs it
+            # ("Work item lists file '...' as an expected output file, but
+            # it wasn't found when the item cooked").
+            try:
+                log = work_item.logMessages or ""
+            except Exception:
+                log = ""
+            for line in log.splitlines():
+                if "expected output file" in line and "wasn't found" in line:
+                    start = line.find("'")
+                    end = line.find("'", start + 1)
+                    path = line[start + 1:end] if 0 <= start < end else line
+                    if path not in missing:
+                        missing.append(path)
+    return {
+        "total": total,
+        "state_counts": counts,
+        "failed": failed,
+        "missing_outputs": missing,
+    }
 
 
 ###### tops.cancel_top_cook

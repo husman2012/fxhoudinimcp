@@ -15,7 +15,9 @@ Regression coverage for defects found running the suite on Houdini 22:
     $FSTART/$FEND expressions) and reported success when nothing was written;
   * build_network could not set a constant over a default expression;
   * setup_render's resolution did not reach Karma renders;
-  * render_lint_settings rejected the /out Karma ROP that setup_render creates.
+  * assign_material's SOP-level assignment was ignored by Karma renders;
+  * render_lint_settings rejected the /out Karma ROP that setup_render creates;
+  * cook_top_node reported success when work items failed or wrote nothing.
 """
 
 from __future__ import annotations
@@ -51,6 +53,15 @@ def _menu_set(parm: hou.Parm, label_part: str) -> None:
             parm.set(index)
             return
     raise AssertionError(f"{parm.path()}: no menu label containing {label_part!r} in {labels}")
+
+
+def _license_ext(kind: str) -> str:
+    """hip/hda extension this license writes (Indie: .hiplc/.hdalc, Apprentice: nc)."""
+    suffix = {
+        hou.licenseCategoryType.Indie: "lc",
+        hou.licenseCategoryType.Apprentice: "nc",
+    }.get(hou.licenseCategory(), "")
+    return kind + suffix
 
 
 def _no_scratch_left() -> None:
@@ -376,10 +387,7 @@ class TestWriteCache:
 
 class TestCreateHda:
     def test_subnet_with_a_dop_network_becomes_an_asset(self, call, tmp_path):
-        ext = {
-            hou.licenseCategoryType.Indie: "hdalc",
-            hou.licenseCategoryType.Apprentice: "hdanc",
-        }.get(hou.licenseCategory(), "hda")
+        ext = _license_ext("hda")
         sub = hou.node("/obj").createNode("subnet", "fx_asset")
         sub.createNode("dopnet", "sim").createNode("smokeobject_sparse")
         path = str(tmp_path / f"s10_fx_asset.{ext}").replace("\\", "/")
@@ -411,8 +419,48 @@ class TestTopCook:
         )
         cooked = call("tops.cook_top_node", node_path="/obj/tops/py", block=True)
         assert cooked["work_item_count"] == 4 and not cooked["errors"], cooked
+        assert cooked["state_counts"] == {"cooked_success": 4}, cooked
         states = call("tops.get_work_item_states", node_path="/obj/tops/py")
         assert states["state_counts"] == {"cooked_success": 4}, states
+
+    def test_failing_script_is_an_error(self, call):
+        call("graph.build_network", parent_path="/obj", nodes=[{"type": "topnet", "name": "tops"}])
+        call(
+            "graph.build_network",
+            parent_path="/obj/tops",
+            nodes=[{"type": "genericgenerator", "name": "gen", "parms": {"itemcount": 2}},
+                   {"type": "pythonscript", "name": "py", "inputs": ["gen"],
+                    "parms": {"script": "raise RuntimeError('deliberate failure')"}}],
+        )
+        error = call("tops.cook_top_node", node_path="/obj/tops/py", block=True, expect_error=True)
+        assert "deliberate failure" in error["message"], error
+
+    def _rop_fetch(self, call, out_pattern: str, cook_type: int) -> str:
+        geo = call("nodes.create_node", parent_path="/obj", node_type="geo", name="g")["node_path"]
+        box = call("nodes.create_node", parent_path=geo, node_type="box")["node_path"]
+        call("graph.build_network", parent_path="/out", nodes=[
+            {"type": "geometry", "name": "rop", "parms": {"soppath": box, "sopoutput": out_pattern}}])
+        call("graph.build_network", parent_path="/obj", nodes=[{"type": "topnet", "name": "tops"}])
+        call("graph.build_network", parent_path="/obj/tops", nodes=[
+            {"type": "ropfetch", "name": "fetch", "parms": {
+                "roppath": "/out/rop", "framegeneration": 1, "range1": 6, "range2": 7,
+                "pdg_cooktype": cook_type}}])
+        return "/obj/tops/fetch"
+
+    def test_rop_fetch_of_saved_scene_writes_its_frames(self, call, tmp_path):
+        fetch = self._rop_fetch(call, str(tmp_path / "f.$F4.bgeo.sc").replace("\\", "/"), cook_type=1)
+        hou.hipFile.save(str(tmp_path / f"scene.{_license_ext('hip')}").replace("\\", "/"))
+        cooked = call("tops.cook_top_node", node_path=fetch, block=True)
+        assert cooked["state_counts"] == {"cooked_success": 2}, cooked
+        assert sorted(p.name for p in tmp_path.glob("f.*.bgeo.sc")) == ["f.0006.bgeo.sc", "f.0007.bgeo.sc"]
+
+    def test_rop_fetch_that_writes_nothing_is_an_error(self, call, tmp_path):
+        # In-process ROP Fetch of an UNSAVED scene: PDG marks the items
+        # cooked but the files never appear (H22.0.429).
+        fetch = self._rop_fetch(call, str(tmp_path / "f.$F4.bgeo.sc").replace("\\", "/"), cook_type=0)
+        error = call("tops.cook_top_node", node_path=fetch, block=True, expect_error=True)
+        assert "missing" in error["message"] or "failed" in error["message"], error
+        assert not list(tmp_path.glob("f.*.bgeo.sc"))
 
 
 ###### Material -> Karma render -> read back from disk
