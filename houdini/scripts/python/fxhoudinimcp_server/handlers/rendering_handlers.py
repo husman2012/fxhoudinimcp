@@ -448,6 +448,23 @@ def start_render(
             f"(category: {node.type().category().name()})."
         )
 
+    # In a graphical session the Karma / USD Render ROP launches husk in the
+    # background unless "Wait for Render to Complete" (soho_foreground) is on,
+    # so render() returned at once and "Render completed." was false (the
+    # image appeared later; read-back tools found no file). Wait for this
+    # call, then restore the node's own setting.
+    foreground = node.parm("soho_foreground")
+    restore_foreground = None
+    if foreground is not None and not foreground.eval():
+        if foreground.keyframes():
+            restore_foreground = (
+                "expr", foreground.expression(), foreground.expressionLanguage()
+            )
+            foreground.deleteAllKeyframes()
+        else:
+            restore_foreground = ("value", foreground.eval(), None)
+        foreground.set(1)
+
     try:
         if frame_range is not None:
             if len(frame_range) < 2:
@@ -469,6 +486,13 @@ def start_render(
             "node_path": node_path,
             "error": str(e),
         }
+    finally:
+        if restore_foreground is not None:
+            kind, value, language = restore_foreground
+            if kind == "expr":
+                foreground.setExpression(value, language)
+            else:
+                foreground.set(value)
 
     return {
         "success": True,

@@ -501,6 +501,10 @@ def _karma_scene(call, tmp_path, color, name):
     hou.node(render["camera_path"]).parmTuple("t").set((0, 0, 5))
     rendered = call("rendering.start_render", node_path=render["rop_path"], frame_range=[1, 1])
     assert rendered["success"], rendered
+    # start_render waits for the render (soho_foreground) only for its own
+    # call; the ROP keeps its setting. (In hython render() blocks anyway;
+    # the graphical-session behaviour is covered by the S10 GUI replay.)
+    assert hou.node(render["rop_path"]).parm("soho_foreground").eval() == 0
     exr = str(tmp_path / f"{name}.0001.exr").replace("\\", "/")
     assert os.path.isfile(exr), f"no image written: {os.listdir(tmp_path)}"
     return render["rop_path"], exr
