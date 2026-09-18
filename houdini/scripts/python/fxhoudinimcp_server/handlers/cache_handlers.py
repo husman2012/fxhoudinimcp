@@ -285,6 +285,77 @@ register_handler("cache.clear_cache", _clear_cache)
 
 ###### cache.write_cache
 
+def _set_parm_overriding(parm: hou.Parm, value: Any) -> None:
+    """Set *parm* to a constant, replacing any expression or keyframes.
+
+    hou.Parm.set() does not override an expression: File Cache 2.0 ships
+    f1/f2 as $FSTART/$FEND, so a plain set() left the whole playbar range
+    in place and write_cache(frame_range=[1, 3]) wrote 240 frames.
+    """
+    parm.deleteAllKeyframes()
+    parm.set(value)
+
+
+def _cache_frames(node: hou.Node, frame_range: list | None) -> list[float]:
+    """Frames the cache node is expected to write."""
+    if frame_range is not None and len(frame_range) >= 2:
+        start, end = frame_range[0], frame_range[1]
+        step = frame_range[2] if len(frame_range) >= 3 and frame_range[2] else 1
+    else:
+        trange = node.parm("trange")
+        f1, f2, f3 = node.parm("f1"), node.parm("f2"), node.parm("f3")
+        if trange is None or trange.eval() == 0 or f1 is None or f2 is None:
+            return [hou.frame()]
+        start, end = f1.eval(), f2.eval()
+        step = f3.eval() if f3 is not None and f3.eval() else 1
+    frames: list[float] = []
+    frame = float(start)
+    while frame <= float(end) + 1e-6 and len(frames) < 100000:
+        frames.append(frame)
+        frame += float(step)
+    return frames
+
+
+def _expected_cache_files(node: hou.Node, frames: list[float]) -> list[str] | None:
+    """Output file of *node* at each frame (deduplicated), or None if unknown."""
+    for parm_name in ("file", "sopoutput", "filename", "filepath"):
+        parm = node.parm(parm_name)
+        if parm is None:
+            continue
+        try:
+            paths = [parm.evalAtFrame(frame) for frame in frames]
+        except Exception:
+            return None
+        return list(dict.fromkeys(p for p in paths if p))
+    return None
+
+
+def _cache_messages(node: hou.Node) -> tuple[list[str], list[str]]:
+    """Errors/warnings of *node* and of any ROP inside it.
+
+    File Cache 2.0 writes through an internal rop_geometry whose errors
+    ("Failed to save output to file ...") never reach the outer node.
+    """
+    nodes = [node]
+    try:
+        nodes += [
+            child for child in node.allSubChildren()
+            if child.type().category().name() == "Driver"
+        ]
+    except Exception:
+        pass
+    errors: list[str] = []
+    warnings: list[str] = []
+    for item in nodes:
+        for message in item.errors():
+            if message not in errors:
+                errors.append(message)
+        for message in item.warnings():
+            if message not in warnings:
+                warnings.append(message)
+    return errors, warnings
+
+
 def _write_cache(
     *,
     node_path: str,
@@ -294,7 +365,9 @@ def _write_cache(
     """Execute (render) a cache node to write files to disk.
 
     Presses the "execute" button on the cache node or calls render()
-    for ROP-style caches.
+    for ROP-style caches, then verifies the result: errors from the node
+    or its internal ROP, or expected output files that do not exist,
+    raise hou.OperationFailed instead of reporting success.
 
     Args:
         node_path: Path to the cache node.
@@ -308,16 +381,24 @@ def _write_cache(
         # Try to set trange to "custom" or specific frame range parms
         trange_parm = node.parm("trange")
         if trange_parm is not None:
-            # Resolve menu index dynamically (avoids version-specific hardcoding)
+            # Resolve menu index dynamically (avoids version-specific
+            # hardcoding): ROP Geometry says "Render Specific Frame Range",
+            # File Cache 2.0 says "Frame Range".
             trange_idx = _menu_index_by_label(trange_parm, "specific frame")
-            trange_parm.set(trange_idx if trange_idx is not None else 1)
+            if trange_idx is None:
+                trange_idx = _menu_index_by_label(trange_parm, "frame range")
+            _set_parm_overriding(
+                trange_parm, trange_idx if trange_idx is not None else 1
+            )
 
         f1_parm = node.parm("f1")
         f2_parm = node.parm("f2")
         if f1_parm is not None:
-            f1_parm.set(frame_range[0])
+            _set_parm_overriding(f1_parm, frame_range[0])
         if f2_parm is not None:
-            f2_parm.set(frame_range[1])
+            _set_parm_overriding(f2_parm, frame_range[1])
+
+    frames = _cache_frames(node, frame_range)
 
     # Execute the cache
     status = "success"
@@ -353,10 +434,35 @@ def _write_cache(
             except Exception:
                 pass
 
+    # Verify: a cache that failed to write must not report success.
+    errors, warnings = _cache_messages(node)
+    expected = _expected_cache_files(node, frames)
+    missing = (
+        [path for path in expected if not os.path.isfile(path)]
+        if expected is not None
+        else []
+    )
+    if status != "success" or errors or missing:
+        problems = []
+        if status != "success":
+            problems.append(status)
+        problems += errors
+        if missing:
+            problems.append(
+                f"{len(missing)} of {len(expected)} expected file(s) missing, "
+                f"e.g. {missing[0]}"
+            )
+        raise hou.OperationFailed(
+            f"write_cache failed for {node_path}: " + " | ".join(problems)
+        )
+
     return {
         "node_path": node_path,
         "frame_range": actual_range,
         "status": status,
+        "frames_requested": len(frames),
+        "files_verified": len(expected) if expected is not None else None,
+        "warnings": warnings,
     }
 
 register_handler("cache.write_cache", _write_cache)

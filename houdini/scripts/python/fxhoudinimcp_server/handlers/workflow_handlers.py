@@ -1178,6 +1178,20 @@ def _assign_material(
     except Exception:
         pass
 
+    # Also assign at object level. The Karma ROP's scene import (H22) does
+    # not bind the SOP-level shop_materialpath written above, so a
+    # SOP-only assignment rendered with the default material; the
+    # object-level material is honoured by Karma and Mantra alike. The
+    # Material SOP covers the whole object, so both mean the same thing.
+    object_material_set = False
+    if (
+        sop_parent.type().category().name() == "Object"
+        and sop_parent.parm("shop_materialpath") is not None
+    ):
+        object_material_set = _set_parm_safe(
+            sop_parent, "shop_materialpath", material_path
+        )
+
     layout_if_enabled(sop_parent)
     _focus_network_editor(mat_sop)
 
@@ -1187,6 +1201,7 @@ def _assign_material(
         "success": True,
         "material_sop_path": mat_sop.path(),
         "material_path": material_path,
+        "object_material_set": object_material_set,
     }
 
 
@@ -1365,6 +1380,10 @@ def _setup_render(
     _set_parm_safe(rop, "resy", resolution[1])
     _set_parm_safe(rop, "res_overridex", resolution[0])
     _set_parm_safe(rop, "res_overridey", resolution[1])
+    # The Karma ROP (H21/H22) renders at its own resolutionx/resolutiony
+    # (default 1280x720) regardless of the camera's resx/resy.
+    _set_parm_safe(rop, "resolutionx", resolution[0])
+    _set_parm_safe(rop, "resolutiony", resolution[1])
 
     # -- Step 5: Configure samples
     print(f"[workflow] Setting samples: {samples}")

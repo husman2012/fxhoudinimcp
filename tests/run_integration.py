@@ -7,7 +7,8 @@ Usage:
 
 Finds the newest installed Houdini (override with the HYTHON environment
 variable pointing at the hython executable) and reuses this interpreter's
-pytest installation via PYTHONPATH. Requires a Houdini license seat.
+pytest installation by appending its site-packages to hython's sys.path
+(after Houdini's own packages). Requires a Houdini license seat.
 """
 
 from __future__ import annotations
@@ -89,16 +90,29 @@ def main() -> int:
         )
 
     env = os.environ.copy()
-    python_path = [str(REPO_ROOT / "python"), str(site_packages)]
+    # Only the fork's own pure-Python package goes on PYTHONPATH. This
+    # interpreter's site-packages must NOT: PYTHONPATH entries precede
+    # hython's own site-packages, and a host site-packages can hold
+    # compiled packages built for another Python (numpy, lxml,
+    # pydantic_core, ...) that shadow Houdini's and break imports inside
+    # hython (seen on H22: PDG's `from lxml import etree` failed). The
+    # bootstrap below APPENDS it to sys.path, so pytest is found there
+    # while Houdini's packages keep priority.
+    python_path = [str(REPO_ROOT / "python")]
     if env.get("PYTHONPATH"):
         python_path.append(env["PYTHONPATH"])
     env["PYTHONPATH"] = os.pathsep.join(python_path)
+    bootstrap = (
+        "import sys; sys.path.append(sys.argv.pop(1)); "
+        "import pytest; sys.exit(pytest.main(sys.argv[1:]))"
+    )
 
     print(f"Using hython: {hython}")
     command = [
         str(hython),
-        "-m",
-        "pytest",
+        "-c",
+        bootstrap,
+        str(site_packages),
         str(REPO_ROOT / "tests" / "integration"),
         "-q",
         "-s",

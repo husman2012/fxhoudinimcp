@@ -24,6 +24,7 @@ import hou
 # Internal
 from fxhoudinimcp_server.config import layout_if_enabled
 from fxhoudinimcp_server.dispatcher import Capability, register_handler
+from fxhoudinimcp_server.handlers.vex_handlers import _split_messages
 
 ###### Helpers
 
@@ -56,8 +57,24 @@ def _parm_names_for_type(scratch: hou.Node, node_type) -> tuple[set, set]:
     return parm_names, tuple_names
 
 
+def _clear_channels(parms) -> None:
+    """Remove expressions/keyframes so a constant set() takes effect.
+
+    hou.Parm.set() does not replace an expression: File Cache f1/f2
+    ($FSTART/$FEND) and similar defaults silently kept their expression
+    when a spec asked for a constant.
+    """
+    for parm in parms:
+        if parm is not None and parm.keyframes():
+            parm.deleteAllKeyframes()
+
+
 def _apply_parm(node: hou.Node, name: str, value: Any) -> None:
-    """Set a parm or parm tuple, broadcasting scalars and coercing floats."""
+    """Set a parm or parm tuple, broadcasting scalars and coercing floats.
+
+    A constant replaces any expression or keyframes on the parm, as typing
+    a value into the parameter editor does.
+    """
     parm = node.parm(name)
     parm_tuple = node.parmTuple(name)
     if isinstance(value, (list, tuple)):
@@ -67,13 +84,16 @@ def _apply_parm(node: hou.Node, name: str, value: Any) -> None:
             raise ValueError(
                 f"'{name}' has {len(parm_tuple)} components, got {len(value)}"
             )
+        _clear_channels(parm_tuple)
         if all(isinstance(v, (int, float)) for v in value):
             parm_tuple.set([float(v) for v in value])
         else:
             parm_tuple.set(list(value))
     elif parm is not None:
+        _clear_channels([parm])
         parm.set(value)
     elif parm_tuple is not None:
+        _clear_channels(parm_tuple)
         # Scalar onto a tuple: broadcast across components.
         if isinstance(value, (int, float)):
             parm_tuple.set([float(value)] * len(parm_tuple))
@@ -84,12 +104,15 @@ def _apply_parm(node: hou.Node, name: str, value: Any) -> None:
 
 
 def _node_report(node: hou.Node) -> dict[str, Any]:
+    # DOP wrangles report VEX compile failures as warnings; count them as
+    # errors so a network with broken VEX is never reported healthy.
+    errors, warnings = _split_messages(node.errors(), node.warnings())
     report: dict[str, Any] = {
         "name": node.name(),
         "path": node.path(),
         "type": node.type().name(),
-        "errors": list(node.errors()),
-        "warnings": list(node.warnings()),
+        "errors": errors,
+        "warnings": warnings,
     }
     with contextlib.suppress(Exception):
         report["bypassed"] = node.isBypassed()
@@ -443,6 +466,57 @@ def _help_text(node_type, category_name: str) -> str | None:
     return embedded or None
 
 
+# Where a throwaway instance of each category can be created: (parent path,
+# container type or None to create directly under the parent).
+_LABEL_PROBE_PARENTS = {
+    "Sop": ("/obj", "geo"),
+    "Dop": ("/obj", "dopnet"),
+    "Lop": ("/obj", "lopnet"),
+    "Top": ("/obj", "topnet"),
+    "Cop": ("/obj", "copnet"),
+    "Chop": ("/obj", "chopnet"),
+    "Object": ("/obj", None),
+    "Driver": ("/out", None),
+}
+_MAX_LABELS = 16
+
+
+def _connector_labels(node_type, category_name: str):
+    """Real input/output connector labels of *node_type*.
+
+    hou.NodeType exposes no connector labels (H22), so a throwaway
+    instance is created inside a temporary container and destroyed at
+    once, as build_network's parm probe does. Returns (None, None) when
+    the category cannot host a probe.
+    """
+    spec = _LABEL_PROBE_PARENTS.get(category_name)
+    root = hou.node(spec[0]) if spec else None
+    if root is None:
+        return None, None
+    container = None
+    probe = None
+    try:
+        with hou.undos.disabler():
+            parent = root
+            if spec[1] is not None:
+                container = root.createNode(spec[1], "__fxh_card_probe")
+                parent = container
+            probe = parent.createNode(node_type.name())
+            inputs = list(probe.inputLabels())[:_MAX_LABELS]
+            outputs = list(probe.outputLabels())[:_MAX_LABELS]
+            return inputs, outputs
+    except Exception:
+        return None, None
+    finally:
+        with hou.undos.disabler():
+            if container is not None:
+                with contextlib.suppress(Exception):
+                    container.destroy()
+            elif probe is not None:
+                with contextlib.suppress(Exception):
+                    probe.destroy()
+
+
 def get_node_card(
     node_type: str,
     context: str = "Sop",
@@ -506,6 +580,8 @@ def get_node_card(
     if help_text and len(help_text) > 5000:
         help_text = help_text[:5000] + "\n[... help truncated]"
 
+    input_labels, output_labels = _connector_labels(resolved, context)
+
     return {
         "type": resolved.name(),
         "label": resolved.description(),
@@ -513,6 +589,8 @@ def get_node_card(
         "min_inputs": resolved.minNumInputs(),
         "max_inputs": resolved.maxNumInputs(),
         "max_outputs": resolved.maxNumOutputs(),
+        "inputs": input_labels,
+        "outputs": output_labels,
         "is_generator": resolved.minNumInputs() == 0,
         "parm_count": len(parms),
         "parms_truncated": truncated,

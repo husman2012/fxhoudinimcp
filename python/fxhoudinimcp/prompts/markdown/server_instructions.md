@@ -82,8 +82,8 @@ The lists below are search hints, not exhaustive. Always call `list_node_types(c
 *   Karma effects: karmaphysicalsky, karmaskyatmosphere, karmafogbox, karmatexturebaker, karmacryptomatte, backgroundplate
 *   Materials: materiallibrary, assignmaterial, editmaterialproperties, materialvariation, materiallinker
 *   Lights: light, distantlight, domelight, lightmixer, portallight, geometrylight, lightlinker, lpetag
-*   Instancing: instancer, modifypointinstances, splitpointinstancers, extractinstances
-*   Layout: layout, drop, edit, editprototypes
+*   Instancing: copytopoints (the Instancer LOP, named instancer before H22), pointinstancer (H22+), modifypointinstances, splitpointinstancers, extractinstances
+*   Layout: paintinstances (the Layout LOP, named layout before H22), drop, edit, editprototypes
 *   Config: prune, configurelayer, configureprimitive, drawmode, configurestage
 *   USD editing: editproperties, addvariant, setvariant, collection, scope, graftbranches, graftstages, splitscene, copyproperty, modifypaths
 *   Constraints: filter='constraint' — blendconstraint, followpathconstraint, lookatconstraint, parentconstraint, surfaceconstraint

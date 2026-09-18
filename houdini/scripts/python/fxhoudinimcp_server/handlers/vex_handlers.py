@@ -27,29 +27,164 @@ def _get_node(node_path: str) -> hou.Node:
     return node
 
 
-def _validate_vex_quick(node: hou.Node) -> dict:
-    """Cook a wrangle node and return any VEX errors/warnings."""
+_VEX_CONTEXT_MARKERS = ("vex", "vop", "snippet", "syntax error", "undefined function")
+_VEX_FAILURE_MARKERS = (
+    "error", "undefined function", "unable to load shader", "failed to resolve",
+)
+_VEX_COMPILE_HEADER = "errors or warnings encountered during vex compile"
+
+
+def _is_vex_compile_error(message: str) -> bool:
+    """True if a node message reports a VEX compile FAILURE.
+
+    DOP wrangles (Gas Field Wrangle, POP Wrangle) report compile failures
+    as node *warnings* ("Error in VOP 'snippet1'.", "... Syntax error ...",
+    "Call to undefined function ..."), so a check that only reads
+    node.errors() calls broken code valid. Compile *warnings* such as
+    "Implicit cast from float to int" are not failures.
+    """
+    low = str(message).lower()
+    if not any(marker in low for marker in _VEX_CONTEXT_MARKERS):
+        return False
+    body = low.replace(_VEX_COMPILE_HEADER, "")
+    return any(marker in body for marker in _VEX_FAILURE_MARKERS)
+
+
+def _split_messages(errors, warnings) -> tuple[list[str], list[str]]:
+    """Promote VEX compile failures reported as warnings to errors."""
+    out_errors: list[str] = []
+    out_warnings: list[str] = []
+    for message in list(errors or []):
+        if message not in out_errors:
+            out_errors.append(message)
+    for message in list(warnings or []):
+        target = out_errors if _is_vex_compile_error(message) else out_warnings
+        if message not in target:
+            target.append(message)
+    return out_errors, out_warnings
+
+
+# DOP VEX node families that compile only when a solver runs them. Each maps
+# to (object type, solver type, solver input for the wrangle) of a tiny
+# scratch simulation that makes the solver compile a COPY of the node.
+_DOP_SCRATCH_SIMS = (
+    ("gas", ("smokeobject", "multisolver", 1)),
+    ("pop", ("popobject", "popsolver", 1)),
+)
+
+
+def _dop_scratch_spec(node: hou.Node):
+    type_name = node.type().name()
+    for prefix, spec in _DOP_SCRATCH_SIMS:
+        if type_name.startswith(prefix):
+            return spec
+    return None
+
+
+def _compile_dop_vex(node: hou.Node) -> tuple[list[str], list[str]]:
+    """Compile a DOP wrangle's VEX in an isolated scratch simulation.
+
+    A DOP wrangle's VEX is compiled only when a solver runs it, so cooking
+    the node itself proves nothing (broken code reported "valid"). A copy
+    of the node (same parms) is attached to a tiny object in a throwaway
+    DOP network under /obj and cooked over its first two frames with
+    cook(frame_range=...), which runs one solve without moving the global
+    frame or touching the user's simulation. The scratch network is
+    always destroyed.
+    """
+    object_type, solver_type, solver_input = _dop_scratch_spec(node)
+    scratch = None
+    try:
+        with hou.undos.disabler():
+            scratch = hou.node("/obj").createNode("dopnet", "__fxh_vex_check")
+            if scratch.parm("cacheenabled") is not None:
+                scratch.parm("cacheenabled").set(0)
+            obj = scratch.createNode(object_type)
+            if object_type == "smokeobject":
+                obj.parm("divsize").set(0.25)
+                obj.parmTuple("size").set((1, 1, 1))
+            copy = hou.copyNodesTo([node], scratch)[0]
+            solver = scratch.createNode(solver_type)
+            solver.setInput(0, obj)
+            solver.setInput(solver_input, copy)
+            out = scratch.createNode("output")
+            out.setInput(0, solver)
+            out.setDisplayFlag(True)
+            start_parm = scratch.parm("startframe")
+            start = int(start_parm.eval()) if start_parm is not None else 1
+            try:
+                out.cook(force=True, frame_range=(start, start + 1))
+            except hou.OperationFailed:
+                pass  # compile failures are read from the copy below
+            return list(copy.errors()), list(copy.warnings())
+    finally:
+        if scratch is not None:
+            with hou.undos.disabler():
+                scratch.destroy()
+
+
+def _compile_report(node: hou.Node) -> dict:
+    """Compile *node*'s VEX and report errors/warnings.
+
+    SOP-style nodes compile on cook. DOP wrangles are compiled in a
+    scratch simulation (see _compile_dop_vex); DOP VEX nodes of other
+    families are reported as not compile-checked instead of valid.
+    """
+    is_dop = node.type().category().name() == "Dop"
+    method = "cook"
+    compile_checked = True
+    errors: list[str] = []
+    warnings: list[str] = []
+    if is_dop and node.parm("snippet") is not None:
+        if _dop_scratch_spec(node) is not None:
+            method = "scratch_dop_solve"
+            errors, warnings = _compile_dop_vex(node)
+        else:
+            compile_checked = False
+            method = "none"
+    # Cooking the node compiles SOP-style VEX and clears messages left on a
+    # DOP node by an earlier solve of code that has since been replaced.
     try:
         node.cook(force=True)
     except hou.OperationFailed:
         pass
-
-    errors = []
-    warnings = []
+    # Messages on the node itself (for DOP nodes: from the user's own sim).
     try:
-        errors = list(node.errors() or [])
+        errors += list(node.errors() or [])
     except Exception:
         pass
     try:
-        warnings = list(node.warnings() or [])
+        warnings += list(node.warnings() or [])
     except Exception:
         pass
-
-    return {
-        "vex_valid": len(errors) == 0,
-        "vex_errors": errors,
-        "vex_warnings": warnings,
+    errors, warnings = _split_messages(errors, warnings)
+    report = {
+        "errors": errors,
+        "warnings": warnings,
+        "compile_checked": compile_checked,
+        "compile_method": method,
     }
+    if not compile_checked:
+        report["note"] = (
+            f"VEX was NOT compiled: {node.type().name()} compiles only while "
+            "its simulation steps. Step the simulation, then call "
+            "validate_vex or verify_network again."
+        )
+    return report
+
+
+def _validate_vex_quick(node: hou.Node) -> dict:
+    """Compile a wrangle node and return any VEX errors/warnings."""
+    report = _compile_report(node)
+    result = {
+        "vex_valid": len(report["errors"]) == 0,
+        "vex_errors": report["errors"],
+        "vex_warnings": report["warnings"],
+        "compile_checked": report["compile_checked"],
+    }
+    if "note" in report:
+        result["vex_note"] = report["note"]
+    return result
 
 
 def _resolve_class_value(node: hou.Node, run_over: str) -> int:
@@ -321,7 +456,13 @@ def create_vex_expression(
 ###### vex.validate_vex
 
 def validate_vex(node_path: str) -> dict:
-    """Validate VEX code by cooking the node and checking for errors.
+    """Validate VEX code by compiling the node and checking for errors.
+
+    SOP wrangles compile when cooked. DOP wrangles (Gas Field Wrangle,
+    POP Wrangle) compile only while a solver runs them, so their VEX is
+    compiled in an isolated scratch simulation (the user's simulation and
+    the global frame are not touched). VEX compile failures that Houdini
+    reports as node warnings are returned as errors.
 
     Args:
         node_path: Path to the wrangle node to validate.
@@ -334,30 +475,9 @@ def validate_vex(node_path: str) -> dict:
     if snippet_parm is not None:
         vex_code = snippet_parm.eval()
 
-    # Force cook the node to trigger VEX compilation
-    try:
-        node.cook(force=True)
-    except hou.OperationFailed:
-        pass  # Errors will be captured below
-
-    # Gather errors and warnings
-    errors = []
-    warnings = []
-
-    try:
-        node_errors = node.errors()
-        if node_errors:
-            errors = list(node_errors)
-    except Exception:
-        pass
-
-    try:
-        node_warnings = node.warnings()
-        if node_warnings:
-            warnings = list(node_warnings)
-    except Exception:
-        pass
-
+    report = _compile_report(node)
+    errors = report["errors"]
+    warnings = report["warnings"]
     is_valid = len(errors) == 0
 
     result = {
@@ -365,12 +485,16 @@ def validate_vex(node_path: str) -> dict:
         "is_valid": is_valid,
         "errors": errors,
         "warnings": warnings,
+        "compile_checked": report["compile_checked"],
+        "compile_method": report["compile_method"],
     }
 
     if vex_code is not None:
         result["vex_code"] = vex_code
 
-    if is_valid:
+    if not report["compile_checked"]:
+        result["message"] = report["note"]
+    elif is_valid:
         result["message"] = "VEX code is valid."
     else:
         result["message"] = f"VEX code has {len(errors)} error(s)."

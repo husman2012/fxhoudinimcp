@@ -48,6 +48,30 @@ _log = _logging.getLogger(__name__)
 # Handler
 # ---------------------------------------------------------------------------
 
+def _resolve_stage_node(node):
+    """Return the LOP node whose stage *node* renders.
+
+    A LOP node is returned as is. A ROP-context render node has no stage of
+    its own: a USD Render ROP names its LOP node in ``loppath``; a Karma ROP
+    (/out, what setup_render creates) renders the display node of its
+    internal LOP network. Returns None when no stage can be found.
+    """
+    if hasattr(node, "stage"):
+        return node
+    loppath = node.parm("loppath")
+    if loppath is not None:
+        target = node.node(loppath.eval()) or hou.node(loppath.eval())
+        if target is not None and hasattr(target, "stage"):
+            return target
+    for child in node.children():
+        category = child.childTypeCategory()
+        if category is not None and category.name() == "Lop":
+            display = child.displayNode()
+            if display is not None and hasattr(display, "stage"):
+                return display
+    return None
+
+
 def render_lint_settings(render_node: str, preset: str = "nuke_safe") -> dict:
     """Read a Karma render node's USD stage and run handoff_linter rules on it.
 
@@ -98,8 +122,13 @@ def render_lint_settings(render_node: str, preset: str = "nuke_safe") -> dict:
         from homedini.rendering.handoff_linter import rules as _rules  # noqa: PLC0415
         from homedini.rendering.handoff_linter import presets as _presets  # noqa: PLC0415
 
+        # A /out Karma or USD Render ROP is linted through the LOP node whose
+        # stage it renders; anything else goes to stage_reader unchanged
+        # (which rejects non-LOP nodes with a clear error).
+        stage_node = _resolve_stage_node(node) or node
+
         # Read the USD stage report from the render node.
-        report = stage_reader.read(node)
+        report = stage_reader.read(stage_node)
 
         # Load the rule preset by name.
         preset_obj = _presets.load(preset)
@@ -110,13 +139,16 @@ def render_lint_settings(render_node: str, preset: str = "nuke_safe") -> dict:
         # Summarize: count ok / warn / error severity buckets.
         summary = _rules.summarize(results)
 
-        return {
+        result = {
             "render_node": render_node,
             "preset": preset,
             "results": [r.to_dict() for r in results],
             "summary": {"ok": summary["ok"], "warn": summary["warn"], "error": summary["error"]},
             "ready_to_render": summary["ready_to_render"],
         }
+        if stage_node is not node:
+            result["stage_node"] = stage_node.path()
+        return result
 
     except Exception as exc:  # noqa: BLE001 — all failures surface as {ok: False}
         _log.warning("render_lint_settings failed for %r: %s", render_node, exc, exc_info=True)
