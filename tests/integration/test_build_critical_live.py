@@ -74,32 +74,51 @@ def _no_scratch_left() -> None:
 ###### get_node_card: connector labels
 
 
+def _instance_labels(node_type: str, container: str) -> list:
+    """Ground truth: the input labels of a real instance in this Houdini."""
+    net = hou.node("/obj").createNode(container, "truth")
+    labels = list(net.createNode(node_type).inputLabels())
+    net.destroy()
+    return labels
+
+
 class TestNodeCardConnectors:
     @pytest.mark.parametrize(
-        "node_type,context,container",
+        "node_type,context,container,source",
         [
-            ("pyrosolver_sparse", "Dop", "dopnet"),
-            ("gasfieldwrangle", "Dop", "dopnet"),
-            ("copytopoints", "Sop", "geo"),
-            ("volumerasterizeattributes", "Sop", "geo"),
+            ("pyrosolver_sparse", "Dop", "dopnet", "definition"),
+            ("smokesolver_sparse", "Dop", "dopnet", "definition"),
+            ("gasfieldwrangle", "Dop", "dopnet", "definition"),
+            ("volumerasterizeattributes", "Sop", "geo", "definition"),
+            ("copytopoints", "Sop", "geo", "help"),
         ],
     )
-    def test_card_reports_the_real_connector_labels(self, call, node_type, context, container):
+    def test_card_reports_the_real_connector_labels(self, call, node_type, context, container, source):
         card = call("graph.get_node_card", node_type=node_type, context=context)
-        # Ground truth: the labels of a real instance in this Houdini.
-        net = hou.node("/obj").createNode(container, "truth")
-        instance = net.createNode(node_type)
-        assert card["inputs"] == list(instance.inputLabels())[: len(card["inputs"])]
-        assert len(card["inputs"]) == min(len(instance.inputLabels()), 16)
-        assert card["outputs"] == list(instance.outputLabels())[: len(card["outputs"])]
-        assert card["inputs"], f"no connector labels for {node_type}"
-        _no_scratch_left()
+        assert card["connector_labels_source"] == source, card["connector_labels_source"]
+        truth = _instance_labels(node_type, container)
+        assert card["inputs"] == truth[:16], (card["inputs"], truth)
 
-    def test_card_probe_leaves_the_scene_untouched(self, call):
-        before = sorted(n.path() for n in hou.node("/obj").allSubChildren())
-        call("graph.get_node_card", node_type="pyrosolver_sparse", context="Dop")
-        call("graph.get_node_card", node_type="geo", context="Object")
-        after = sorted(n.path() for n in hou.node("/obj").allSubChildren())
+    def test_compiled_type_without_instance_reports_unavailable(self, call):
+        # polyextrude is a compiled SOP with no labels in its help: the card
+        # says so instead of creating a node (it is a READONLY command).
+        card = call("graph.get_node_card", node_type="polyextrude", context="Sop")
+        assert card["inputs"] is None and card["connector_labels_source"] == "unavailable"
+        geo = hou.node("/obj").createNode("geo", "g")
+        geo.createNode("polyextrude")
+        card = call("graph.get_node_card", node_type="polyextrude", context="Sop")
+        assert card["connector_labels_source"] == "instance"
+        assert card["inputs"] == list(geo.node("polyextrude1").inputLabels())
+
+    def test_card_is_read_only(self, call):
+        # (hou.hipFile.hasUnsavedChanges() is True even right after a save
+        # in hython, so the whole node tree is compared instead.)
+        hou.node("/obj").createNode("geo", "keep")
+        before = sorted(n.path() for n in hou.node("/").allSubChildren())
+        for node_type, context in (("pyrosolver_sparse", "Dop"), ("geo", "Object"), ("karma", "Driver"),
+                                   ("copytopoints", "Sop"), ("polyextrude", "Sop")):
+            call("graph.get_node_card", node_type=node_type, context=context)
+        after = sorted(n.path() for n in hou.node("/").allSubChildren())
         assert before == after
 
 

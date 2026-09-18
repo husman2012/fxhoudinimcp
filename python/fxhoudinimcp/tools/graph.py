@@ -93,6 +93,13 @@ async def get_node_card(
     in this session — never guess parameter names. Unversioned names
     resolve to the newest version.
 
+    "inputs"/"outputs" list the connector labels in input order (wire by
+    these indices, e.g. a Pyro Solver's "Sourcing" or "Forces" input);
+    "connector_labels_source" says where they came from (an existing
+    instance, the asset definition, or the help). They are null when
+    Houdini exposes none for a compiled node type that has no instance
+    in the scene yet — the card never creates nodes to find out.
+
     Args:
         node_type: Type name (e.g. "scatter", "rbdbulletsolver").
         context: Category — "Sop", "Lop", "Dop", "Cop", "Chop", "Top",

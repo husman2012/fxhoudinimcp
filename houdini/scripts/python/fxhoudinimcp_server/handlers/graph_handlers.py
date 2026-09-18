@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import tempfile
 import zipfile
 from difflib import get_close_matches
@@ -466,55 +467,51 @@ def _help_text(node_type, category_name: str) -> str | None:
     return embedded or None
 
 
-# Where a throwaway instance of each category can be created: (parent path,
-# container type or None to create directly under the parent).
-_LABEL_PROBE_PARENTS = {
-    "Sop": ("/obj", "geo"),
-    "Dop": ("/obj", "dopnet"),
-    "Lop": ("/obj", "lopnet"),
-    "Top": ("/obj", "topnet"),
-    "Cop": ("/obj", "copnet"),
-    "Chop": ("/obj", "chopnet"),
-    "Object": ("/obj", None),
-    "Driver": ("/out", None),
-}
 _MAX_LABELS = 16
+_DIALOG_LABEL = re.compile(r'^\s*(input|output)label\s+(\d+)\s+"?([^"\n]*)"?\s*$', re.M)
+_HELP_INPUT_LABEL = re.compile(r"^([^\s:][^\n:]*):\s*$", re.M)
 
 
-def _connector_labels(node_type, category_name: str):
-    """Real input/output connector labels of *node_type*.
+def _connector_labels(node_type, category_name: str) -> tuple:
+    """Real connector labels of *node_type*, WITHOUT touching the scene.
 
-    hou.NodeType exposes no connector labels (H22), so a throwaway
-    instance is created inside a temporary container and destroyed at
-    once, as build_network's parm probe does. Returns (None, None) when
-    the category cannot host a probe.
+    get_node_card is READONLY (no scene mutation), and hou.NodeType has no
+    label API in H22, so the labels come from, in order of authority:
+      1. an existing instance of the type in the scene (exact);
+      2. a digital asset's DialogScript (``inputlabel`` / ``outputlabel``,
+         exact for HDAs such as the Pyro/Smoke solvers and wrangles);
+      3. the node's shipped help ``@inputs`` section (plain labels only).
+    Returns (inputs, outputs, source); labels are None when unavailable.
     """
-    spec = _LABEL_PROBE_PARENTS.get(category_name)
-    root = hou.node(spec[0]) if spec else None
-    if root is None:
-        return None, None
-    container = None
-    probe = None
-    try:
-        with hou.undos.disabler():
-            parent = root
-            if spec[1] is not None:
-                container = root.createNode(spec[1], "__fxh_card_probe")
-                parent = container
-            probe = parent.createNode(node_type.name())
-            inputs = list(probe.inputLabels())[:_MAX_LABELS]
-            outputs = list(probe.outputLabels())[:_MAX_LABELS]
-            return inputs, outputs
-    except Exception:
-        return None, None
-    finally:
-        with hou.undos.disabler():
-            if container is not None:
-                with contextlib.suppress(Exception):
-                    container.destroy()
-            elif probe is not None:
-                with contextlib.suppress(Exception):
-                    probe.destroy()
+    max_in = node_type.maxNumInputs()
+    max_out = node_type.maxNumOutputs()
+    with contextlib.suppress(Exception):
+        instances = node_type.instances()
+        if instances:
+            node = instances[0]
+            return (list(node.inputLabels())[: min(max_in, _MAX_LABELS)],
+                    list(node.outputLabels())[: min(max_out, _MAX_LABELS)],
+                    "instance")
+    definition = node_type.definition()
+    if definition is not None:
+        section = definition.sections().get("DialogScript")
+        text = section.contents() if section is not None else ""
+        found: dict[str, dict[int, str]] = {"input": {}, "output": {}}
+        for kind, index, label in _DIALOG_LABEL.findall(text):
+            found[kind][int(index)] = label
+        if found["input"] or max_in == 0:
+            inputs = [found["input"][i] for i in sorted(found["input"])]
+            outputs = [found["output"][i] for i in sorted(found["output"])]
+            return (inputs[: min(max_in, _MAX_LABELS)],
+                    outputs[: min(max_out, _MAX_LABELS)] or None,
+                    "definition")
+    help_text = _help_text(node_type, category_name) or ""
+    section = re.search(r"@inputs\s*\n(.*?)(?:\n@|\Z)", help_text, re.S)
+    if section:
+        labels = _HELP_INPUT_LABEL.findall(section.group(1))
+        if labels and len(labels) <= max_in:
+            return labels[:_MAX_LABELS], None, "help"
+    return None, None, "unavailable"
 
 
 def get_node_card(
@@ -580,7 +577,7 @@ def get_node_card(
     if help_text and len(help_text) > 5000:
         help_text = help_text[:5000] + "\n[... help truncated]"
 
-    input_labels, output_labels = _connector_labels(resolved, context)
+    input_labels, output_labels, labels_source = _connector_labels(resolved, context)
 
     return {
         "type": resolved.name(),
@@ -591,6 +588,7 @@ def get_node_card(
         "max_outputs": resolved.maxNumOutputs(),
         "inputs": input_labels,
         "outputs": output_labels,
+        "connector_labels_source": labels_source,
         "is_generator": resolved.minNumInputs() == 0,
         "parm_count": len(parms),
         "parms_truncated": truncated,
