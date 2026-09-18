@@ -317,8 +317,13 @@ def _cache_frames(node: hou.Node, frame_range: list | None) -> list[float]:
 
 
 def _expected_cache_files(node: hou.Node, frames: list[float]) -> list[str] | None:
-    """Output file of *node* at each frame (deduplicated), or None if unknown."""
-    for parm_name in ("file", "sopoutput", "filename", "filepath"):
+    """Output file of *node* at each frame (deduplicated), or None if unknown.
+
+    ``sopoutput`` comes first: on File Cache 2.0 it is the path actually
+    written in both file modes, while ``file`` only holds the Explicit-mode
+    path (in the default Constructed mode it points somewhere unused).
+    """
+    for parm_name in ("sopoutput", "file", "filename", "filepath"):
         parm = node.parm(parm_name)
         if parm is None:
             continue

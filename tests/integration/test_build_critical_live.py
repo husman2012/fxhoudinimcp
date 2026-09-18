@@ -349,6 +349,16 @@ class TestWriteCache:
         written = sorted(p.name for p in tmp_path.glob("box.*.bgeo.sc"))
         assert written == ["box.0002.bgeo.sc", "box.0003.bgeo.sc", "box.0004.bgeo.sc"]
 
+    def test_constructed_paths_are_verified(self, call, box_cache, tmp_path):
+        # Default File Cache 2.0 mode builds the path from basedir/basename/
+        # version; the Explicit-mode "file" parm is then unused.
+        node = hou.node(box_cache)
+        node.parm("filemethod").set(0)
+        node.parm("basedir").set(str(tmp_path / "constructed").replace("\\", "/"))
+        result = call("cache.write_cache", node_path=box_cache, frame_range=[1, 2])
+        assert result["files_verified"] == 2, result
+        assert len(list((tmp_path / "constructed").rglob("*.bgeo.sc"))) == 2
+
     def test_failed_write_is_an_error(self, call, box_cache, tmp_path):
         blocker = tmp_path / "not_a_dir"
         blocker.write_text("a file where the cache directory should be")
@@ -400,6 +410,22 @@ class TestCreateHda:
             assert node.type().name() == type_name
             second = hou.node("/obj").createNode(type_name, "fx_asset2")
             assert second.node("sim/smokeobject_sparse1") is not None
+        finally:
+            hou.hda.uninstallFile(path)
+
+    def test_dop_subnet_becomes_an_asset(self, call, tmp_path):
+        net = hou.node("/obj").createNode("dopnet", "sim")
+        sub = net.createNode("subnet", "fx")
+        sub.createNode("gasfieldwrangle", "w").parm("snippet").set("f@density *= 0.99;")
+        path = str(tmp_path / f"s10_dop_fx.{_license_ext('hda')}").replace("\\", "/")
+        call("hda.create_hda", node_path=sub.path(), hda_file=path,
+             type_name="fxhtest::dop_fx", label="DOP FX")
+        try:
+            second = net.createNode("fxhtest::dop_fx", "fx2")
+            # H22 creates a DOP asset's contents lazily: children() is empty
+            # on a fresh instance, but the contents are there when asked for.
+            assert second.node("w") is not None
+            assert second.node("w").parm("snippet").eval() == "f@density *= 0.99;"
         finally:
             hou.hda.uninstallFile(path)
 
